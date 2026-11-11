@@ -1,7 +1,8 @@
 (ns skein.ui.parity-test
   (:require [skein.test :refer [deftest is are testing use-fixtures]]
             [skein.ui :as ui]
-            [skein.ui.headless :as headless]))
+            [skein.ui.headless :as headless]
+            [skein.io :as io]))
 
 ;; The parts of LGT that skein-ui gained before its examples were ported (part A of step 6
 ;; of M2.14, D-097): fonts, colors, focus, input events, user data, windows' options and
@@ -320,3 +321,39 @@
     (is (= (ui/place-popup [100 100 10 20] [50 40] [0 0 1000 800]) [100 122 :below]))
     (is (= (ui/place-popup [980 780 10 20] [50 40] [0 0 1000 800]) [950 738 :above]))
     (ui/close! w)))
+
+(deftest images-and-fonts
+  (let [png (io/read-bytes "test/skein/ui/red-3x2.png")
+        i (ui/image-from-bytes png)]
+    (is (= [3 2] [(:width i) (:height i)]))
+    (is (thrown-with-msg? error "empty" (ui/image-from-bytes (make-array u8 0))))
+    (let [star (ui/system-image "star")]
+      (is (= [16 16] [(:width star) (:height star)]))
+      (is (= "star" (:system star))))
+    (testing "glyph images are made once and shared"
+      (let [g (ui/glyph-image \A)
+            h (ui/glyph-image "A" {:size 24 :color :red})]
+        (is (identical? g (ui/glyph-image "A")))
+        (is (= [18 18] [(:width g) (:height g)]))
+        (is (:template (:glyph g)) ":text glyphs follow the control's color")
+        (is (not (:template (:glyph h))))
+        (is (= 24 (:size (:font (:glyph h)))) "the font takes the image's size")))
+    (testing "freeing"
+      (ui/free-image! i)
+      (is (:freed i))
+      (is (thrown-with-msg? error "freed" (ui/check-image i)))
+      (ui/free-image! (ui/glyph-image "A"))
+      (is (not (:freed (ui/glyph-image "A"))) "shared glyphs aren't freed"))
+    (testing "fonts"
+      (is (= ["Monospace" "Sans" "Serif"] (ui/font-families)))
+      (is (thrown-with-msg? error "no font file" (ui/register-font-file! "no/such.ttf")))))
+  (testing "row icons"
+    (let [star (ui/system-image "star")
+          l (ui/list-box {:items ["a" "b"] :icon-fn (fn [x] (when (= x "a") star))})
+          t (ui/table-view {:items [{:n 1}] :columns [(ui/column "N" :n {:icon-fn (fn [_] star)})
+                                                      (ui/column "M" :n)]})]
+      (is (= [star nil] (headless/row-icons l)))
+      (is (= [star] (headless/row-icons t 0)))
+      (is (= [nil] (headless/row-icons t 1)))
+      (is (thrown-with-msg? error "an :icon-fn gives"
+                            (ui/row-icon (ui/list-box {:items [1] :icon-fn (fn [_] "x")}) 1))))))

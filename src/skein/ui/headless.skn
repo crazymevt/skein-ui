@@ -901,3 +901,31 @@ platform tells the core, which emits :closed with :dismissed). True if it closed
   "The first line the code view shows."
   [v]
   (top-line v))
+
+;;; ------------------------------------------------------------------------------------
+;;; Images from bytes, system and glyph images, and fonts: nothing is decoded or drawn. A
+;;; PNG's header gives its size, other formats are 16 by 16; any name is a 16 by 16
+;;; system image; the font families are a fixed few, and the fonts registered.
+
+(defmethod ui/backend-image-data-size [(b headless-backend) bytes]
+  (if (and (>= (count bytes) 24) (= 137 (aget bytes 0)) (= 80 (aget bytes 1)))
+    [(be32 bytes 16) (be32 bytes 20)]
+    [16 16]))
+
+(defmethod ui/backend-system-image-size [(b headless-backend) name]
+  (when (seq (str name)) [16 16]))
+
+(defmethod ui/backend-font-families [(b headless-backend)]
+  (into ["Sans" "Monospace" "Serif"]
+        (keep (fn [entry] (when (= :font-file (first entry)) (second entry))) (:log b))))
+
+(defmethod ui/backend-register-font-file [(b headless-backend) path]
+  (update-slot! b :log conj [:font-file path]))
+
+(defmethod ui/backend-free-image [(b headless-backend) image]
+  (update-slot! b :log conj [:free-image image]))
+
+(defn row-icons
+  "The images the list box's (or table's) rows show in the column, by row."
+  ([w] (row-icons w 0))
+  ([w column] (mapv (fn [item] (ui/row-icon w item column)) (:items w))))

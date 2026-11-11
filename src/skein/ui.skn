@@ -26,7 +26,8 @@ controls.
 The backend protocol is a set of generic functions on a backend object (backend-realize,
 backend-set-property, ...), which skein.ui.headless, skein.ui.cocoa, skein.ui.win32 and
 skein.ui.gtk implement. The core calls them through backend-in-ui-thread."
-  (:require [skein.math :as math]
+  (:require [skein.io :as io]
+            [skein.math :as math]
             [skein.string :as string]
             [skein.system :as system]
             [skein.time :as time]))
@@ -1363,12 +1364,18 @@ window."
 ;;; Images
 
 (defclass image []
-  "A picture that image views and buttons show: from a file (image-from-file) or from
-RGBA pixels (image-from-pixels)."
+  "A picture that image views, buttons, rows and canvases show: from a file
+(image-from-file), the bytes of one (image-from-bytes), RGBA pixels (image-from-pixels),
+the platform's icons (system-image) or text (glyph-image). Its native image lives until
+free-image! frees it."
   (path :init nil)
   (pixels :init nil :doc "A byte array of width × height RGBA pixels, row by row.")
+  (data :init nil :doc "The bytes of an image file (PNG, JPEG, ...).")
+  (system :init nil :doc "The platform's name of a system image.")
+  (glyph :init nil :doc "What a glyph image shows: {:text :font :color :size :template}.")
   (width :init 0)
-  (height :init 0))
+  (height :init 0)
+  (freed :cell :atom :init false :doc "True once free-image! freed it."))
 
 (defn image-from-file
   "The image in the file at path (PNG, and the formats the platform reads)."
@@ -1384,6 +1391,125 @@ RGBA pixels (image-from-pixels)."
     (error "an image of" width "by" height "needs" (* 4 width height) "bytes, not"
            (count pixels)))
   (make image :pixels pixels :width width :height height))
+
+(defgeneric backend-image-data-size [backend bytes]
+  "The [width height] of the image whose file's bytes are bytes; an error if the platform
+can't read it.")
+
+(defn image-from-bytes
+  "The image whose file's contents are bytes (a byte array): PNG, JPEG, GIF, TIFF, and what
+else the platform reads. The image keeps them, so changing bytes afterwards changes
+nothing it shows."
+  [bytes]
+  (when (zero? (count bytes)) (error "the image data is empty"))
+  (let [b (current-backend)
+        [w h] (in-ui (fn [] (backend-image-data-size b bytes)))]
+    (make image :data bytes :width w :height h)))
+
+(defgeneric backend-system-image-size [backend name]
+  "The [width height] of the platform's image called name, or nil if it has none.")
+
+(defn system-image
+  "The platform's icon called name, such as \"star\" or \"folder\" (on macOS an SF
+Symbols name, on GTK an icon theme's), or nil when the platform has none."
+  [name]
+  (let [b (current-backend)]
+    (when-let [[w h] (in-ui (fn [] (backend-system-image-size b name)))]
+      (make image :system name :width w :height h))))
+
+(def ^:private glyph-images
+  "[backend key] -> the glyph image made for key."
+  (atom {}))
+
+(def ensure-font
+  "A font for a font designator (defined with the fonts, below).")
+
+(def dark-mode?
+  "True in dark mode (defined with the appearances, below).")
+
+(defn glyph-image
+  "A square image, :size points on a side (18), of text (a string or character) in its
+middle: in :font (a font designator; its size, the image's if it has none) and :color (a
+color designator, :text by default). A :template image (true for :text) takes its color
+from where it shows, following appearance and selection, as the platforms' symbols do. A
+system color is drawn as it is in the current mode: ask again after :appearance-changed.
+Glyph images are made once and shared."
+  ([text] (glyph-image text {}))
+  ([text opts]
+   (let [size (get opts :size 18)
+         _ (when-not (and (number? size) (pos? size)) (error "a glyph image's size is positive"))
+         text (str text)
+         f (ensure-font (:font opts))
+         f (if (:size f) f (assoc f :size size))
+         color (get opts :color :text)
+         template (boolean (get opts :template (= color :text)))
+         b (current-backend)
+         key [b text f (when-not template [color (when (keyword? color) (dark-mode?))]) size template]]
+     (or (get @glyph-images key)
+         (let [i (make image :glyph {:text text :font f :color color :size size :template template}
+                       :width size :height size)]
+           (swap! glyph-images assoc key i)
+           i)))))
+
+(defgeneric backend-free-image [backend image]
+  "Release the image's native image, if the backend made one.")
+
+(defmethod backend-free-image [(b backend) image]
+  nil)
+
+(defn free-image!
+  "Free the image's native memory now: use it when a program makes many large images, as
+the pages of a document. Afterwards showing or drawing it is an error. Free an image only
+when nothing shows it. Glyph images are shared, so this leaves them alone. Returns the
+image."
+  [i]
+  (when (and (not (:freed i)) (nil? (:glyph i)))
+    (let [b (current-backend)]
+      (in-ui (fn [] (backend-free-image b i))))
+    (set-slot! i :freed true))
+  i)
+
+(defn check-image
+  "The image, or an error if free-image! freed it. Backends call it before showing one."
+  [i]
+  (when (and i (:freed i))
+    (error "the image was freed by free-image! and can't be shown"))
+  i)
+
+(defgeneric backend-font-families [backend]
+  "The names of the font families the platform has.")
+
+(defn font-families
+  "The names of the font families on this system, sorted without regard to case. Ask
+when opening a font chooser, not every frame."
+  []
+  (let [b (current-backend)
+        names (filter (fn [n] (and (string? n) (pos? (count n))))
+                      (in-ui (fn [] (backend-font-families b))))]
+    (vec (sort-by string/lower-case
+                  (vals (reduce (fn [m n] (let [k (string/lower-case n)]
+                                            (if (contains? m k) m (assoc m k n))))
+                                {} names))))))
+
+(defgeneric backend-register-font-file [backend path]
+  "Make the font in the TTF or OTF file at path available to this process.")
+
+(def ^:private registered-fonts (atom #{}))
+
+(defn register-font-file!
+  "Make the font in the TTF or OTF file at path available to this program; then use its
+family name (not the file's) in fonts. Registering a file again does nothing. Returns
+path."
+  [path]
+  (when-not (io/file-exists? path) (error "no font file" (pr-str path)))
+  (let [b (current-backend)
+        k [b path]]
+    (when-not (contains? @registered-fonts k)
+      (in-ui (fn [] (backend-register-font-file b path)))
+      (swap! registered-fonts conj k)
+      ;; A glyph drawn with a fallback font may have its own font now.
+      (reset! glyph-images {})))
+  path)
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Text
@@ -2084,6 +2210,20 @@ or nil)."
    (apply make table-column :title title
           :key (if (integer? key) (fn [row] (nth row key)) key)
           (mapcat identity opts))))
+
+(defn row-icon
+  "The image the list box, table or tree shows for item in its column at column-index:
+the column's :icon-fn's, or for the first column the widget's :icon-fn's, or nil.
+Backends call it with the item itself, not a row number."
+  ([w item] (row-icon w item 0))
+  ([w item column-index]
+   (let [c (get (vec (:columns w)) column-index)
+         f (or (when c (:icon-fn c)) (when (zero? column-index) (:icon-fn w)))]
+     (when f
+       (let [i (f item)]
+         (when-not (or (nil? i) (instance? image i))
+           (error "an :icon-fn gives an image or nil, not" (pr-str i)))
+         (check-image i))))))
 
 (defn cell-text
   "The text column shows for row."
@@ -3352,6 +3492,7 @@ which point of the text is at x, y."
   "Draw the image with its top left at x, y, scaled to :width and :height if given."
   ([gc image x y] (draw-image! gc image x y {}))
   ([gc image x y opts]
+   (check-image image)
    (gc-image gc image (d x) (d y) (d (or (:width opts) (:width image)))
              (d (or (:height opts) (:height image))))))
 
