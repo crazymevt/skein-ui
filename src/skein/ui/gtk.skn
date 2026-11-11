@@ -2640,7 +2640,7 @@ a handler consumed it."
 
 (defn- inherited-appearance [w]
   (some (fn [o] (let [a (:appearance o)] (when (or (= a :light) (= a :dark)) a)))
-        (take-while some? (iterate :parent w))))
+        (ui/holders w)))
 
 (defmethod ui/backend-widget-appearance [(b gtk-backend) w]
   (or (inherited-appearance w) (if (ui/backend-dark-mode? b) :dark :light)))
@@ -3062,3 +3062,122 @@ reporting window points as the pane's event controller would."
     (tab-drag-motion! pane (/ (+ sx tx) 2) (/ (+ sy ty) 2))
     (tab-drag-motion! pane tx ty)
     (tab-drag-release! pane tx ty)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Popovers and completion popups: a GtkPopover holding a GtkFixed, parented to the
+;;; widget it is shown for while it is shown. A completion popup's has no arrow and doesn't
+;;; hide itself, and the widget it is shown for keeps the focus.
+
+(def ^:private popdowns
+  "The addresses of the popovers the program is closing, whose closed signal isn't the
+user's doing."
+  (atom #{}))
+
+(defmethod make-native [(s ui/surface-widget)]
+  (let [p (owned (lib/popover-new))
+        host (lib/fixed-new)]
+    (lib/popover-set-child p host)
+    (swap! inner-fixed assoc (ffi/address p) host)
+    (when (instance? ui/completion-popup-widget s)
+      (lib/popover-set-has-arrow p false)
+      (lib/popover-set-autohide p false))
+    (connect! p "closed" :closed signal-imp)
+    p))
+
+(defmethod set-native [(s ui/surface-widget) (p (= :visible)) v]
+  ;; A GtkPopover is visible while it pops up: show-popover! and close-surface! decide.
+  nil)
+
+(defmethod container-view [(s ui/surface-widget)]
+  (get @inner-fixed (ffi/address (native s))))
+
+(defn- unparent-surface! [s]
+  (let [p (native s)]
+    (when-not (ffi/null? (lib/widget-get-parent p))
+      (lib/widget-unparent p))))
+
+(defmethod ui/backend-destroy :before [(b gtk-backend) (s ui/surface-widget)]
+  (unparent-surface! s)
+  (swap! inner-fixed dissoc (ffi/address (native s))))
+
+(defmethod native-signal [(s ui/surface-widget) (k (= :closed)) p arg]
+  (when-not (contains? @popdowns (ffi/address p))
+    (ui/surface-closed! s :dismissed))
+  ;; Let go of the widget it was shown for once GTK is done closing it.
+  (ui/backend-call-later (ui/current-backend)
+                         (fn [] (when (and (not (:shown s)) (not (:destroyed s)))
+                                  (unparent-surface! s)))))
+
+(defmethod set-native [(s ui/surface-widget) (p (= :size)) size]
+  (when-let [[w h] size]
+    (lib/widget-set-size-request (container-view s) w h)))
+
+(defmethod set-native [(s ui/popover-widget) (p (= :behavior)) v]
+  (lib/popover-set-autohide (native s) (not= v :application-defined)))
+
+(defn- point-popover! [s widget [x y width height] position]
+  (let [p (native s)
+        n (native widget)]
+    (when-not (= (ffi/address (lib/widget-get-parent p)) (ffi/address n))
+      (unparent-surface! s)
+      (lib/widget-set-parent p n))
+    (ffi/with-foreign [r (ffi/alloc gdk-rectangle)]
+      (ffi/put-field! r gdk-rectangle :x (int x))
+      (ffi/put-field! r gdk-rectangle :y (int y))
+      (ffi/put-field! r gdk-rectangle :width (max 1 (int width)))
+      (ffi/put-field! r gdk-rectangle :height (max 1 (int height)))
+      (lib/popover-set-pointing-to p r))
+    ;; GTK_POS_LEFT 0, RIGHT 1, TOP 2, BOTTOM 3
+    (lib/popover-set-position p (case position :left 0 :right 1 :top 2 3))
+    (doseq [x (ui/widgets-in s)] (apply-native-appearance! x))
+    (lib/popover-popup p)))
+
+(defmethod ui/backend-show-popover [(b gtk-backend) s widget rectangle edge]
+  (point-popover! s widget rectangle edge))
+
+(defn- pop-down! [s]
+  (let [p (native s)
+        a (ffi/address p)]
+    (swap! popdowns conj a)
+    (try (lib/popover-popdown p)
+         (finally (swap! popdowns disj a)))))
+
+(defmethod ui/backend-close-popover [(b gtk-backend) s]
+  (pop-down! s))
+
+(defmethod ui/backend-caret-rectangle [(b gtk-backend) w position]
+  (let [tv (text-view-of w)]
+    (with-iters
+      (fn [iter _]
+        (lib/text-buffer-get-iter-at-offset (buffer-of w) iter position)
+        (ffi/with-foreign [r (ffi/alloc gdk-rectangle)]
+          (lib/text-view-get-iter-location tv iter r)
+          (ffi/with-foreign [wx (ffi/alloc i32 1)]
+            (ffi/with-foreign [wy (ffi/alloc i32 1)]
+              ;; GTK_TEXT_WINDOW_WIDGET 1: from the buffer to the text view's own
+              (lib/text-view-buffer-to-window-coords tv 1 (ffi/field r gdk-rectangle :x)
+                                                     (ffi/field r gdk-rectangle :y) wx wy)
+              (let [[x y] (or (lib/point-in tv (native w) (ffi/get wx i32) (ffi/get wy i32))
+                              [(ffi/get wx i32) (ffi/get wy i32)])]
+                [(int (math/round x)) (int (math/round y)) 1
+                 (max 1 (ffi/field r gdk-rectangle :height))]))))))))
+
+(defmethod ui/backend-show-panel [(b gtk-backend) s widget anchor]
+  (let [focus (ui/backend-focused-widget b)
+        rectangle (if (vector? anchor)
+                    anchor
+                    (ui/backend-caret-rectangle b widget (if (= anchor :caret)
+                                                           (ui/caret-position widget)
+                                                           anchor)))]
+    ;; GTK centers a popover on what it points at: a list starts at the caret instead.
+    (lib/popover-set-offset (native s) (quot (or (first (:size s)) 0) 2) 0)
+    (point-popover! s widget rectangle :bottom)
+    (when focus (ui/backend-focus b focus))))
+
+(defmethod ui/backend-close-panel [(b gtk-backend) s]
+  (pop-down! s))
+
+(defn native-surface-shown?
+  "True if the surface's GtkPopover is shown."
+  [s]
+  (lib/widget-get-visible (native s)))

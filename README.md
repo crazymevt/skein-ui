@@ -49,7 +49,7 @@ Common Lisp toolkit. It has LGT's widgets except the web view: labels, buttons, 
 check boxes, radio buttons, entries, text views, sliders, spin buttons, progress bars,
 spinners, combo boxes, list boxes, sortable tables, trees, images, color and date
 pickers, frames, notebooks, stacks, tabbed panes (closable, reorderable tabs that drag
-between panes), split panes, scrolled windows and canvases.
+between panes), split panes, scrolled windows, canvases, popovers and completion popups.
 
 - **Backends:** `skein.ui.cocoa` (AppKit, on macOS), `skein.ui.gtk` (GTK 4, on Linux, and
   on macOS with Homebrew's `gtk4`) and `skein.ui.headless` (no screen, for tests). Win32

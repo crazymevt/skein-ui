@@ -566,6 +566,19 @@ hasn't placed it."
 (ffi/defcfun ^:blocking popover-menu-bar-new "gtk_popover_menu_bar_new_from_model" ptr [model ptr])
 (ffi/defcfun ^:blocking popover-menu-new "gtk_popover_menu_new_from_model" ptr [model ptr])
 (ffi/defcfun ^:blocking popover-popup "gtk_popover_popup" void [p ptr])
+(ffi/defcfun ^:blocking popover-new "gtk_popover_new" ptr [])
+(ffi/defcfun ^:blocking popover-set-child "gtk_popover_set_child" void [p ptr, child ptr])
+(ffi/defcfun ^:blocking popover-popdown "gtk_popover_popdown" void [p ptr])
+(ffi/defcfun ^:blocking popover-set-position "gtk_popover_set_position" void [p ptr, pos i32])
+(ffi/defcfun ^:blocking popover-set-autohide "gtk_popover_set_autohide" void [p ptr, v bool])
+(ffi/defcfun ^:blocking popover-set-has-arrow "gtk_popover_set_has_arrow" void [p ptr, v bool])
+(ffi/defcfun ^:blocking popover-set-offset "gtk_popover_set_offset" void [p ptr, x i32, y i32])
+(ffi/defcfun ^:blocking widget-get-mapped "gtk_widget_get_mapped" bool [w ptr])
+(ffi/defcfun ^:blocking text-view-get-iter-location "gtk_text_view_get_iter_location" void
+  [v ptr, iter ptr, rect ptr])
+(ffi/defcfun ^:blocking text-view-buffer-to-window-coords
+  "gtk_text_view_buffer_to_window_coords" void
+  [v ptr, win i32, bx i32, by i32, wx ptr, wy ptr])
 (ffi/defcfun ^:blocking popover-set-pointing-to "gtk_popover_set_pointing_to" void
   [p ptr, rect ptr])
 (ffi/defcfun ^:blocking widget-set-parent "gtk_widget_set_parent" void [w ptr, parent ptr])
