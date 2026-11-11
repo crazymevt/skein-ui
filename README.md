@@ -50,11 +50,12 @@ check boxes, radio buttons, entries, text views, sliders, spin buttons, progress
 spinners, combo boxes, list boxes, sortable tables, trees, images, color and date
 pickers, frames, notebooks, split panes, scrolled windows and canvases.
 
-- **Backends:** `skein.ui.cocoa` (AppKit, on macOS) and `skein.ui.headless` (no screen,
-  for tests). Win32 and GTK 4 come next.
-- **Threads:** AppKit runs on the main thread, where `-main` and `ui/run!` run. Widgets
-  can be made and changed from any fiber: the call is handed to the main thread, which
-  the backend wakes from the event loop.
+- **Backends:** `skein.ui.cocoa` (AppKit, on macOS), `skein.ui.gtk` (GTK 4, on Linux, and
+  on macOS with Homebrew's `gtk4`) and `skein.ui.headless` (no screen, for tests). Win32
+  comes next.
+- **Threads:** the toolkit runs on the main thread, where `-main` and `ui/run!` run.
+  Widgets can be made and changed from any fiber: the call is handed to the main thread,
+  which the backend wakes from the event loop.
 
 ## Using it
 
