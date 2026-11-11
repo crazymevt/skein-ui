@@ -1,0 +1,82 @@
+(ns skein.ui.web-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]))
+
+;; Web views (part H of step 6 of M2.14, D-097), on the headless backend: the tests stand
+;; for the page.
+
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)))
+
+(deftest origins-and-urls
+  (are [url origin] (= origin (ui/web-origin url))
+    "https://Example.com/a?b" "https://example.com"
+    "https://example.com:443/" "https://example.com"
+    "http://example.com:8080/x" "http://example.com:8080"
+    "file:///tmp/a.html" nil
+    "https://user@example.com/" nil
+    "nonsense" nil)
+  (is (ui/web-url? "https://x.org"))
+  (is (ui/web-url? "about:blank"))
+  (is (not (ui/web-url? "docs/index.html")))
+  (is (not (ui/web-url? "C:\\docs\\index.html")))
+  (is (= "\"a\\\"b\\\\c\\u000a\"" (ui/javascript-string "a\"b\\c\n"))))
+
+(deftest loading-and-scripts
+  (let [loaded (atom [])
+        v (ui/web-view {:html "<p>hi</p>" :on-loaded (fn [e] (swap! loaded conj (:value e)))})]
+    (is (= :headless (ui/web-engine v)))
+    (is (ui/web-view-capable? v :messages))
+    (is (= [:html "<p>hi</p>" nil nil] (headless/web-load v)))
+    (is (= "about:blank" (:local-document v)))
+    (is (thrown-with-msg? error "no document" (ui/run-script! v "1+1")))
+    (ui/web-load-finished! v "about:blank")
+    (is (= ["about:blank"] @loaded))
+    (let [results (atom [])
+          id (ui/run-script! v "1+1" (fn [r e] (swap! results conj [r e])))]
+      (is (= [[id "1+1"]] (headless/web-scripts v)))
+      (ui/web-script-completed! v id "2" nil)
+      (ui/web-script-completed! v id "3" nil)
+      (is (= [["2" nil]] @results) "once")
+      (testing "a new document cancels pending scripts"
+        (ui/run-script! v "late" (fn [r e] (swap! results conj [r e])))
+        (set-slot! v :url "https://example.com")
+        (is (= ["2" nil] (first @results)))
+        (is (= [nil "the web document changed"] (second @results)))
+        (is (nil? (:html v)) ":url replaces :html")
+        (is (not (ui/web-view-ready? v)))))
+    (testing "a script without a callback reports failures"
+      (let [errors (atom [])]
+        (ui/on v :script-error (fn [e] (swap! errors conj (:value e))))
+        (ui/web-load-finished! v "https://example.com/")
+        (let [id (ui/run-script! v "boom()")]
+          (ui/web-script-completed! v id nil "boom is not defined")
+          (is (= ["boom is not defined"] @errors)))))
+    (testing "post-message! dispatches a message event"
+      (let [id (ui/post-message! v "{\"a\":1}")]
+        (is (string? (second (last (headless/web-scripts v)))))
+        (is (= id (first (last (headless/web-scripts v)))))))
+    (ui/destroy! v)
+    (is (:web-destroyed @(:native v)))))
+
+(deftest messages-and-navigation
+  (let [got (atom [])
+        v (ui/web-view {:url "https://app.example.com/page"
+                        :message-origins ["https://app.example.com"]
+                        :on-message (fn [e] (swap! got conj (:value e)))})]
+    (is (ui/web-message-received! v "hello" "https://app.example.com/other"))
+    (is (not (ui/web-message-received! v "evil" "https://evil.example.com/")))
+    (is (not (ui/web-message-received! v "frame" "https://app.example.com/" false)) "main frame only")
+    (is (= ["hello"] @got))
+    (ui/on v :navigation-request (fn [e] (when (= "https://blocked.example/" (:url e)) (ui/veto e))))
+    (is (ui/web-navigation-requested! v "https://ok.example/" {:kind :link}))
+    (is (not (ui/web-navigation-requested! v "https://blocked.example/" {:kind :link}))))
+  (let [got (atom [])
+        local (ui/web-view {:html "<p>x</p>" :local-messages true
+                            :on-message (fn [e] (swap! got conj (:value e)))})
+        plain (ui/web-view {:html "<p>x</p>"})]
+    (is (ui/web-message-received! local "from the page" "about:blank"))
+    (is (not (ui/web-message-received! plain "not trusted" "about:blank")))
+    (is (= ["from the page"] @got)))
+  (is (thrown-with-msg? error "not both" (ui/web-view {:url "https://a.example" :html "x"})))
+  (is (thrown-with-msg? error "canonical" (ui/web-view {:message-origins ["https://a.example/"]}))))

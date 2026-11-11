@@ -975,3 +975,36 @@ platform tells the core, which emits :closed with :dismissed). True if it closed
   [w [x y] [width height]]
   (ui/moved-by-user! w x y)
   (ui/resized-by-user! w width height))
+
+;;; ------------------------------------------------------------------------------------
+;;; Web views: the headless engine records loads and scripts; tests stand for the page
+;;; (load-finished!, the page's messages, navigation, script results).
+
+(defmethod ui/backend-web-engine-info [(b headless-backend) engine]
+  {:engine :headless :version "recording"
+   :capabilities [:file-loading :html :script-results :messages :navigation-policy :context-menu]})
+
+(defmethod ui/backend-web-load [(b headless-backend) v kind source base read-access]
+  (swap! (:native v) assoc :web-load [kind source base read-access])
+  (set-slot! v :local-document
+             (cond (= kind :html) (cond (nil? base) "about:blank"
+                                        (ui/web-url? base) (when (string/starts-with? base "file:") base)
+                                        :else (ui/file-url base))
+                   (ui/web-url? source) (when (string/starts-with? source "file:") source)
+                   :else (ui/file-url source))))
+
+(defmethod ui/backend-web-run-script [(b headless-backend) v script id]
+  (swap! (:native v) update :web-scripts (fnil conj []) [id script]))
+
+(defmethod ui/backend-web-destroy [(b headless-backend) v]
+  (swap! (:native v) assoc :web-destroyed true))
+
+(defn web-load
+  "The web view's last load: [kind source base read-access]."
+  [v]
+  (:web-load @(:native v)))
+
+(defn web-scripts
+  "The scripts the web view was asked to run, oldest first: [id script]."
+  [v]
+  (:web-scripts @(:native v)))

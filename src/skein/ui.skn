@@ -5564,6 +5564,298 @@ the view, or nil. Platforms whose native view does the editing keys don't call i
         :else nil))))
 
 ;;; ------------------------------------------------------------------------------------
+;;; Web views: an embedded browser, the platform's engine (WKWebView, WebKitGTK), with
+;;; navigation, scripts and messages. Messages from pages are refused until trusted: a
+;;; local document the program loaded (:local-messages) or listed HTTP(S) origins. This is
+;;; not a bridge for evaluating Skein from a page.
+
+(defclass web-navigation-event [vetoable-event]
+  "A proposed navigation to :url, which veto keeps out of the view. :kind is :link,
+:form, :back-forward, :reload, :form-resubmitted or :other; :main-frame and :new-window say
+where it would load."
+  (url :init nil)
+  (kind :init :other)
+  (main-frame :init true)
+  (new-window :init false))
+
+(defclass web-error-event [value-event]
+  "A load or script failed: :value is the message, :url the failing URL if known."
+  (url :init nil))
+
+(defclass web-view-widget [widget]
+  "An embedded web browser. Load a page with :url (a URL with a scheme, or a local file's
+path) or :html (a string, its relative links against :base-url). It emits :loaded (a
+value-event with the URL) when a document finished loading, :load-error, :script-error,
+:navigation-request (vetoable, links and new windows included), and :message for each
+message (a string, objects as JSON text) a trusted page sends with
+window.skein.postMessage(value)."
+  (engine :init :native :doc "The engine asked for: :native, the platform's.")
+  (engine-info :cell :atom :init nil)
+  (url :cell :atom :init nil :doc "A URL, or a local file's path, to load; or nil.")
+  (html :cell :atom :init nil :doc "An HTML string to load instead of :url, or nil.")
+  (base-url :init nil :doc "The URL or path relative links in :html resolve against.")
+  (read-access :init nil
+               :doc "A file or folder a loaded local document may read; nil for itself only.")
+  (local-messages :init false
+                  :doc "Whether the local document the program loaded (or :html) may send
+messages.")
+  (message-origins :init [] :doc "The HTTP(S) origins (\"https://example.com\") whose
+pages, in the main frame, may send messages.")
+  (custom-context-menu :init false
+                       :doc "Whether a right-click in the page emits :context-request
+instead of the page's own menu (a trusted page only).")
+  (loaded :cell :atom :init false :doc "True once the main document finished loading.")
+  (current-url :cell :atom :init nil)
+  (local-document :cell :atom :init nil
+                  :doc "The URL of the local document the program loaded (backends set it).")
+  (script-counter :cell :atom :init 0)
+  (scripts :cell :atom :init {} :doc "Pending scripts: id -> callback, or nil.")
+  (hexpand :cell :atom :init true)
+  (vexpand :cell :atom :init true))
+
+(declare-widget! web-view-widget
+                 {:signals (merge input-signals
+                                  {:message value-event :loaded value-event
+                                   :load-error web-error-event :script-error web-error-event
+                                   :navigation-request web-navigation-event})})
+
+(defgeneric backend-web-engine-info [backend engine]
+  "{:engine :version :capabilities} of the engine (:native for the platform's).")
+
+(defgeneric backend-web-load [backend view kind source base read-access]
+  "Load source in the web view: kind :url (a URL or file path) or :html (a string, against
+base). Set the view's :local-document when the program loads a local document.")
+
+(defgeneric backend-web-run-script [backend view script id]
+  "Run the JavaScript script in the view's main frame; report with web-script-completed!.")
+
+(defgeneric backend-web-destroy [backend view]
+  "Let go of the web view's engine: stop loading, drop its handlers.")
+
+(defmethod backend-web-destroy [(b backend) view]
+  nil)
+
+(defn web-origin
+  "The canonical HTTP(S) origin of the URL (\"https://example.com\", with a port only if
+not the scheme's default), or nil."
+  [url]
+  (when (string? url)
+    (when-let [sep (string/index-of url "://")]
+      (let [scheme (string/lower-case (subs url 0 sep))
+            rest-url (subs url (+ sep 3))
+            end (or (first (keep-indexed (fn [i c] (when (contains? #{\/ \? \#} c) i)) rest-url))
+                    (count rest-url))
+            authority (string/lower-case (subs rest-url 0 end))
+            default (if (= scheme "https") ":443" ":80")]
+        (when (and (contains? #{"http" "https"} scheme) (pos? (count authority))
+                   (not (some (fn [c] (contains? #{\space \tab \newline \return \\ \@} c)) authority)))
+          (str scheme "://" (if (and (> (count authority) (count default))
+                                     (string/ends-with? authority default))
+                              (subs authority 0 (- (count authority) (count default)))
+                              authority)))))))
+
+(defn web-url?
+  "True if s is a URL (it has a scheme: https:, file:, about:, ...), not a file path. A
+one-letter scheme is a Windows drive."
+  [s]
+  (let [i (when (string? s) (string/index-of s ":"))
+        letter? (fn [c] (let [n (int c)] (or (<= 65 n 90) (<= 97 n 122))))]
+    (boolean (and i (> i 1) (letter? (first s))
+                  (every? (fn [c] (or (letter? c) (<= 48 (int c) 57) (contains? #{\+ \- \.} c)))
+                          (subs s 0 i))))))
+
+(defmethod initialize :before [(v web-view-widget)]
+  (when (and (:url v) (:html v)) (error "a web view loads :url or :html, not both"))
+  (when-not (or (nil? (:html v)) (string? (:html v))) (error "a web view's :html is a string"))
+  (doseq [o (:message-origins v)]
+    (when-not (and (string? o) (= o (web-origin o)))
+      (error "a message origin is a canonical HTTP(S) origin, such as \"https://example.com\", not"
+             (pr-str o))))
+  (let [b (current-backend)]
+    (set-slot! v :engine-info (in-ui (fn [] (backend-web-engine-info b (:engine v)))))))
+
+(defn web-engine-info
+  "{:engine :version :capabilities} of the web view's engine."
+  [v]
+  (:engine-info v))
+
+(defn web-engine
+  "The engine the web view uses, such as :webkit."
+  [v]
+  (:engine (:engine-info v)))
+
+(defn web-view-capable?
+  "True if the web view's engine can do capability (:html, :file-loading,
+:script-results, :messages, :navigation-policy, :context-menu)."
+  [v capability]
+  (boolean (some (fn [c] (= c capability)) (:capabilities (:engine-info v)))))
+
+(defn web-view-ready?
+  "True once the web view's main document has loaded, so run-script! can run."
+  [v]
+  (boolean (:loaded v)))
+
+(defn- cancel-web-scripts! [v message]
+  (let [callbacks (keep identity (vals (:scripts v)))]
+    (set-slot! v :scripts {})
+    (doseq [f callbacks] (f nil message))))
+
+(defn web-load-started!
+  "Backends call this when the web view starts loading another main document: it isn't
+ready, and its pending scripts end with an error."
+  [v]
+  (set-slot! v :loaded false)
+  (cancel-web-scripts! v "the web document changed"))
+
+(defn web-load-finished!
+  "Backends call this when the web view's main document finished loading url."
+  [v url]
+  (when-not (:destroyed v)
+    (set-slot! v :loaded true)
+    (set-slot! v :current-url url)
+    (emit! v (event-for v :loaded :value url))))
+
+(defn web-load-failed!
+  "Backends call this when the web view's main document failed to load."
+  ([v message] (web-load-failed! v message nil))
+  ([v message url]
+   (when-not (:destroyed v)
+     (web-load-started! v)
+     (emit! v (event-for v :load-error :value message :url url)))))
+
+(defn- document-url [url] (when url (first (string/split url "#"))))
+
+(defn web-message-allowed?
+  "Backends ask: may the page at source-url, in the main frame or not, send the web view a
+message?"
+  ([v source-url] (web-message-allowed? v source-url true))
+  ([v source-url main-frame]
+   (boolean
+    (and (not (:destroyed v)) main-frame
+         (or (and (:local-messages v) (:local-document v)
+                  (= (document-url source-url) (document-url (:local-document v))))
+             (let [o (web-origin source-url)]
+               (and o (some (fn [x] (= x o)) (:message-origins v)))))))))
+
+(defn web-message-received!
+  "Backends call this with a message (a string) from the page at source-url: the view
+emits :message if the page is trusted. True if it was delivered."
+  ([v message source-url] (web-message-received! v message source-url true))
+  ([v message source-url main-frame]
+   (when (web-message-allowed? v source-url main-frame)
+     (emit! v (event-for v :message :value message))
+     true)))
+
+(defn web-navigation-requested!
+  "Backends call this for a navigation the page asks for: the view emits
+:navigation-request; true if no handler vetoed it."
+  ([v url] (web-navigation-requested! v url {}))
+  ([v url opts]
+   (and (not (:destroyed v))
+        (not (vetoed? (emit! v (event-for v :navigation-request :url url
+                                          :kind (get opts :kind :other)
+                                          :main-frame (get opts :main-frame true)
+                                          :new-window (get opts :new-window false))))))))
+
+(defn web-script-completed!
+  "Backends call this once a script finished: result is JSON text (nil for undefined),
+error a message or nil. A script without a callback emits :script-error on failure."
+  [v id result error]
+  (when (contains? (:scripts v) id)
+    (let [f (get (:scripts v) id)]
+      (update-slot! v :scripts dissoc id)
+      (if f
+        (f result error)
+        (when (and error (not (:destroyed v)))
+          (emit! v (event-for v :script-error :value error :url (:current-url v))))))))
+
+(defn run-script!
+  "Run the JavaScript script in the web view's main frame, which must have loaded. The
+callback, if given, gets (result error) once on the UI thread: result is JSON text (nil for
+undefined), error a message or nil. Without one, a failure emits :script-error. Returns
+the script's id."
+  ([v script] (run-script! v script nil))
+  ([v script callback]
+   (when-not (string? script) (error "a script is a string"))
+   (when (or (:destroyed v) (not (:loaded v)))
+     (error "the web view has no document loaded"))
+   (let [id (update-slot! v :script-counter inc)
+         b (current-backend)]
+     (update-slot! v :scripts assoc id callback)
+     (try (in-ui (fn [] (backend-web-run-script b v script id)))
+          (catch error e
+            (update-slot! v :scripts dissoc id)
+            (error e)))
+     id)))
+
+(defn javascript-string
+  "s as a JavaScript (and JSON) string literal, quotes included."
+  [s]
+  (apply str (concat ["\""]
+                     (map (fn [c]
+                            (let [n (int c)]
+                              (cond (= c \") "\\\""
+                                    (= c \\) "\\\\"
+                                    (or (< n 32) (= n 0x2028) (= n 0x2029)) (format "\\u%04x" n)
+                                    :else (str c))))
+                          s)
+                     ["\""])))
+
+(defn post-message!
+  "Send json (JSON text) to the page: its window's \"message\" listeners get it parsed, as
+data, with origin \"skein\". callback as for run-script!."
+  ([v json] (post-message! v json nil))
+  ([v json callback]
+   (run-script! v (str "window.dispatchEvent(new MessageEvent('message',{data:JSON.parse("
+                       (javascript-string json) "),origin:'skein'}));")
+                callback)))
+
+(defn- load-web! [v]
+  (let [b (current-backend)
+        [kind source] (cond (:html v) [:html (:html v)]
+                            (:url v) [:url (:url v)]
+                            :else [nil nil])]
+    (when kind
+      (web-load-started! v)
+      (set-slot! v :local-document nil)
+      (in-ui (fn [] (backend-web-load b v kind source (:base-url v) (:read-access v)))))))
+
+(defmethod initialize :after [(v web-view-widget)]
+  (add-watch (cell v :url) ::load
+             (fn [_ _ old new]
+               (when (and new (not= old new))
+                 (set-slot! v :html nil)
+                 (load-web! v))))
+  (add-watch (cell v :html) ::load
+             (fn [_ _ old new]
+               (when (and new (not= old new))
+                 (when-not (string? new) (error "a web view's :html is a string"))
+                 (set-slot! v :url nil)
+                 (load-web! v))))
+  (load-web! v))
+
+(defmethod measure [(v web-view-widget)]
+  [400 300])
+
+(defmethod destroy! :before [(v web-view-widget)]
+  (when-not (:destroyed v)
+    (set-slot! v :loaded false)
+    (let [b (current-backend)]
+      (when (realized? v) (in-ui (fn [] (backend-web-destroy b v)))))
+    (cancel-web-scripts! v "the web view was destroyed")))
+
+(defn web-view
+  "A web view: (web-view {:url \"https://example.com\" :message-origins [\"https://example.com\"]})."
+  ([] (web-view {}))
+  ([opts] (build web-view-widget opts nil)))
+
+(defn file-url
+  "The file: URL of the local file at path (made absolute)."
+  [path]
+  (let [p (io/absolute-path path)]
+    (str "file://" (if (string/starts-with? p "/") p (str "/" (string/replace p "\\" "/"))))))
+
+;;; ------------------------------------------------------------------------------------
 ;;; Appearance, palettes and control sizes
 
 (def system-palette
