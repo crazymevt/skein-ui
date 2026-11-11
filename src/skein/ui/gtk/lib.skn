@@ -673,6 +673,11 @@ hasn't placed it."
 (ffi/defcfun ^:blocking window-unmaximize "gtk_window_unmaximize" void [w ptr])
 (ffi/defcfun ^:blocking window-is-maximized "gtk_window_is_maximized" bool [w ptr])
 (ffi/defcfun ^:blocking window-fullscreen "gtk_window_fullscreen" void [w ptr])
+(ffi/defcfun ^:blocking window-unfullscreen "gtk_window_unfullscreen" void [w ptr])
+(ffi/defcfun ^:blocking window-unminimize "gtk_window_unminimize" void [w ptr])
+(ffi/defcfun ^:blocking window-is-fullscreen "gtk_window_is_fullscreen" bool [w ptr])
+(ffi/defcfun ^:blocking native-get-surface "gtk_native_get_surface" ptr [n ptr])
+(ffi/defcfun ^:blocking toplevel-get-state "gdk_toplevel_get_state" u32 [t ptr])
 (ffi/defcfun ^:blocking root-get-focus "gtk_root_get_focus" ptr [r ptr])
 
 ;;; Dialogs, the clipboard and the system

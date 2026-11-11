@@ -90,7 +90,7 @@ with args, a map.")
   [:clicked :activate :changed :toggled :value-changed :resized :selected :switch-page
    :close-request :position :sort :items-changed :pressed :released :motion :enter :leave
    :scroll :key-pressed :key-released :window-key :closed :menu-activate :active
-   :page-reordered :tab-close :mark-set])
+   :page-reordered :tab-close :mark-set :window-state])
 
 (defn- kind-of [data] (nth signal-kinds (ffi/address data)))
 
@@ -3644,3 +3644,75 @@ which has it already."
   "True if the list box's, table's or tree's cell at row and column shows an icon."
   [w row column]
   (contains? @icon-cells [(ffi/address (native w)) row column]))
+
+;;; ------------------------------------------------------------------------------------
+;;; Window states, from the toplevel surface's state. GTK 4 keeps a window's default size
+;;; as its normal one, so the content's actual size is read back when the state settles.
+
+(def ^:private watched-surfaces
+  "The addresses of the window surfaces whose state we watch."
+  (atom #{}))
+
+(defmethod ui/backend-window-state [(b gtk-backend) w]
+  (let [win (native w)
+        surface (lib/native-get-surface win)
+        bits (if (ffi/null? surface) 0 (lib/toplevel-get-state surface))]
+    ;; GDK_TOPLEVEL_STATE_MINIMIZED 1, MAXIMIZED 2, FULLSCREEN 8
+    (cond (pos? (bit-and bits 1)) :minimized
+          (or (pos? (bit-and bits 8)) (lib/window-is-fullscreen win)) :fullscreen
+          (or (pos? (bit-and bits 2)) (lib/window-is-maximized win)) :maximized
+          :else :normal)))
+
+(defn- settle-window-state! [w]
+  (when (and (ui/realized? w) (:shown w))
+    (let [b (ui/current-backend)
+          state (ui/backend-window-state b w)
+          content (container-view w)
+          size (if (= state :normal)
+                 [(:width (:normal-frame w) (:width w)) (:height w)]
+                 [(lib/widget-get-width content) (lib/widget-get-height content)])]
+      (when (and (not= state :minimized) (every? pos? size))
+        (if (= state :normal)
+          (when-let [[nw nh] (:size (:normal-frame w))]
+            (quietly (fn [] (lib/window-set-default-size (native w) nw (+ nh (bar-height w)))))
+            (ui/resized-by-user! w nw nh))
+          (apply ui/resized-by-user! w size)))
+      (ui/state-changed-by-user! w state))))
+
+(defmethod native-signal [(w ui/window-widget) (k (= :window-state)) surface arg]
+  ;; Let GTK lay the window out at its new size first.
+  (ui/backend-call-later (ui/current-backend) (fn [] (settle-window-state! w))))
+
+(defn- watch-surface! [w]
+  (let [surface (lib/native-get-surface (native w))]
+    (when (and (not (ffi/null? surface)) (not (contains? @watched-surfaces (ffi/address surface))))
+      (swap! watched-surfaces conj (ffi/address surface))
+      (lib/register! surface w)
+      (connect! surface "notify::state" :window-state signal-arg-imp))))
+
+(defn- apply-window-state! [w state]
+  (let [win (native w)
+        now (ui/backend-window-state (ui/current-backend) w)]
+    (when (not= now state)
+      (when (= now :normal)
+        (set-slot! w :normal-frame {:position (:position w) :size [(:width w) (:height w)]}))
+      (case now
+        :minimized (lib/window-unminimize win)
+        :fullscreen (lib/window-unfullscreen win)
+        :maximized (when (not= state :fullscreen) (lib/window-unmaximize win))
+        nil)
+      (case state
+        :minimized (lib/window-minimize win)
+        :maximized (lib/window-maximize win)
+        :fullscreen (lib/window-fullscreen win)
+        nil))))
+
+(defmethod set-native [(w ui/window-widget) (p (= :state)) state]
+  (when (:shown w) (apply-window-state! w state)))
+
+(defmethod ui/backend-show :after [(b gtk-backend) (w ui/window-widget)]
+  (watch-surface! w)
+  (when (not= (:state w) :normal)
+    (when (nil? (:normal-frame w))
+      (set-slot! w :normal-frame {:position (:position w) :size [(:width w) (:height w)]}))
+    (apply-window-state! w (:state w))))
