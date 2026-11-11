@@ -89,7 +89,7 @@ with args, a map.")
   [:clicked :activate :changed :toggled :value-changed :resized :selected :switch-page
    :close-request :position :sort :items-changed :pressed :released :motion :enter :leave
    :scroll :key-pressed :key-released :window-key :closed :menu-activate :active
-   :page-reordered :tab-close])
+   :page-reordered :tab-close :mark-set])
 
 (defn- kind-of [data] (nth signal-kinds (ffi/address data)))
 
@@ -108,6 +108,10 @@ this namespace's), reporting it as kind. Returns o."
 (ffi/defcallback signal-arg-imp void [instance ptr, arg ptr, data ptr]
   (when-let [w (lib/object-for instance)]
     (native-signal w (kind-of data) instance arg)))
+
+(ffi/defcallback signal-args2-imp void [instance ptr, a ptr, b ptr, data ptr]
+  (when-let [w (lib/object-for instance)]
+    (native-signal w (kind-of data) instance [a b])))
 
 (ffi/defcallback close-request-imp bool [window ptr, data ptr]
   (when-let [w (lib/object-for window)]
@@ -2467,7 +2471,9 @@ clicks OK (nil cancels it); a file chooser is cancelled."
          (if (:italic f) "font-style: italic; " ""))))
 
 (defn- style-target [w]
-  (if (instance? ui/text-view-widget w) (text-view-of w) (native w)))
+  (if (or (instance? ui/text-view-widget w) (instance? ui/code-view-widget w))
+    (text-view-of w)
+    (native w)))
 
 (def ^:private size-scales {:small "85%" :mini "72%" :large "115%"})
 
@@ -2528,7 +2534,8 @@ colors, the palette's text and background colors, a container's surface or backg
 (defn- input-target
   "The GTK widget that gets a widget's keys and clicks, given its own GTK widget n."
   [w n]
-  (cond (instance? ui/text-view-widget w) (get @text-views (ffi/address n))
+  (cond (or (instance? ui/text-view-widget w) (instance? ui/code-view-widget w))
+        (get @text-views (ffi/address n))
         (or (instance? ui/list-box-widget w) (instance? ui/tree-view-widget w))
         (:view (get @list-parts (ffi/address n)))
         :else n))
@@ -2565,7 +2572,9 @@ colors, the palette's text and background colors, a container's surface or backg
 
 (defn- emit-input! [w signal & kvs]
   (let [e (apply ui/event-for w signal kvs)]
-    (ui/emit! w e)
+    ;; The native control acts on what no handler consumes.
+    (binding [ui/*native-input* true]
+      (ui/emit! w e))
     (ui/consumed? e)))
 
 (defmethod native-input [(w ui/widget) kind controller args]
@@ -3209,3 +3218,288 @@ user's doing."
   "True if the surface's GtkPopover is shown."
   [s]
   (lib/widget-get-visible (native s)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Code views: each is a GtkTextView with a GtkTextBuffer of its own that mirrors the
+;;; core's text buffer; the native view's edits come back as buffer changes made with the
+;;; view as their origin, so the other views of the buffer get them. Runs are text tags;
+;;; the gutter is a drawing area in the text view's left window.
+
+(def ^:private code-parts
+  "A code view's GtkScrolledWindow address -> {:gutter :gutter-width :placeholder :tags}."
+  (atom {}))
+
+(defn- code-parts-of [w] (get @code-parts (ffi/address (native w))))
+
+(def ^:private native-origin
+  "The code view whose GtkTextBuffer made the change being applied to the core's buffer,
+which has it already."
+  (atom nil))
+
+(defmethod make-native [(w ui/code-view-widget)]
+  (let [scroll (owned (lib/scrolled-new))
+        tv (lib/text-view-new)
+        gutter (lib/drawing-area-new)
+        adj (lib/scrolled-get-vadjustment scroll)]
+    (lib/scrolled-set-child scroll tv)
+    (lib/text-view-set-monospace tv true)
+    (swap! text-views assoc (ffi/address scroll) tv)
+    (let [buffer (lib/text-view-get-buffer tv)]
+      (also-register! buffer w)
+      (connect! buffer "changed" :changed signal-imp)
+      (lib/g-signal-connect-data buffer "mark-set" signal-args2-imp
+                                 (lib/signal-data (index-of signal-kinds :mark-set)) (ffi/null) 0))
+    (lib/drawing-area-set-draw-func gutter draw-imp (ffi/null) (ffi/null))
+    (also-register! gutter w)
+    (lib/text-view-set-gutter tv 3 gutter)   ; GTK_TEXT_WINDOW_LEFT
+    (also-register! adj w)
+    (connect! adj "value-changed" :value-changed signal-imp)
+    (swap! code-parts assoc (ffi/address scroll) {:gutter gutter :tags {}})
+    scroll))
+
+(defmethod ui/backend-destroy :before [(b gtk-backend) (w ui/code-view-widget)]
+  (swap! code-parts dissoc (ffi/address (native w))))
+
+(defmethod native-natural-size [(w ui/code-view-widget)] [300 200])
+
+(defn- code-buffer [w] (buffer-of w))
+
+(defn- iter-at [w iter position]
+  (lib/text-buffer-get-iter-at-offset (code-buffer w) iter position))
+
+(def ^:private update-code-placeholder!
+  "Show the code view's placeholder while it is empty (defined below).")
+
+(def ^:private update-code-gutter!
+  "Size the code view's gutter for its lines and redraw it (defined below).")
+
+(defn- show-buffer-text! [w]
+  (quietly (fn [] (lib/text-buffer-set-text (code-buffer w) (ui/buffer-text (:buffer w)) -1)))
+  (update-code-placeholder! w)
+  (update-code-gutter! w))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :buffer)) buffer]
+  (show-buffer-text! w))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :editable)) v]
+  (lib/text-view-set-editable (text-view-of w) (boolean v)))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :wrap)) v]
+  (lib/text-view-set-wrap-mode (text-view-of w) (if v 3 0)))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :line-numbers)) v]
+  (update-code-gutter! w))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :placeholder)) v]
+  (update-code-placeholder! w))
+
+(defn- show-tab-width! [w]
+  (let [[sw _] (ui/backend-text-size (ui/current-backend) " " (:font w))
+        tabs (lib/pango-tab-array-new 1 true)]
+    (lib/pango-tab-array-set-tab tabs 0 0 (max 1 (int (math/round (* sw (max 1 (:tab-width w)))))))
+    (lib/text-view-set-tabs (text-view-of w) tabs)
+    (lib/pango-tab-array-free tabs)))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :tab-width)) v]
+  (show-tab-width! w))
+
+(defmethod set-native :after [(w ui/code-view-widget) (p (= :font)) f]
+  (show-tab-width! w)
+  (update-code-gutter! w))
+
+(defn- native-code-text [w]
+  (buffer-text (code-buffer w)))
+
+(defn- native-selection-of [w]
+  (let [b (code-buffer w)]
+    (with-iters (fn [a c]
+                  (lib/text-buffer-get-iter-at-mark b a (lib/text-buffer-get-selection-bound b))
+                  (lib/text-buffer-get-iter-at-mark b c (lib/text-buffer-get-insert b))
+                  [(lib/text-iter-get-offset a) (lib/text-iter-get-offset c)]))))
+
+(defmethod native-signal [(w ui/code-view-widget) (k (= :changed)) buffer arg]
+  ;; The user's edit: from the core's text to the view's, by the parts that differ.
+  (update-code-placeholder! w)
+  (when-not (quiet?)
+    (let [old (ui/code-text w)
+          new (native-code-text w)]
+      (when (not= old new)
+        (let [o (vec old)
+              n (vec new)
+              start (loop [i 0] (if (and (< i (count o)) (< i (count n)) (= (o i) (n i))) (recur (inc i)) i))
+              [old-end new-end] (loop [a (count o) z (count n)]
+                                  (if (and (> a start) (> z start) (= (o (dec a)) (n (dec z))))
+                                    (recur (dec a) (dec z))
+                                    [a z]))
+              text (apply str (subvec n start new-end))]
+          (reset! native-origin w)
+          (try
+            (binding [ui/*edit-origin* w]
+              (ui/replace-buffer-range! (:buffer w) start old-end text
+                                        (<= (+ (- old-end start) (- new-end start)) 1)))
+            (finally (reset! native-origin nil)))))
+      (apply ui/native-selection-changed! w (native-selection-of w)))
+    (update-code-gutter! w)))
+
+(defmethod native-signal [(w ui/code-view-widget) (k (= :mark-set)) buffer arg]
+  (when-not (quiet?)
+    (apply ui/native-selection-changed! w (native-selection-of w))
+    (when-let [g (:gutter (code-parts-of w))] (lib/widget-queue-draw g))))
+
+(defmethod native-signal [(w ui/code-view-widget) (k (= :value-changed)) adj arg]
+  (when-not (:destroyed w)
+    (when-let [g (:gutter (code-parts-of w))] (lib/widget-queue-draw g))
+    (ui/code-view-scrolled! w)))
+
+(defmethod ui/backend-buffer-replaced [(b gtk-backend) buffer start old-end text removed]
+  (doseq [v (:views buffer)]
+    ;; The view the edit came from has it already.
+    (when (and (ui/realized? v) (not (identical? v @native-origin)))
+      (quietly
+       (fn []
+         (with-iters (fn [a z]
+                       (iter-at v a start)
+                       (iter-at v z old-end)
+                       (lib/text-buffer-delete (code-buffer v) a z)
+                       (iter-at v a start)
+                       (lib/text-buffer-insert (code-buffer v) a text -1)))))
+      (update-code-placeholder! v))))
+
+(defmethod ui/backend-code-set-selection [(b gtk-backend) w anchor cursor]
+  (quietly (fn [] (with-iters (fn [c a]
+                                (iter-at w c cursor)
+                                (iter-at w a anchor)
+                                (lib/text-buffer-select-range (code-buffer w) c a)))))
+  (when-let [g (:gutter (code-parts-of w))] (lib/widget-queue-draw g)))
+
+(defmethod ui/backend-code-position-at-point [(b gtk-backend) w x y]
+  (with-iters (fn [iter _]
+                (lib/text-view-get-iter-at-location (text-view-of w) iter (int x) (int y))
+                (lib/text-iter-get-offset iter))))
+
+(defmethod ui/backend-code-point-at-position [(b gtk-backend) w position]
+  (with-iters (fn [iter _]
+                (iter-at w iter position)
+                (ffi/with-foreign [r (ffi/alloc gdk-rectangle)]
+                  (lib/text-view-get-iter-location (text-view-of w) iter r)
+                  [(ffi/field r gdk-rectangle :x) (ffi/field r gdk-rectangle :y)
+                   (max 1 (ffi/field r gdk-rectangle :height))]))))
+
+(defmethod ui/backend-code-scroll-to-position [(b gtk-backend) w position]
+  (with-iters (fn [iter _]
+                (iter-at w iter position)
+                (lib/text-view-scroll-to-iter (text-view-of w) iter 0.0 false 0.0 0.0))))
+
+(defn- visible-rect [w]
+  (ffi/with-foreign [r (ffi/alloc gdk-rectangle)]
+    (lib/text-view-get-visible-rect (text-view-of w) r)
+    [(ffi/field r gdk-rectangle :x) (ffi/field r gdk-rectangle :y)
+     (ffi/field r gdk-rectangle :width) (ffi/field r gdk-rectangle :height)]))
+
+(defmethod ui/backend-code-visible-lines [(b gtk-backend) w]
+  (let [[_ y _ h] (visible-rect w)
+        buffer (:buffer w)
+        at (fn [yy] (ui/position-line buffer (min (ui/text-length w)
+                                                  (ui/backend-code-position-at-point b w 0 yy))))]
+    [(at y) (at (+ y (max 0 (dec h))))]))
+
+(defn- gutter-size [w]
+  (let [[tw _] (ui/backend-text-size (ui/current-backend)
+                                     (str (apply str (repeat (max 3 (count (str (ui/buffer-line-count (:buffer w))))) "0")) " ")
+                                     (:font w))]
+    (+ 12 (int (math/ceil tw)))))
+
+(defn- update-code-gutter! [w]
+  (when-let [g (:gutter (code-parts-of w))]
+    (let [width (if (:line-numbers w) (gutter-size w) 0)]
+      (lib/widget-set-visible g (boolean (:line-numbers w)))
+      (when (not= width (:gutter-width (code-parts-of w)))
+        (lib/widget-set-size-request g width -1)
+        (swap! code-parts assoc-in [(ffi/address (native w)) :gutter-width] width))
+      (lib/widget-queue-draw g))))
+
+(defmethod ui/backend-code-gutter-width [(b gtk-backend) w]
+  (or (:gutter-width (code-parts-of w)) (gutter-size w)))
+
+(defmethod native-draw [(w ui/code-view-widget) cr width height]
+  ;; The gutter: line numbers beside the lines that show, the caret's line in full color.
+  (when-not (:destroyed w)
+    (let [gc (make gtk-context :cr cr :width width :height height :widget w)
+          b (ui/current-backend)
+          buffer (:buffer w)
+          current (ui/position-line buffer (:cursor w))
+          [first-line last-line] (ui/backend-code-visible-lines b w)]
+      (ui/fill-rectangle! gc 0 0 width height {:color (ui/widget-color w :gutter-background)})
+      (doseq [line (range first-line (inc last-line))]
+        (let [[_ y _] (ui/backend-code-point-at-position b w (ui/line-start buffer line))
+              wy (ffi/with-foreign [wx (ffi/alloc i32 1)]
+                   (ffi/with-foreign [wy (ffi/alloc i32 1)]
+                     (lib/text-view-buffer-to-window-coords (text-view-of w) 3 0 y wx wy)
+                     (ffi/get wy i32)))]
+          (ui/draw-text! gc (str (inc line)) (- width 6) wy
+                         {:font (:font w) :align :right
+                          :color (ui/widget-color w (if (= line current) :text :gutter-text))}))))))
+
+(defn- tag-for [w attrs]
+  (or (get-in (code-parts-of w) [:tags attrs])
+      (let [tag (lib/text-tag-new (ffi/null))]
+        (when-let [c (:color attrs)] (lib/g-object-set-string tag "foreground" (css-color c) (ffi/null)))
+        (when-let [c (:background attrs)] (lib/g-object-set-string tag "background" (css-color c) (ffi/null)))
+        (when (:bold attrs) (lib/g-object-set-int tag "weight" 700 (ffi/null)))
+        (when (:italic attrs) (lib/g-object-set-int tag "style" 2 (ffi/null)))       ; PANGO_STYLE_ITALIC
+        (when (:underline attrs) (lib/g-object-set-int tag "underline" 1 (ffi/null))) ; SINGLE
+        (lib/text-tag-table-add (lib/text-buffer-get-tag-table (code-buffer w)) tag)
+        (lib/g-object-unref tag)
+        (swap! code-parts assoc-in [(ffi/address (native w)) :tags attrs] tag)
+        tag)))
+
+(defmethod ui/backend-code-apply-runs [(b gtk-backend) w start end runs]
+  (let [n (ui/text-length w)]
+    (quietly
+     (fn []
+       (with-iters (fn [a z]
+                     (iter-at w a (min start n))
+                     (iter-at w z (min end n))
+                     (lib/text-buffer-remove-all-tags (code-buffer w) a z)
+                     (doseq [[rs re attrs] runs]
+                       (when (seq attrs)
+                         (iter-at w a (min rs n))
+                         (iter-at w z (min re n))
+                         (lib/text-buffer-apply-tag (code-buffer w) (tag-for w attrs) a z)))))))))
+
+(defn- update-code-placeholder! [w]
+  (when-let [parts (code-parts-of w)]
+    (let [text (:placeholder w)
+          shown (and (seq (str (or text "")))
+                     (zero? (lib/text-buffer-get-char-count (code-buffer w))))
+          label (or (:placeholder parts)
+                    (when shown
+                      (let [l (lib/label-new "")]
+                        (lib/widget-add-css-class l "dim-label")
+                        (lib/widget-set-can-target l false)
+                        (lib/text-view-add-overlay (text-view-of w) l 0 0)
+                        (swap! code-parts assoc-in [(ffi/address (native w)) :placeholder] l)
+                        l)))]
+      (when label
+        (lib/label-set-text label (str (or text "")))
+        (lib/widget-set-visible label (boolean shown))))))
+
+(defn code-native-text
+  "The text of the code view's GtkTextBuffer."
+  [w]
+  (native-code-text w))
+
+(defn code-native-selection
+  "The code view's GtkTextBuffer selection, [anchor cursor]."
+  [w]
+  (native-selection-of w))
+
+(defn type-into-code-view!
+  "Type s at the code view's GtkTextView cursor, as the keyboard does."
+  [w s]
+  (lib/text-buffer-insert-at-cursor (code-buffer w) s -1))
+
+(defn code-placeholder-shown?
+  "True if the code view shows its placeholder."
+  [w]
+  (boolean (when-let [l (:placeholder (code-parts-of w))] (lib/widget-get-visible l))))

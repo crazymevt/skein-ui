@@ -415,3 +415,43 @@
         (gtk/settle!)
         (is (not (gtk/native-surface-shown? c)))))
     (ui/close! w)))
+
+(deftest code-views
+  (let [b (ui/make-text-buffer {:text "(defn f [x]\n  x)"})
+        v (ui/code-view {:buffer b})
+        v2 (ui/code-view {:buffer b :line-numbers false})
+        empty (ui/code-view {:placeholder "Type here"})
+        w (ui/window {:title "Code" :width 500 :height 400} (ui/vbox {} v v2 empty))]
+    (ui/show! w)
+    (gtk/settle!)
+    (is (= "(defn f [x]\n  x)" (gtk/code-native-text v)))
+    (testing "the core's edits reach both views"
+      (ui/insert-into-buffer! b 0 ";; ")
+      (is (= ";; (defn f [x]\n  x)" (gtk/code-native-text v)))
+      (is (= ";; (defn f [x]\n  x)" (gtk/code-native-text v2))))
+    (testing "typing in one view changes the buffer and the other view"
+      (ui/set-cursor! v 3)
+      (is (= [3 3] (gtk/code-native-selection v)))
+      (gtk/type-into-code-view! v "x")
+      (is (= ";; x(defn f [x]\n  x)" (ui/buffer-text b)))
+      (is (= 4 (:cursor v)))
+      (is (= ";; x(defn f [x]\n  x)" (gtk/code-native-text v2)))
+      (ui/undo! v)
+      (is (= ";; (defn f [x]\n  x)" (gtk/code-native-text v))))
+    (testing "geometry"
+      (gtk/settle!)
+      (let [[x0 y0 h] (ui/point-at-position v 0)
+            [_ y1 _] (ui/point-at-position v (ui/line-start b 1))]
+        (is (< 0 h 40))
+        (is (< y0 y1))
+        (is (= (ui/line-start b 1) (ui/position-at-point v (+ x0 1) (+ y1 2)))))
+      (is (< 20 (ui/gutter-width v) 80))
+      (is (= [0 1] (ui/visible-lines v))))
+    (testing "runs"
+      (ui/set-text-runs! v [[4 8 {:color :purple :bold true}]])
+      (is (= [[4 8 {:color :purple :bold true}]] (ui/text-runs v))))
+    (testing "the placeholder shows while empty"
+      (is (gtk/code-placeholder-shown? empty))
+      (ui/set-code-text! empty "x")
+      (is (not (gtk/code-placeholder-shown? empty))))
+    (ui/close! w)))

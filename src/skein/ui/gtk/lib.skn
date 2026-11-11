@@ -567,6 +567,39 @@ hasn't placed it."
 (ffi/defcfun ^:blocking popover-menu-new "gtk_popover_menu_new_from_model" ptr [model ptr])
 (ffi/defcfun ^:blocking popover-popup "gtk_popover_popup" void [p ptr])
 (ffi/defcfun ^:blocking popover-new "gtk_popover_new" ptr [])
+(ffi/defcfun ^:blocking text-view-get-iter-at-location "gtk_text_view_get_iter_at_location" bool
+  [v ptr, iter ptr, x i32, y i32])
+(ffi/defcfun ^:blocking text-view-scroll-to-iter "gtk_text_view_scroll_to_iter" bool
+  [v ptr, iter ptr, margin f64, use-align bool, xalign f64, yalign f64])
+(ffi/defcfun ^:blocking text-view-get-visible-rect "gtk_text_view_get_visible_rect" void
+  [v ptr, rect ptr])
+(ffi/defcfun ^:blocking text-view-set-gutter "gtk_text_view_set_gutter" void
+  [v ptr, win i32, widget ptr])
+(ffi/defcfun ^:blocking text-view-set-tabs "gtk_text_view_set_tabs" void [v ptr, tabs ptr])
+(ffi/defcfun ^:blocking text-view-set-monospace "gtk_text_view_set_monospace" void
+  [v ptr, m bool])
+(ffi/defcfun ^:blocking text-view-add-overlay "gtk_text_view_add_overlay" void
+  [v ptr, child ptr, x i32, y i32])
+(ffi/defcfun ^:blocking pango-tab-array-new "pango_tab_array_new" ptr [n i32, pixels bool])
+(ffi/defcfun ^:blocking pango-tab-array-set-tab "pango_tab_array_set_tab" void
+  [a ptr, i i32, align i32, location i32])
+(ffi/defcfun ^:blocking pango-tab-array-free "pango_tab_array_free" void [a ptr])
+(ffi/defcfun ^:blocking text-buffer-get-insert "gtk_text_buffer_get_insert" ptr [b ptr])
+(ffi/defcfun ^:blocking text-buffer-get-selection-bound "gtk_text_buffer_get_selection_bound"
+  ptr [b ptr])
+(ffi/defcfun ^:blocking text-buffer-get-iter-at-mark "gtk_text_buffer_get_iter_at_mark" void
+  [b ptr, iter ptr, mark ptr])
+(ffi/defcfun ^:blocking text-buffer-remove-all-tags "gtk_text_buffer_remove_all_tags" void
+  [b ptr, start ptr, end ptr])
+(ffi/defcfun ^:blocking text-buffer-apply-tag "gtk_text_buffer_apply_tag" void
+  [b ptr, tag ptr, start ptr, end ptr])
+(ffi/defcfun ^:blocking text-buffer-get-tag-table "gtk_text_buffer_get_tag_table" ptr [b ptr])
+(ffi/defcfun ^:blocking text-tag-table-add "gtk_text_tag_table_add" bool [t ptr, tag ptr])
+(ffi/defcfun ^:blocking text-tag-new "gtk_text_tag_new" ptr [name ptr])
+(ffi/defcfun ^:blocking text-buffer-get-char-count "gtk_text_buffer_get_char_count" i32 [b ptr])
+(ffi/defcfun ^:blocking text-buffer-insert-at-cursor "gtk_text_buffer_insert_at_cursor" void
+  [b ptr, text c-string, n i32])
+(ffi/defcfun ^:blocking widget-set-can-target "gtk_widget_set_can_target" void [w ptr, v bool])
 (ffi/defcfun ^:blocking popover-set-child "gtk_popover_set_child" void [p ptr, child ptr])
 (ffi/defcfun ^:blocking popover-popdown "gtk_popover_popdown" void [p ptr])
 (ffi/defcfun ^:blocking popover-set-position "gtk_popover_set_position" void [p ptr, pos i32])
