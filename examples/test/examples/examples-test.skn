@@ -7,7 +7,8 @@
             [examples.registry :as registry]
             [examples.launcher]
             [examples.code-editor]
-            [examples.editor]))
+            [examples.editor]
+            [examples.widget-explorer :as explorer]))
 
 ;; Every example builds and shows its windows on the headless backend, and a few act as a
 ;; user would on them.
@@ -205,3 +206,19 @@
       (ui/activate-menu-item! (first (filter (fn [i] (= "New Tab" (:label i)))
                                              (ui/widgets-in (first (:children (:menu-bar e)))))))
       (is (= 2 (count (:children tabs)))))))
+
+(deftest widget-explorer
+  (let [w (run :widget-explorer)]
+    (is (= "button" (:text (ui/find-widget w :sample-title))))
+    (is (string/includes? (ui/code-text (ui/find-widget w :source)) "(ui/button {:label \"Click me\"})"))
+    (testing "every sample shows: its widget, or why it can't"
+      (doseq [s (explorer/catalog)]
+        (explorer/show-sample! w s)
+        (is (= s (first (ui/selected-items (ui/find-widget w :catalog)))) "and selects it")
+        (is (= 1 (count (:children (ui/find-widget w :preview)))) (explorer/sample-title s))
+        (is (nil? (:preview-error (:user-data w))) (explorer/sample-title s))))
+    (testing "searching"
+      (headless/type-text! (ui/find-widget w :filter) "pages")
+      (is (= ["notebook" "stack" "tab-bar" "tabbed-pane" "vertical-notebook"]
+             (mapv explorer/sample-title (:items (ui/find-widget w :catalog)))))
+      (is (= "5 widgets" (:text (ui/find-widget w :count)))))))

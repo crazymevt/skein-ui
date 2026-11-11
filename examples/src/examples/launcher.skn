@@ -20,7 +20,8 @@
             [examples.web-view]
             [examples.code-editor]
             [examples.gallery]
-            [examples.editor]))
+            [examples.editor]
+            [examples.widget-explorer]))
 
 (define-example launcher
   {:title "skein-ui Examples"

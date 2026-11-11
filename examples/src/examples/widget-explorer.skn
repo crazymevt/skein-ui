@@ -1,0 +1,307 @@
+(ns examples.widget-explorer
+  "Live widgets beside the exact, runnable forms that make them."
+  (:require [skein.ui :as ui]
+            [skein.string :as string]
+            [examples.registry :refer [define-example]]))
+
+(def samples
+  "The samples: {:type :category :description :form :factory}, in the order defined."
+  (atom []))
+
+(defmacro define-sample
+  "Define the sample of a widget type: the form both makes it (its factory) and is shown
+as its source, so the two never differ. The form gives a widget, or [widget cleanup]."
+  [type category description form]
+  `(swap! samples (fn [ss#] (conj (filterv (fn [s#] (not= (:type s#) '~type)) ss#)
+                                  {:type '~type :category ~category :description ~description
+                                   :form '~form :factory (fn [] ~form)}))))
+
+(define-sample label "Text" "Selectable text with wrapping and a semantic text color."
+  (ui/label {:text "Hello from skein-ui. Select this text to copy it."
+             :selectable true :wrap true :width 360 :text-color :text}))
+(define-sample entry "Text" "An editable single-line field. Try typing or pressing Return."
+  (ui/entry {:text "Edit me" :placeholder "Type a value…" :width-chars 32}))
+(define-sample password-entry "Text" "A secure entry that masks its contents."
+  (ui/password-entry {:text "secret" :width-chars 28}))
+(define-sample search-entry "Text" "A native search field with its platform's search affordances."
+  (ui/search-entry {:placeholder "Search…" :width-chars 32}))
+(define-sample text-view "Text" "A multi-line native text view with selection, editing and scrolling."
+  (ui/text-view {:text "A native text view.\nType a second paragraph here." :wrap true :height 220}))
+(define-sample code-view "Text" "An editable text buffer with line numbers and styled runs."
+  (let [v (ui/code-view {:buffer (ui/make-text-buffer {:text "(defn greet [name]\n  (str \"Hello, \" name \"!\"))"})
+                         :height 240})]
+    (ui/set-text-runs! v [[1 5 {:color :purple :bold true}]])
+    v))
+(define-sample button "Buttons" "Click to change the button's label."
+  (let [b (ui/button {:label "Click me"})]
+    (ui/on b :clicked (fn [_] (set-slot! b :label "Clicked!")))
+    b))
+(define-sample toggle-button "Buttons" "A native button that keeps its on/off state."
+  (ui/toggle-button {:label "Toggle me" :checked true}))
+(define-sample check-box "Buttons" "A native boolean option."
+  (ui/check-box {:label "Enable notifications" :checked true}))
+(define-sample radio-button "Buttons" "Radio buttons in one container form an exclusive group."
+  (ui/vbox {:spacing 12}
+           (ui/radio-button {:label "Small"})
+           (ui/radio-button {:label "Medium" :checked true})
+           (ui/radio-button {:label "Large"})))
+(define-sample slider "Values" "Drag the slider to choose a number."
+  (ui/slider {:min 0 :max 100 :value 35 :ticks 11 :width 360}))
+(define-sample spin-button "Values" "A number field with increment and decrement arrows."
+  (ui/spin-button {:min 0 :max 100 :value 12 :step 1}))
+(define-sample progress-bar "Values" "Progress between zero and one."
+  (ui/progress-bar {:value 0.65 :width 360}))
+(define-sample spinner "Values" "Native indeterminate activity."
+  (ui/spinner {:active true}))
+(define-sample color-button "Values" "Click to open the platform's color picker."
+  (ui/color-button {:color "#4067db"}))
+(define-sample date-picker "Values" "The native date and time editor."
+  (ui/date-picker {:mode :date}))
+(define-sample combo-box "Lists and trees" "A native single-choice dropdown."
+  (ui/combo-box {:items ["Mercury" "Venus" "Earth" "Mars"] :selected-index 2}))
+(define-sample combo-entry "Lists and trees" "Editable text with suggested choices."
+  (ui/combo-entry {:items ["Skein" "Common Lisp" "Clojure"] :text "Skein"}))
+(define-sample list-box "Lists and trees" "A selectable, scrolling list; Command or Control-click to select several."
+  (ui/list-box {:items ["Mercury" "Venus" "Earth" "Mars" "Jupiter"] :selection-mode :multiple
+                :selected-indices [2] :height 220}))
+(define-sample table-view "Lists and trees" "Click a column title to sort the table."
+  (ui/table-view {:items [["Mercury" 0] ["Venus" 0] ["Earth" 1] ["Mars" 2]]
+                  :columns [(ui/column "Planet" 0 {:width 240}) (ui/column "Moons" 1 {:alignment :right})]
+                  :height 220}))
+(define-sample tree-view "Lists and trees" "Open the disclosure triangles to explore a lazy hierarchy."
+  (ui/tree-view {:roots [["Languages" ["Lisp" ["Skein"] ["Common Lisp"] ["Scheme"]] ["ML" ["OCaml"]]]]
+                 :children-fn rest :item-label first :item-key first :height 240}))
+(define-sample image-view "Images and drawing" "A native image view showing a platform icon."
+  (ui/image-view {:image (or (ui/system-image "star.fill") (ui/system-image "starred")
+                             (ui/glyph-image "★" {:size 64}))
+                  :width 100 :height 100 :scaling :fit}))
+(define-sample canvas "Images and drawing" "Drawing of your own with the portable graphics calls."
+  (ui/canvas {:height 220 :background :content-background
+              :on-draw (fn [e]
+                         (let [gc (:context e)]
+                           (ui/fill-rectangle! gc 24 24 160 90 {:color "#4067db"})
+                           (ui/fill-circle! gc 250 70 45 {:color "#ec9e36"})
+                           (ui/draw-text! gc "Drawn with skein-ui" 24 150 {:color :text})))}))
+(define-sample box "Layout" "The configurable box lays its children out across or down."
+  (ui/box {:orientation :horizontal :spacing 12}
+          (ui/button {:label "First"}) (ui/button {:label "Second"})))
+(define-sample hbox "Layout" "A horizontal box shares space among its children."
+  (ui/hbox {:spacing 12}
+           (ui/button {:label "Left"}) (ui/button {:label "Expanding" :hexpand true}) (ui/button {:label "Right"})))
+(define-sample vbox "Layout" "A vertical box with spacing between rows."
+  (ui/vbox {:spacing 12}
+           (ui/label {:text "First row"}) (ui/entry {:text "Second row"}) (ui/button {:label "Third row"})))
+(define-sample grid "Layout" "Rows and columns, with a cell spanning two columns."
+  (ui/grid {:row-spacing 12 :column-spacing 12}
+           (ui/label {:text "Name" :row 0 :column 0})
+           (ui/entry {:text "Ada" :row 0 :column 1 :hexpand true})
+           (ui/label {:text "Language" :row 1 :column 0})
+           (ui/combo-box {:items ["Skein" "Scheme"] :selected-index 0 :row 1 :column 1})
+           (ui/button {:label "Two-column action" :row 2 :column 0 :column-span 2})))
+(define-sample frame "Layout" "A native labeled group around related controls."
+  (ui/frame {:title "Preferences"}
+            (ui/vbox {:padding 16 :spacing 10}
+                     (ui/check-box {:label "Show line numbers" :checked true})
+                     (ui/check-box {:label "Wrap long lines"}))))
+(define-sample scrolled-window "Layout" "A scrolling view of content bigger than its space."
+  (ui/scrolled-window {:height 240 :vertical-policy :always}
+                      (apply ui/vbox {:spacing 10 :padding 16}
+                             (map (fn [i] (ui/label {:text (str "Row " (inc i))})) (range 30)))))
+(define-sample paned "Layout" "Drag the divider to resize the two panes."
+  (ui/paned {:position 220 :height 240}
+            (ui/vbox {:padding 16} (ui/label {:text "Left pane"}))
+            (ui/vbox {:padding 16} (ui/label {:text "Right pane"}))))
+(define-sample separator "Layout" "Native horizontal and vertical separator lines."
+  (ui/vbox {:spacing 14}
+           (ui/label {:text "Above"})
+           (ui/separator {})
+           (ui/hbox {:spacing 14} (ui/label {:text "Left"}) (ui/separator {:orientation :vertical :height 36})
+                    (ui/label {:text "Right"}))
+           (ui/separator {})
+           (ui/label {:text "Below"})))
+(define-sample spacer "Layout" "A spacer takes the unused space and pushes the last button to the edge."
+  (ui/hbox {:spacing 12} (ui/button {:label "Start"}) (ui/spacer {}) (ui/button {:label "End"})))
+(define-sample notebook "Pages" "A native notebook with two pages."
+  (ui/notebook {:height 240}
+               (ui/label {:text "First page" :tab-label "First"})
+               (ui/entry {:text "Second page" :tab-label "Second"})))
+(define-sample tabbed-pane "Pages" "Closable, reorderable tabs with room for the program's controls."
+  (ui/tabbed-pane {:height 240}
+                  (ui/text-view {:text "First document" :tab-label "First"})
+                  (ui/text-view {:text "Second document" :tab-label "Second"})))
+(define-sample tab-bar "Pages" "A tabbed pane's tab bar: its :start and :end boxes hold ordinary widgets."
+  (let [pane (ui/tabbed-pane {:height 240} (ui/label {:text "Page content" :tab-label "Document"}))]
+    (ui/add! (:end (ui/tab-bar pane)) (ui/button {:label "+" :tooltip "A button of the program's"}))
+    pane))
+(define-sample stack "Pages" "Click Next to change the page that shows; the stack keeps its size."
+  (let [s (ui/stack {} (ui/label {:text "First stack page"}) (ui/label {:text "Second stack page"}))]
+    (ui/vbox {:spacing 16}
+             (ui/button {:label "Next page"
+                         :on-clicked (fn [_] (set-slot! s :selected-index (mod (inc (:selected-index s)) 2)))})
+             s)))
+(define-sample vertical-notebook "Pages" "A list of categories beside a stack of settings pages."
+  (ui/vertical-notebook {:height 240}
+                        (ui/vbox {:padding 16 :tab-label "General"} (ui/check-box {:label "General setting" :checked true}))
+                        (ui/vbox {:padding 16 :tab-label "Editor"} (ui/entry {:text "Editor setting"}))))
+(define-sample web-view "Web content" "An embedded native browser; its engine loads when this preview is chosen."
+  (ui/web-view {:height 260
+                :html "<!doctype html><meta charset='utf-8'><style>:root{color-scheme:light dark;font:18px system-ui}body{padding:24px}button{font:inherit;padding:8px 16px}</style><h1>Hello from HTML</h1><p>This is an embedded native web view.</p><button onclick='this.textContent=\"Clicked!\"'>Click me</button>"}))
+(define-sample window "Windows and popups" "Open a separate window. It closes when you choose another preview."
+  (let [w (atom nil)]
+    [(ui/button {:label "Open window"
+                 :on-clicked (fn [_]
+                               (when (or (nil? @w) (:destroyed @w))
+                                 (reset! w (ui/window {:title "Sample Window" :width 420 :height 240}
+                                                      (ui/label {:text "A separate native window" :margin 24}))))
+                               (ui/show! @w))})
+     (fn [] (when (and @w (not (:destroyed @w))) (ui/close! @w true)))]))
+(define-sample dialog "Windows and popups" "Open a dialog that doesn't block: its buttons answer and close it."
+  (let [d (atom nil)]
+    [(ui/button {:label "Open dialog"
+                 :on-clicked (fn [_]
+                               (when (or (nil? @d) (:destroyed @d))
+                                 (reset! d (ui/dialog {:title "Sample Dialog" :buttons [:cancel :ok]}
+                                                      (ui/entry {:text "Edit this value"}))))
+                               (ui/show! @d))})
+     (fn [] (when (and @d (not (:destroyed @d))) (ui/close! @d true)))]))
+(define-sample popover "Windows and popups" "A native popover pointing at a button, holding ordinary controls."
+  (let [p (ui/popover {} (ui/vbox {:padding 16 :spacing 12}
+                                  (ui/label {:text "Popover settings"})
+                                  (ui/check-box {:label "Enabled" :checked true})))
+        b (ui/button {:label "Show popover"})]
+    (ui/on b :clicked (fn [_] (ui/show-popover! p b)))
+    [b (fn [] (ui/destroy! p))]))
+(define-sample completion-popup "Windows and popups" "A completion popup leaves the keyboard with its owner. Use the arrows and Return."
+  (let [e (ui/entry {:text "Choose a language"})
+        p (ui/completion-popup {:items ["Skein" "Common Lisp" "Clojure"]
+                                :on-accept (fn [ev] (set-slot! e :text (:value ev)))})]
+    [(ui/vbox {:spacing 12}
+              e
+              (ui/button {:label "Show completions"
+                          :on-clicked (fn [_] (ui/focus! e) (ui/show-completion-popup! p e))}))
+     (fn [] (ui/destroy! p))]))
+
+(defn sample-title [s] (str (:type s)))
+
+(defn catalog
+  "The samples, by title."
+  []
+  (vec (sort-by sample-title @samples)))
+
+;; Showing a form: one line if it fits, else its head and first argument, then one
+;; argument a line, indented.
+
+(defn- pretty
+  ([form] (pretty form 0))
+  ([form indent]
+   (let [flat (pr-str form)
+         width (- 88 indent)
+         pad (apply str (repeat (+ indent 2) " "))]
+     (cond
+       (<= (count flat) width) flat
+       (seq? form) (let [[head first-arg & more] form
+                         start (str "(" (pr-str head) " ")
+                         first-s (pretty first-arg (+ indent (count start)))]
+                     (str start first-s
+                          (apply str (map (fn [x] (str "\n" pad (pretty x (+ indent 2)))) more))
+                          ")"))
+       (vector? form) (str "[" (string/join (str "\n" (apply str (repeat (inc indent) " ")))
+                                            (map (fn [x] (pretty x (inc indent))) form))
+                           "]")
+       (map? form) (str "{" (string/join (str "\n" (apply str (repeat (inc indent) " ")))
+                                         (map (fn [[k v]] (str (pr-str k) " " (pretty v (+ indent 2 (count (pr-str k))))))
+                                              form))
+                        "}")
+       :else flat))))
+
+(defn sample-source
+  "The program text that makes the sample's widget."
+  [s]
+  (str "(ns widget-demo\n  (:require [skein.ui :as ui]))\n\n" (pretty (:form s)) "\n"))
+
+(defn- dispose-preview! [w]
+  (when-let [f (:cleanup (:user-data w))] (f))
+  (set-slot! w :user-data (dissoc (:user-data w) :cleanup))
+  (ui/clear! (ui/find-widget w :preview)))
+
+(defn show-sample!
+  "Show the sample's preview and source in the explorer window, and select it in the
+catalog. Returns the sample."
+  [w s]
+  (dispose-preview! w)
+  (set-slot! w :user-data (assoc (:user-data w) :sample s :preview-error nil))
+  (let [list (ui/find-widget w :catalog)
+        i (when s (index-of (vec (:items list)) s))]
+    (set-slot! list :selected-indices (if i [i] [])))
+  (set-slot! (ui/find-widget w :sample-title) :text (if s (sample-title s) "No matching widgets"))
+  (set-slot! (ui/find-widget w :description) :text (if s (:description s) "Try another search."))
+  (ui/set-code-text! (ui/find-widget w :source) (if s (sample-source s) ""))
+  (ui/set-cursor! (ui/find-widget w :source) 0)
+  (set-slot! (ui/find-widget w :copy-source) :enabled (some? s))
+  (set-slot! (ui/find-widget w :reset) :enabled (some? s))
+  (when s
+    (try
+      (let [made ((:factory s))
+            [widget cleanup] (if (vector? made) made [made nil])]
+        (set-slot! w :user-data (assoc (:user-data w) :cleanup cleanup))
+        (ui/add! (ui/find-widget w :preview) widget))
+      (catch error c
+        (set-slot! w :user-data (assoc (:user-data w) :preview-error c))
+        (ui/add! (ui/find-widget w :preview)
+                 (ui/label {:wrap true :width 560
+                            :text (str "This preview is unavailable: " (ex-message c))})))))
+  (ui/flush-layouts!)
+  s)
+
+(defn filter-catalog!
+  "Show only the samples whose title or category has query in it."
+  [w query]
+  (let [list (ui/find-widget w :catalog)
+        q (string/lower-case query)
+        old (:sample (:user-data w))
+        matches (filterv (fn [s] (or (string/includes? (string/lower-case (sample-title s)) q)
+                                     (string/includes? (string/lower-case (:category s)) q)))
+                         (catalog))
+        selected (or (first (filter (fn [s] (identical? s old)) matches)) (first matches))]
+    (set-slot! list :items matches)
+    (set-slot! list :selected-indices (if selected [(index-of matches selected)] []))
+    (set-slot! (ui/find-widget w :count) :text (str (count matches) " widgets"))
+    (when-not (identical? old selected) (show-sample! w selected))))
+
+(define-example widget-explorer
+  {:title "Widget Explorer"
+   :description "Choose a widget on the left. Try it live, or read the exact source that makes
+it. Search by widget name or category."
+   :topics [:list-box :paned :tabbed-pane :code-view :stack :web-view :popover]}
+  (let [source (ui/code-view {:name :source :editable false :line-numbers true :tab-closable false
+                              :tab-label "Source"})
+        preview (ui/vbox {:name :preview :padding 24 :spacing 16 :surface :content
+                          :tab-closable false :tab-label "Preview"})
+        tabs (ui/tabbed-pane {:name :tabs :reorderable false} preview source)
+        w (ui/window
+           {:title "skein-ui Widget Explorer" :width 1080 :height 720 :user-data {}}
+           (ui/paned {:position 240}
+                     (ui/vbox {:padding 12 :spacing 10 :hexpand false}
+                              (ui/label {:text "WIDGETS" :font {:size 12 :weight :bold}})
+                              (ui/search-entry {:name :filter :placeholder "Search widgets…" :width-chars 20})
+                              (ui/list-box {:name :catalog :items (catalog) :item-label sample-title :border false})
+                              (ui/label {:name :count :text-color :secondary-text}))
+                     (ui/vbox {:padding 18 :spacing 12}
+                              (ui/hbox {:spacing 10}
+                                       (ui/label {:name :sample-title :font {:size 24 :weight :bold} :hexpand true})
+                                       (ui/button {:name :reset :label "Reset"})
+                                       (ui/button {:name :copy-source :label "Copy source"}))
+                              (ui/label {:name :description :wrap true :width 620 :text-color :secondary-text})
+                              tabs)))]
+    (ui/on (ui/find-widget w :catalog) :selection-changed (fn [e] (show-sample! w (:value e))))
+    (ui/on (ui/find-widget w :filter) :changed (fn [e] (filter-catalog! w (:value e))))
+    (ui/on (ui/find-widget w :reset) :clicked (fn [_] (show-sample! w (:sample (:user-data w)))))
+    (ui/on (ui/find-widget w :copy-source) :clicked (fn [_] (ui/set-clipboard-text! (ui/code-text source))))
+    (ui/on w :closed (fn [_] (dispose-preview! w)))
+    (ui/show! w)
+    (let [samples (catalog)
+          initial (first (filter (fn [s] (= 'button (:type s))) samples))]
+      (set-slot! (ui/find-widget w :catalog) :selected-indices [(index-of samples initial)])
+      (set-slot! (ui/find-widget w :count) :text (str (count samples) " widgets"))
+      (show-sample! w initial))
+    w))
