@@ -2911,11 +2911,16 @@ notebook)."
     (objc/release v)
     v))
 
+(def ^:private backdrop-hosts
+  "A container's view address -> the addresses of the hosts of its backdrops."
+  (atom {}))
+
 (defn- refresh-surface! [c]
   (let [role (:surface c)
         color (ui/container-fill c)]
     (doseq [host (surface-hosts c)]
       (let [a (ffi/address host)
+            _ (swap! backdrop-hosts update (ffi/address (view c)) (fnil conj #{}) a)
             data (or (get @backdrops a) {})
             data (if (and color (not (:color data)))
                    (assoc data :color (make-backdrop host :color))
@@ -2934,6 +2939,13 @@ notebook)."
           (objc/send-l-void m (objc/sel "setState:") 0)
           (objc/send-b-void m (objc/sel "setHidden:") (boolean (or color (= role :automatic)))))
         (swap! backdrops assoc a data)))))
+
+(defmethod ui/backend-destroy :before [(b cocoa-backend) (c ui/container-widget)]
+  ;; Its views go, and AppKit may give a new view the same address. (Its pages are gone
+  ;; already, so the hosts are those noted when its backdrops were made.)
+  (let [k (ffi/address (view c))]
+    (doseq [a (get @backdrop-hosts k)] (swap! backdrops dissoc a))
+    (swap! backdrop-hosts dissoc k)))
 
 (defmethod set-native [(c ui/container-widget) (p (= :surface)) v] (refresh-surface! c))
 (defmethod set-native [(c ui/container-widget) (p (= :background)) v] (refresh-surface! c))
