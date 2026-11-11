@@ -494,6 +494,183 @@ hasn't placed it."
   [s c-string])
 (ffi/defcfun ^:blocking pango-font-free "pango_font_description_free" void [d ptr])
 
+;;; Menus, shortcuts and actions
+
+(ffi/defcfun ^:blocking g-menu-new "g_menu_new" ptr [])
+(ffi/defcfun ^:blocking g-menu-remove-all "g_menu_remove_all" void [m ptr])
+(ffi/defcfun ^:blocking g-menu-append-item "g_menu_append_item" void [m ptr, item ptr])
+(ffi/defcfun ^:blocking g-menu-append-section "g_menu_append_section" void
+  [m ptr, label c-string, section ptr])
+(ffi/defcfun ^:blocking g-menu-append-submenu "g_menu_append_submenu" void
+  [m ptr, label c-string, submenu ptr])
+(ffi/defcfun ^:blocking g-menu-item-new "g_menu_item_new" ptr [label c-string, action c-string])
+(ffi/defcfun ^:blocking g-menu-item-set-attribute-value "g_menu_item_set_attribute_value" void
+  [item ptr, attribute c-string, value ptr])
+(ffi/defcfun ^:blocking g-simple-action-new "g_simple_action_new" ptr [name c-string, type ptr])
+(ffi/defcfun ^:blocking g-simple-action-new-stateful "g_simple_action_new_stateful" ptr
+  [name c-string, type ptr, state ptr])
+(ffi/defcfun ^:blocking g-simple-action-set-enabled "g_simple_action_set_enabled" void
+  [a ptr, v bool])
+(ffi/defcfun ^:blocking g-simple-action-set-state "g_simple_action_set_state" void
+  [a ptr, state ptr])
+(ffi/defcfun ^:blocking g-simple-action-group-new "g_simple_action_group_new" ptr [])
+(ffi/defcfun ^:blocking g-action-map-add-action "g_action_map_add_action" void [m ptr, a ptr])
+(ffi/defcfun ^:blocking g-action-map-remove-action "g_action_map_remove_action" void
+  [m ptr, name c-string])
+(ffi/defcfun ^:blocking g-action-activate "g_action_activate" void [a ptr, parameter ptr])
+(ffi/defcfun ^:blocking g-variant-new-boolean "g_variant_new_boolean" ptr [v bool])
+(ffi/defcfun ^:blocking g-variant-new-string "g_variant_new_string" ptr [s c-string])
+(ffi/defcfun ^:blocking popover-menu-bar-new "gtk_popover_menu_bar_new_from_model" ptr [model ptr])
+(ffi/defcfun ^:blocking popover-menu-new "gtk_popover_menu_new_from_model" ptr [model ptr])
+(ffi/defcfun ^:blocking popover-popup "gtk_popover_popup" void [p ptr])
+(ffi/defcfun ^:blocking popover-set-pointing-to "gtk_popover_set_pointing_to" void
+  [p ptr, rect ptr])
+(ffi/defcfun ^:blocking widget-set-parent "gtk_widget_set_parent" void [w ptr, parent ptr])
+(ffi/defcfun ^:blocking widget-insert-action-group "gtk_widget_insert_action_group" void
+  [w ptr, prefix c-string, group ptr])
+(ffi/defcfun ^:blocking widget-activate-action "gtk_widget_activate_action" bool
+  [w ptr, name c-string, format c-string])
+(ffi/defcfun ^:blocking widget-remove-controller "gtk_widget_remove_controller" void
+  [w ptr, controller ptr])
+(ffi/defcfun ^:blocking widget-set-vexpand "gtk_widget_set_vexpand" void [w ptr, v bool])
+(ffi/defcfun ^:blocking widget-set-hexpand "gtk_widget_set_hexpand" void [w ptr, v bool])
+(ffi/defcfun ^:blocking widget-get-first-child "gtk_widget_get_first_child" ptr [w ptr])
+(ffi/defcfun ^:blocking widget-get-next-sibling "gtk_widget_get_next_sibling" ptr [w ptr])
+(ffi/defcfun ^:blocking type-name-of "g_type_name_from_instance" c-string [o ptr])
+(ffi/defcfun ^:blocking box-prepend "gtk_box_prepend" void [b ptr, child ptr])
+(ffi/defcfun ^:blocking box-remove "gtk_box_remove" void [b ptr, child ptr])
+(ffi/defcfun ^:blocking shortcut-controller-new "gtk_shortcut_controller_new" ptr [])
+(ffi/defcfun ^:blocking shortcut-controller-set-scope "gtk_shortcut_controller_set_scope" void
+  [c ptr, scope i32])
+(ffi/defcfun ^:blocking shortcut-controller-add "gtk_shortcut_controller_add_shortcut" void
+  [c ptr, shortcut ptr])
+(ffi/defcfun ^:blocking shortcut-new "gtk_shortcut_new" ptr [trigger ptr, action ptr])
+(ffi/defcfun ^:blocking shortcut-trigger-parse "gtk_shortcut_trigger_parse_string" ptr
+  [s c-string])
+(ffi/defcfun ^:blocking named-action-new "gtk_named_action_new" ptr [name c-string])
+(ffi/defcfun ^:blocking controller-set-phase "gtk_event_controller_set_propagation_phase" void
+  [c ptr, phase i32])
+(ffi/defcfun ^:blocking window-get-toplevels "gtk_window_get_toplevels" ptr [])
+(ffi/defcfun ^:blocking window-is-active "gtk_window_is_active" bool [w ptr])
+(ffi/defcfun ^:blocking window-set-modal "gtk_window_set_modal" void [w ptr, v bool])
+(ffi/defcfun ^:blocking window-set-transient-for "gtk_window_set_transient_for" void
+  [w ptr, parent ptr])
+(ffi/defcfun ^:blocking window-minimize "gtk_window_minimize" void [w ptr])
+(ffi/defcfun ^:blocking window-maximize "gtk_window_maximize" void [w ptr])
+(ffi/defcfun ^:blocking window-unmaximize "gtk_window_unmaximize" void [w ptr])
+(ffi/defcfun ^:blocking window-is-maximized "gtk_window_is_maximized" bool [w ptr])
+(ffi/defcfun ^:blocking window-fullscreen "gtk_window_fullscreen" void [w ptr])
+(ffi/defcfun ^:blocking root-get-focus "gtk_root_get_focus" ptr [r ptr])
+
+;;; Dialogs, the clipboard and the system
+
+(ffi/defcfun ^:blocking g-strdup "g_strdup" ptr [s c-string])
+(ffi/defcfun ^:blocking g-cancellable-new "g_cancellable_new" ptr [])
+(ffi/defcfun ^:blocking g-cancellable-cancel "g_cancellable_cancel" void [c ptr])
+(ffi/defcfun ^:blocking alert-dialog-new "gtk_alert_dialog_new" ptr [format c-string & s c-string])
+(ffi/defcfun ^:blocking alert-dialog-set-detail "gtk_alert_dialog_set_detail" void
+  [d ptr, detail c-string])
+(ffi/defcfun ^:blocking alert-dialog-set-buttons "gtk_alert_dialog_set_buttons" void
+  [d ptr, labels ptr])
+(ffi/defcfun ^:blocking alert-dialog-set-cancel-button "gtk_alert_dialog_set_cancel_button"
+  void [d ptr, i i32])
+(ffi/defcfun ^:blocking alert-dialog-choose "gtk_alert_dialog_choose" void
+  [d ptr, parent ptr, cancellable ptr, callback ptr, data ptr])
+(ffi/defcfun ^:blocking alert-dialog-choose-finish "gtk_alert_dialog_choose_finish" i32
+  [d ptr, result ptr, error ptr])
+(ffi/defcfun ^:blocking file-dialog-new "gtk_file_dialog_new" ptr [])
+(ffi/defcfun ^:blocking file-dialog-set-title "gtk_file_dialog_set_title" void [d ptr, t c-string])
+(ffi/defcfun ^:blocking file-dialog-set-initial-name "gtk_file_dialog_set_initial_name" void
+  [d ptr, name c-string])
+(ffi/defcfun ^:blocking file-dialog-set-initial-folder "gtk_file_dialog_set_initial_folder" void
+  [d ptr, folder ptr])
+(ffi/defcfun ^:blocking file-dialog-set-filters "gtk_file_dialog_set_filters" void
+  [d ptr, filters ptr])
+(ffi/defcfun ^:blocking file-dialog-open "gtk_file_dialog_open" void
+  [d ptr, parent ptr, cancellable ptr, callback ptr, data ptr])
+(ffi/defcfun ^:blocking file-dialog-open-finish "gtk_file_dialog_open_finish" ptr
+  [d ptr, result ptr, error ptr])
+(ffi/defcfun ^:blocking file-dialog-open-multiple "gtk_file_dialog_open_multiple" void
+  [d ptr, parent ptr, cancellable ptr, callback ptr, data ptr])
+(ffi/defcfun ^:blocking file-dialog-open-multiple-finish "gtk_file_dialog_open_multiple_finish"
+  ptr [d ptr, result ptr, error ptr])
+(ffi/defcfun ^:blocking file-dialog-save "gtk_file_dialog_save" void
+  [d ptr, parent ptr, cancellable ptr, callback ptr, data ptr])
+(ffi/defcfun ^:blocking file-dialog-save-finish "gtk_file_dialog_save_finish" ptr
+  [d ptr, result ptr, error ptr])
+(ffi/defcfun ^:blocking file-dialog-select-folder "gtk_file_dialog_select_folder" void
+  [d ptr, parent ptr, cancellable ptr, callback ptr, data ptr])
+(ffi/defcfun ^:blocking file-dialog-select-folder-finish "gtk_file_dialog_select_folder_finish"
+  ptr [d ptr, result ptr, error ptr])
+(ffi/defcfun ^:blocking file-filter-new "gtk_file_filter_new" ptr [])
+(ffi/defcfun ^:blocking file-filter-set-name "gtk_file_filter_set_name" void [f ptr, n c-string])
+(ffi/defcfun ^:blocking file-filter-add-suffix "gtk_file_filter_add_suffix" void
+  [f ptr, suffix c-string])
+(ffi/defcfun ^:blocking file-filter-get-type "gtk_file_filter_get_type" u64 [])
+(ffi/defcfun ^:blocking g-list-store-new "g_list_store_new" ptr [type u64])
+(ffi/defcfun ^:blocking g-list-store-append "g_list_store_append" void [s ptr, item ptr])
+(ffi/defcfun ^:blocking g-file-new-for-path "g_file_new_for_path" ptr [path c-string])
+(ffi/defcfun ^:blocking g-file-get-path "g_file_get_path" ptr [f ptr])
+(ffi/defcfun ^:blocking about-dialog-new "gtk_about_dialog_new" ptr [])
+(ffi/defcfun ^:blocking about-set-program-name "gtk_about_dialog_set_program_name" void
+  [d ptr, s c-string])
+(ffi/defcfun ^:blocking about-set-version "gtk_about_dialog_set_version" void [d ptr, s c-string])
+(ffi/defcfun ^:blocking about-set-copyright "gtk_about_dialog_set_copyright" void
+  [d ptr, s c-string])
+(ffi/defcfun ^:blocking about-set-comments "gtk_about_dialog_set_comments" void
+  [d ptr, s c-string])
+(ffi/defcfun ^:blocking about-set-website "gtk_about_dialog_set_website" void [d ptr, s c-string])
+(ffi/defcfun ^:blocking about-set-logo "gtk_about_dialog_set_logo" void [d ptr, logo ptr])
+(ffi/defcfun ^:blocking display-get-default "gdk_display_get_default" ptr [])
+(ffi/defcfun ^:blocking display-get-clipboard "gdk_display_get_clipboard" ptr [d ptr])
+(ffi/defcfun ^:blocking display-beep "gdk_display_beep" void [d ptr])
+(ffi/defcfun ^:blocking clipboard-set-text "gdk_clipboard_set_text" void [c ptr, s c-string])
+(ffi/defcfun ^:blocking clipboard-read-text-async "gdk_clipboard_read_text_async" void
+  [c ptr, cancellable ptr, callback ptr, data ptr])
+(ffi/defcfun ^:blocking clipboard-read-text-finish "gdk_clipboard_read_text_finish" ptr
+  [c ptr, result ptr, error ptr])
+(ffi/defcfun ^:blocking uri-launcher-new "gtk_uri_launcher_new" ptr [uri c-string])
+(ffi/defcfun ^:blocking uri-launcher-launch "gtk_uri_launcher_launch" void
+  [l ptr, parent ptr, cancellable ptr, callback ptr, data ptr])
+(ffi/defcfun ^:blocking settings-get-default "gtk_settings_get_default" ptr [])
+(ffi/defcfun ^:blocking g-object-get-bool "g_object_get" void
+  [o ptr, name c-string & out ptr, end ptr])
+
+(ffi/defcfun ^:blocking g-menu-model-n-items "g_menu_model_get_n_items" i32 [m ptr])
+(ffi/defcfun ^:blocking g-menu-model-attribute "g_menu_model_get_item_attribute_value" ptr
+  [m ptr, i i32, attribute c-string, type ptr])
+(ffi/defcfun ^:blocking g-variant-get-string "g_variant_get_string" c-string [v ptr, length ptr])
+(ffi/defcfun ^:blocking g-variant-unref "g_variant_unref" void [v ptr])
+
+(defn menu-model-labels
+  "The labels of a GMenuModel's items."
+  [m]
+  (mapv (fn [i] (let [v (g-menu-model-attribute m i "label" (ffi/null))]
+                  (when-not (ffi/null? v)
+                    (let [s (g-variant-get-string v (ffi/null))]
+                      (g-variant-unref v)
+                      s))))
+        (range (g-menu-model-n-items m))))
+
+(defn owned-string
+  "The Skein string of a C string GLib allocated (null for nil), freeing it."
+  [p]
+  (when-not (ffi/null? p)
+    (let [s (ffi/c-string p)]
+      (g-free p)
+      s)))
+
+(defn children-of
+  "The GTK widget w's children, in order."
+  [w]
+  (loop [c (widget-get-first-child w) out []]
+    (if (ffi/null? c) out (recur (widget-get-next-sibling c) (conj out c)))))
+
+(defn widgets-under
+  "w and every GTK widget inside it, depth first."
+  [w]
+  (tree-seq (fn [_] true) children-of w))
+
 ;;; ------------------------------------------------------------------------------------
 ;;; From GTK objects to Skein's
 

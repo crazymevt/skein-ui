@@ -15,7 +15,8 @@ act on and read the real widgets."
             [skein.ui.gtk.lib :as lib]
             [skein.ffi :as ffi]
             [skein.math :as math]
-            [skein.string :as string]))
+            [skein.string :as string]
+            [skein.time :as time]))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; What each widget class implements here
@@ -60,6 +61,12 @@ split pane's divider).")
   "One of w's event controllers reported kind (:pressed, :motion, :key-pressed, ...)
 with args, a map.")
 
+(defgeneric native-close-request [o]
+  "The user asked o's GtkWindow to close: by default ui/close!.")
+
+(defmethod native-close-request [o]
+  (ui/close! o))
+
 (defgeneric native-natural-size [w]
   "w's natural [width height]: by default its GTK widget's natural size.")
 
@@ -81,7 +88,7 @@ with args, a map.")
 (def ^:private signal-kinds
   [:clicked :activate :changed :toggled :value-changed :resized :selected :switch-page
    :close-request :position :sort :items-changed :pressed :released :motion :enter :leave
-   :scroll :key-pressed :key-released])
+   :scroll :key-pressed :key-released :window-key :closed :menu-activate])
 
 (defn- kind-of [data] (nth signal-kinds (ffi/address data)))
 
@@ -103,7 +110,7 @@ this namespace's), reporting it as kind. Returns o."
 
 (ffi/defcallback close-request-imp bool [window ptr, data ptr]
   (when-let [w (lib/object-for window)]
-    (ui/close! w))
+    (native-close-request w))
   ;; true: GTK doesn't close the window itself; ui/close! did, unless a handler vetoed.
   true)
 
@@ -175,6 +182,32 @@ this namespace's), reporting it as kind. Returns o."
    (when-let [w (lib/object-for controller)]
      (native-input w (kind-of data) controller {:keyval keyval :state state}))))
 
+(def ^:private async-results
+  "An async call's id -> its GAsyncResult, once it finished."
+  (atom {}))
+
+(ffi/defcallback async-imp void [source ptr, result ptr, data ptr]
+  (lib/g-object-ref result)
+  (swap! async-results assoc (ffi/address data) result))
+
+(def ^:private timers
+  "A timer's id -> the skein.ui timer."
+  (atom {}))
+
+(ffi/defcallback timer-imp bool [data ptr]
+  (if-let [t (get @timers (ffi/address data))]
+    (do (when-not (:repeat t) (swap! timers dissoc (ffi/address data)))
+        (ui/timer-fired! t)
+        (boolean (:repeat t)))
+    false))
+
+(def ^:private auto-answer!
+  "Answer the dialog that is open, for tests (defined below).")
+
+(ffi/defcallback answer-imp bool [data ptr]
+  (auto-answer!)
+  false)
+
 (def ^:private pulsing
   "progress bar id -> the indeterminate progress bar it pulses."
   (atom {}))
@@ -190,6 +223,7 @@ this namespace's), reporting it as kind. Returns o."
 (defclass gtk-backend [ui/backend]
   "The GTK 4 backend."
   (main-thread :init nil :doc "The GThread of the main thread, where GTK was initialized.")
+  (actions :init nil :doc "The GSimpleActionGroup of the menu items' actions, \"skein\".")
   (running :cell :atom :init false :doc "Whether ui/run!'s main loop runs."))
 
 (defn available?
@@ -204,7 +238,7 @@ this namespace's), reporting it as kind. Returns o."
     (error "the GTK backend needs GTK 4, which isn't installed"))
   (when-not (lib/gtk-init-check)
     (error "GTK 4 can't open the display"))
-  (make gtk-backend :main-thread (lib/g-thread-self)))
+  (make gtk-backend :main-thread (lib/g-thread-self) :actions (lib/g-simple-action-group-new)))
 
 (defn- main-thread? [b]
   (= (ffi/address (lib/g-thread-self)) (ffi/address (:main-thread b))))
@@ -324,11 +358,31 @@ for the user's doing."
 inside it that holds its children."
   (atom {}))
 
+(def ^:private window-boxes
+  "A window's GtkWindow address -> the vertical GtkBox of its menu bar and content."
+  (atom {}))
+
+(def ^:private menu-bar-heights
+  "A window's GtkWindow address -> the height of its menu bar, or 0."
+  (atom {}))
+
 (defmethod make-native [(w ui/window-widget)]
-  (let [win (lib/g-object-ref (lib/window-new))
-        content (lib/fixed-new)]
-    (lib/window-set-child win content)
+  (let [b (ui/current-backend)
+        win (lib/g-object-ref (lib/window-new))
+        box (lib/box-new 1 0)
+        content (lib/fixed-new)
+        keys (lib/key-controller-new)]
+    (lib/widget-set-vexpand content true)
+    (lib/box-append box content)
+    (lib/window-set-child win box)
+    (lib/widget-insert-action-group win "skein" (:actions b))
     (swap! inner-fixed assoc (ffi/address win) content)
+    (swap! window-boxes assoc (ffi/address win) box)
+    ;; Its own shortcuts (add-shortcut!), before the focused widget gets the key.
+    (lib/controller-set-phase keys 1)   ; GTK_PHASE_CAPTURE
+    (lib/register! keys w)
+    (connect! keys "key-pressed" :window-key key-imp)
+    (lib/widget-add-controller win keys)
     (connect! win "close-request" :close-request close-request-imp)
     (connect! win "notify::default-width" :resized signal-arg-imp)
     (connect! win "notify::default-height" :resized signal-arg-imp)
@@ -340,9 +394,11 @@ inside it that holds its children."
 (defmethod set-native [(w ui/window-widget) (p (= :title)) v]
   (lib/window-set-title (native w) (or v "")))
 
+(defn- bar-height [w] (get @menu-bar-heights (ffi/address (native w)) 0))
+
 (defn- set-default-size! [w]
   (when (and (:width w) (:height w))
-    (lib/window-set-default-size (native w) (:width w) (:height w))))
+    (lib/window-set-default-size (native w) (:width w) (+ (:height w) (bar-height w)))))
 
 (defmethod set-native [(w ui/window-widget) (p (= :width)) v] (set-default-size! w))
 (defmethod set-native [(w ui/window-widget) (p (= :height)) v] (set-default-size! w))
@@ -352,7 +408,7 @@ inside it that holds its children."
     (ffi/with-foreign [width (ffi/alloc i32 1)]
       (ffi/with-foreign [height (ffi/alloc i32 1)]
         (lib/window-get-default-size win width height)
-        (let [size [(ffi/get width i32) (ffi/get height i32)]]
+        (let [size [(ffi/get width i32) (- (ffi/get height i32) (bar-height w))]]
           (when (and (every? pos? size) (not= size [(:width w) (:height w)]))
             (apply ui/resized-by-user! w size)))))))
 
@@ -1194,7 +1250,8 @@ inside it that holds its children."
     (quietly (fn [] (set-view-model! w sel)))
     (if (tree? w)
       (do (show-expansion! w)
-          (select-rows! w (keep (fn [r] (when (contains? (set (:selection w)) (first (row-items w [r])))
+          (select-rows! w (keep (fn [r] (when (contains? (set (:selection w))
+                                                         (first (row-items w [r])))
                                           r))
                                 (range (n-rows w)))))
       (select-rows! w (:selected-indices w)))))
@@ -1214,7 +1271,8 @@ inside it that holds its children."
 (defn- remove-columns! [w]
   (let [view (view-of w)
         cols (lib/column-view-get-columns view)
-        items (mapv (fn [i] (lib/list-model-get-item cols i)) (range (lib/list-model-n-items cols)))]
+        items (mapv (fn [i] (lib/list-model-get-item cols i))
+                    (range (lib/list-model-n-items cols)))]
     (doseq [c items]
       (lib/column-view-remove-column view c)
       (lib/g-object-unref c))))
@@ -1269,7 +1327,8 @@ inside it that holds its children."
                     (lib/tree-expander-get-child child))
                 child)]
     (lib/label-set-text label text)
-    (swap! bound-cells assoc [(ffi/address (native w)) (lib/list-item-get-position list-item) column]
+    (swap! bound-cells assoc
+           [(ffi/address (native w)) (lib/list-item-get-position list-item) column]
            text)))
 
 (defmethod set-native [(l ui/list-box-widget) (p (= :items)) v] (reload! l))
@@ -1609,12 +1668,517 @@ stroke colors are set as each shape is drawn."
             lower (lib/keyval-to-lower keyval)
             code (lib/keyval-to-unicode keyval)
             key (or (get named-keys lower)
-                    (when (pos? (lib/keyval-to-unicode lower)) (char (lib/keyval-to-unicode lower))))
+                    (when (pos? (lib/keyval-to-unicode lower))
+                      (char (lib/keyval-to-unicode lower))))
             e (ui/event-for c (if (= kind :key-pressed) :key-down :key-up) :key key
                             :modifiers (modifiers-of (:state args))
                             :text (if (pos? code) (str (char code)) ""))]
         (ui/emit! c e)
         (ui/consumed? e)))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Window shortcuts
+
+(defn- key-of
+  "skein.ui's key for a GDK keyval."
+  [keyval]
+  (let [lower (lib/keyval-to-lower keyval)]
+    (or (get named-keys lower)
+        (let [code (lib/keyval-to-unicode lower)] (when (pos? code) (char code))))))
+
+(defmethod native-input [(w ui/window-widget) (k (= :window-key)) controller args]
+  (let [e (ui/event-for w :key-down :key (key-of (:keyval args))
+                        :modifiers (modifiers-of (:state args)))]
+    (or (ui/dispatch-shortcut! w e)
+        (do (ui/emit! w e) (ui/consumed? e)))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Menus: each item is a GSimpleAction in the backend's action group ("skein."), each
+;;; menu a GMenu filled from the core's tree, a menu bar a GtkPopoverMenuBar in its
+;;; window above the content. Separators split a menu into sections.
+
+(def ^:private action-names
+  "A menu item's GSimpleAction address -> its name."
+  (atom {}))
+
+(def ^:private action-ids (atom 0))
+
+(defn- action-name [item] (get @action-names (ffi/address (native item))))
+
+(defmethod make-native [(item ui/menu-item-widget)]
+  (let [name (str "item-" (swap! action-ids inc))
+        a (if (instance? ui/check-menu-item-widget item)
+            (lib/g-simple-action-new-stateful name (ffi/null)
+                                              (lib/g-variant-new-boolean (boolean (:checked item))))
+            (lib/g-simple-action-new name (ffi/null)))]
+    (swap! action-names assoc (ffi/address a) name)
+    (lib/g-action-map-add-action (:actions (ui/current-backend)) a)
+    (connect! a "activate" :menu-activate signal-arg-imp)))
+
+(defmethod make-native [(m ui/menu-widget)] (lib/g-menu-new))
+(defmethod make-native [(s ui/menu-separator-widget)] (lib/g-menu-new))
+
+(def ^:private bar-models
+  "A menu bar's GtkPopoverMenuBar address -> its top GMenu."
+  (atom {}))
+
+(defmethod make-native [(bar ui/menu-bar-widget)]
+  (let [top (lib/g-menu-new)
+        n (owned (lib/popover-menu-bar-new top))]
+    (swap! bar-models assoc (ffi/address n) top)
+    n))
+
+(def ^:private gtk-keys
+  {:return "Return" :escape "Escape" :tab "Tab" :backspace "BackSpace" :delete "Delete"
+   :left "Left" :right "Right" :up "Up" :down "Down" :home "Home" :end "End"
+   :page-up "Page_Up" :page-down "Page_Down" :space "space"
+   \, "comma" \. "period" \+ "plus" \- "minus" \/ "slash" \; "semicolon" \= "equal"})
+
+(defn accelerator
+  "GTK's accelerator string for a shortcut string, such as \"<Control><Shift>s\"."
+  [shortcut]
+  (let [[key mods] (ui/parse-shortcut shortcut)]
+    (str (apply str (keep (fn [[m s]] (when (contains? mods m) s))
+                          [[:control "<Control>"] [:alt "<Alt>"] [:shift "<Shift>"]
+                           [:command "<Meta>"]]))
+         (or (get gtk-keys key)
+             (if (keyword? key) (string/upper-case (name key)) (str key))))))
+
+(defn- fill-menu!
+  "Fill the GMenu of the menu widget m from its children, sections at the separators."
+  [m]
+  (let [gmenu (native m)
+        sections (reduce (fn [acc c] (if (instance? ui/menu-separator-widget c)
+                                       (conj acc [])
+                                       (update acc (dec (count acc)) conj c)))
+                         [[]] (:children m))
+        fill (fn [target items]
+               (doseq [c items]
+                 (if (instance? ui/menu-widget c)
+                   (do (fill-menu! c)
+                       (lib/g-menu-append-submenu target (or (:title c) "") (native c)))
+                   (let [i (lib/g-menu-item-new (or (:label c) "") (str "skein." (action-name c)))]
+                     (when (:shortcut c)
+                       (lib/g-menu-item-set-attribute-value
+                        i "accel" (lib/g-variant-new-string (accelerator (:shortcut c)))))
+                     (lib/g-menu-append-item target i)
+                     (lib/g-object-unref i)))))]
+    (lib/g-menu-remove-all gmenu)
+    (if (= 1 (count sections))
+      (fill gmenu (first sections))
+      (doseq [section sections]
+        (let [sm (lib/g-menu-new)]
+          (fill sm section)
+          (lib/g-menu-append-section gmenu (ffi/null) sm)
+          (lib/g-object-unref sm))))))
+
+(def ^:private window-shortcuts
+  "A window's GtkWindow address -> the shortcut controller of its menu bar's items."
+  (atom {}))
+
+(def ^:private window-of-bar
+  "A window's address -> the window, for the windows with menu bars."
+  (atom {}))
+
+(defn- windows-with-bar [bar]
+  (filter (fn [w] (identical? bar (:menu-bar w))) (vals @window-of-bar)))
+
+(defn- install-shortcuts! [w]
+  (let [win (native w)
+        old (get @window-shortcuts (ffi/address win))
+        controller (lib/shortcut-controller-new)]
+    (when old (lib/widget-remove-controller win old))
+    (lib/shortcut-controller-set-scope controller 1)   ; GTK_SHORTCUT_SCOPE_MANAGED
+    (when-let [bar (:menu-bar w)]
+      (ui/map-menu-items
+       (fn [item _]
+         (when (:shortcut item)
+           (lib/shortcut-controller-add
+            controller (lib/shortcut-new (lib/shortcut-trigger-parse (accelerator (:shortcut item)))
+                                         (lib/named-action-new
+                                          (str "skein." (action-name item)))))))
+       bar))
+    (lib/widget-add-controller win controller)
+    (swap! window-shortcuts assoc (ffi/address win) controller)))
+
+(defn- rebuild-menus!
+  "Fill again the GMenus of the menu bar or menu that o is in, and the shortcuts of the
+windows that show it."
+  [o]
+  (let [root (last (take-while some? (iterate :parent o)))]
+    (cond
+      (instance? ui/menu-bar-widget root)
+      (let [top (get @bar-models (ffi/address (native root)))]
+        (lib/g-menu-remove-all top)
+        (doseq [m (:children root)]
+          (fill-menu! m)
+          (lib/g-menu-append-submenu top (or (:title m) "") (native m)))
+        (doseq [w (windows-with-bar root)] (install-shortcuts! w)))
+      (instance? ui/menu-widget root) (fill-menu! root))))
+
+(defmethod ui/backend-add-child [(b gtk-backend) (parent ui/menu-object) child]
+  (rebuild-menus! parent))
+
+(defmethod ui/backend-remove-child [(b gtk-backend) (parent ui/menu-object) child]
+  (rebuild-menus! parent))
+
+(defmethod set-native [(m ui/menu-widget) (p (= :title)) v]
+  (rebuild-menus! m))
+
+(defmethod set-native [(item ui/menu-item-widget) (p (= :label)) v]
+  (rebuild-menus! item))
+
+(defmethod set-native [(item ui/menu-item-widget) (p (= :shortcut)) v]
+  (rebuild-menus! item))
+
+(defmethod set-native [(item ui/menu-item-widget) (p (= :enabled)) v]
+  (lib/g-simple-action-set-enabled (native item) (boolean v)))
+
+(defmethod set-native [(item ui/check-menu-item-widget) (p (= :checked)) v]
+  (lib/g-simple-action-set-state (native item) (lib/g-variant-new-boolean (boolean v))))
+
+(defmethod native-signal [(item ui/menu-item-widget) (k (= :menu-activate)) action arg]
+  (ui/activate-menu-item! item))
+
+(defmethod ui/backend-destroy :before [(b gtk-backend) (item ui/menu-item-widget)]
+  (lib/g-action-map-remove-action (:actions b) (action-name item)))
+
+(defmethod set-native [(w ui/window-widget) (p (= :menu-bar)) bar]
+  (let [win (native w)
+        box (get @window-boxes (ffi/address win))
+        first-child (lib/widget-get-first-child box)
+        content (container-view w)]
+    (when (not= (ffi/address first-child) (ffi/address content))
+      (lib/box-remove box first-child))
+    (if bar
+      (do (lib/box-prepend box (native bar))
+          (swap! window-of-bar assoc (ffi/address win) w)
+          (swap! menu-bar-heights assoc (ffi/address win) (second (lib/natural-size (native bar))))
+          (rebuild-menus! bar))
+      (do (swap! window-of-bar dissoc (ffi/address win))
+          (swap! menu-bar-heights dissoc (ffi/address win))))
+    (install-shortcuts! w)
+    (set-default-size! w)))
+
+(defclass popup-state []
+  "A popup menu that is open."
+  (closed :cell :atom :init false))
+
+(defmethod native-signal [(p popup-state) (k (= :closed)) instance arg]
+  (set-slot! p :closed true))
+
+(ffi/defcstruct gdk-rectangle (x i32) (y i32) (width i32) (height i32))
+
+(defmethod ui/backend-popup-menu [(b gtk-backend) m widget x y]
+  (fill-menu! m)
+  (let [popover (lib/popover-menu-new (native m))
+        state (make popup-state)]
+    (lib/widget-set-parent popover (native widget))
+    (lib/widget-insert-action-group popover "skein" (:actions b))
+    (lib/register! popover state)
+    (connect! popover "closed" :closed signal-imp)
+    (ffi/with-foreign [r (ffi/alloc gdk-rectangle)]
+      (ffi/put-field! r gdk-rectangle :x (int x))
+      (ffi/put-field! r gdk-rectangle :y (int y))
+      (ffi/put-field! r gdk-rectangle :width 1)
+      (ffi/put-field! r gdk-rectangle :height 1)
+      (lib/popover-set-pointing-to popover r))
+    (lib/popover-popup popover)
+    (while (not (:closed state))
+      (lib/g-main-context-iteration (ffi/null) true))
+    (lib/widget-unparent popover)
+    (lib/unregister! popover)))
+
+(defn- toplevels []
+  (let [l (lib/window-get-toplevels)]
+    (mapv (fn [i] (let [w (lib/list-model-get-item l i)] (lib/g-object-unref w) w))
+          (range (lib/list-model-n-items l)))))
+
+(defmethod ui/backend-active-window [(b gtk-backend)]
+  (some (fn [w] (when (lib/window-is-active w) (lib/object-for w))) (toplevels)))
+
+(def ^:private role-actions
+  {:copy "clipboard.copy" :cut "clipboard.cut" :paste "clipboard.paste"
+   :select-all "selection.select-all" :delete "selection.delete" :undo "text.undo"
+   :redo "text.redo"})
+
+(defmethod ui/backend-perform-role [(b gtk-backend) role]
+  (when-let [w (ui/backend-active-window b)]
+    (let [win (native w)]
+      (case role
+        :minimize (lib/window-minimize win)
+        :zoom (if (lib/window-is-maximized win)
+                (lib/window-unmaximize win)
+                (lib/window-maximize win))
+        :fullscreen (lib/window-fullscreen win)
+        (when-let [action (get role-actions role)]
+          (let [focus (lib/root-get-focus win)]
+            (when-not (ffi/null? focus)
+              (lib/widget-activate-action focus action (ffi/null)))))))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Dialogs: GtkAlertDialog and GtkFileDialog, and a window of our own for a text prompt.
+;;; They are asynchronous in GTK 4: the backend runs the main loop until they answer.
+
+(def ^:private async-ids (atom 0))
+
+(def ^:private next-answer
+  "For tests: {:answer x} for the next dialog (answer-next-dialog!), or nil."
+  (atom nil))
+
+(def ^:private open-dialog
+  "The dialog that is open: {:kind :alert or :file, :cancellable} or {:kind :prompt ...}."
+  (atom nil))
+
+(defn- await-async
+  "Start an async call (f id cancellable) and run the main loop until it finished; its
+GAsyncResult, which the caller unrefs."
+  [kind f]
+  (let [id (swap! async-ids inc)
+        cancellable (lib/g-cancellable-new)]
+    (reset! open-dialog {:kind kind :cancellable cancellable})
+    (when (some? @next-answer)
+      (lib/g-timeout-add 100 answer-imp (ffi/null)))
+    (f (lib/signal-data id) cancellable)
+    (while (not (contains? @async-results id))
+      (lib/g-main-context-iteration (ffi/null) true))
+    (reset! open-dialog nil)
+    (lib/g-object-unref cancellable)
+    (let [r (get @async-results id)]
+      (swap! async-results dissoc id)
+      r)))
+
+(defn- parent-window
+  "The GtkWindow a dialog belongs to: parent's, else the active window's, else null."
+  [parent]
+  (if-let [w (or parent (ui/backend-active-window (ui/current-backend)))]
+    (native w)
+    (ffi/null)))
+
+(defn- c-strings
+  "A NULL-terminated C array of copies of the strings, and a function that frees it."
+  [strings]
+  (let [a (ffi/alloc ptr (inc (count strings)))
+        copies (mapv (fn [s] (lib/g-strdup s)) strings)]
+    (doseq [[i p] (map-indexed vector copies)] (ffi/put! a ptr p i))
+    (ffi/put! a ptr (ffi/null) (count strings))
+    [a (fn [] (doseq [p copies] (lib/g-free p)) (ffi/free a))]))
+
+(defmethod ui/backend-message-box [(b gtk-backend) parent message detail type labels]
+  (let [d (lib/alert-dialog-new "%s" message)
+        [buttons free!] (c-strings labels)]
+    (when detail (lib/alert-dialog-set-detail d detail))
+    (lib/alert-dialog-set-buttons d buttons)
+    (free!)
+    (lib/alert-dialog-set-cancel-button d -1)
+    (let [r (await-async :alert (fn [id c] (lib/alert-dialog-choose d (parent-window parent) c
+                                                                    async-imp id)))
+          i (lib/alert-dialog-choose-finish d r (ffi/null))]
+      (lib/g-object-unref r)
+      (lib/g-object-unref d)
+      (when (< -1 i (count labels)) i))))
+
+(defclass prompt-dialog []
+  "A text prompt that is open: its window, entry and OK button, and the answer once
+given ({:text s} or {:text nil})."
+  (window :init nil)
+  (entry :init nil)
+  (ok :init nil)
+  (answer :cell :atom :init nil))
+
+(defn- answer-prompt! [p ok?]
+  (when-not (:answer p)
+    (set-slot! p :answer {:text (when ok? (lib/editable-get-text (:entry p)))})))
+
+(defmethod native-signal [(p prompt-dialog) (k (= :clicked)) button arg]
+  (answer-prompt! p (= (ffi/address button) (ffi/address (:ok p)))))
+
+(defmethod native-signal [(p prompt-dialog) (k (= :activate)) entry arg]
+  (answer-prompt! p true))
+
+(defmethod native-close-request [(p prompt-dialog)]
+  (answer-prompt! p false))
+
+(defmethod ui/backend-prompt-text [(b gtk-backend) parent message detail default ok cancel]
+  (let [win (lib/window-new)
+        box (lib/box-new 1 8)
+        buttons (lib/box-new 0 8)
+        entry (lib/entry-new)
+        ok-button (lib/button-new)
+        cancel-button (lib/button-new)
+        p (make prompt-dialog :window win :entry entry :ok ok-button)]
+    (lib/window-set-title win "")
+    (lib/window-set-modal win true)
+    (when parent (lib/window-set-transient-for win (native parent)))
+    (lib/box-append box (lib/label-new message))
+    (when detail (lib/box-append box (lib/label-new detail)))
+    (lib/editable-set-text entry (or default ""))
+    (lib/box-append box entry)
+    (lib/button-set-label cancel-button cancel)
+    (lib/button-set-label ok-button ok)
+    (lib/box-append buttons cancel-button)
+    (lib/box-append buttons ok-button)
+    (lib/box-append box buttons)
+    (lib/window-set-child win box)
+    (doseq [[o signal kind handler] [[win "close-request" :close-request close-request-imp]
+                                     [entry "activate" :activate signal-imp]
+                                     [ok-button "clicked" :clicked signal-imp]
+                                     [cancel-button "clicked" :clicked signal-imp]]]
+      (lib/register! o p)
+      (connect! o signal kind handler))
+    (reset! open-dialog {:kind :prompt :prompt p})
+    (when (some? @next-answer) (lib/g-timeout-add 100 answer-imp (ffi/null)))
+    (lib/window-present win)
+    (while (nil? (:answer p))
+      (lib/g-main-context-iteration (ffi/null) true))
+    (reset! open-dialog nil)
+    (doseq [o [win entry ok-button cancel-button]] (lib/unregister! o))
+    (lib/window-destroy win)
+    (:text (:answer p))))
+
+(defmethod ui/backend-choose-file [(b gtk-backend) parent opts]
+  (let [d (lib/file-dialog-new)
+        mode (:mode opts)]
+    (when (:title opts) (lib/file-dialog-set-title d (:title opts)))
+    (when (and (= mode :save) (:name opts)) (lib/file-dialog-set-initial-name d (:name opts)))
+    (when (:directory opts)
+      (let [f (lib/g-file-new-for-path (:directory opts))]
+        (lib/file-dialog-set-initial-folder d f)
+        (lib/g-object-unref f)))
+    (when (seq (:filters opts))
+      (let [store (lib/g-list-store-new (lib/file-filter-get-type))]
+        (doseq [[description & extensions] (:filters opts)]
+          (let [f (lib/file-filter-new)]
+            (lib/file-filter-set-name f description)
+            (doseq [e extensions] (lib/file-filter-add-suffix f e))
+            (lib/g-list-store-append store f)
+            (lib/g-object-unref f)))
+        (lib/file-dialog-set-filters d store)
+        (lib/g-object-unref store)))
+    (let [parent (parent-window parent)
+          multiple (and (= mode :open) (:multiple opts))
+          r (await-async :file
+                         (fn [id c]
+                           (cond (= mode :save) (lib/file-dialog-save d parent c async-imp id)
+                                 (= mode :directory) (lib/file-dialog-select-folder
+                                                      d parent c async-imp id)
+                                 multiple (lib/file-dialog-open-multiple d parent c async-imp id)
+                                 :else (lib/file-dialog-open d parent c async-imp id))))
+          path (fn [f] (let [p (lib/owned-string (lib/g-file-get-path f))]
+                         (lib/g-object-unref f)
+                         p))
+          paths (if multiple
+                  (let [files (lib/file-dialog-open-multiple-finish d r (ffi/null))]
+                    (when-not (ffi/null? files)
+                      (let [ps (mapv (fn [i] (path (lib/list-model-get-item files i)))
+                                     (range (lib/list-model-n-items files)))]
+                        (lib/g-object-unref files)
+                        ps)))
+                  (let [f (case mode
+                            :save (lib/file-dialog-save-finish d r (ffi/null))
+                            :directory (lib/file-dialog-select-folder-finish d r (ffi/null))
+                            (lib/file-dialog-open-finish d r (ffi/null)))]
+                    (when-not (ffi/null? f) [(path f)])))]
+      (lib/g-object-unref r)
+      (lib/g-object-unref d)
+      paths)))
+
+(defmethod ui/backend-show-about [(b gtk-backend) info]
+  (let [d (lib/about-dialog-new)]
+    (when (:name info) (lib/about-set-program-name d (:name info)))
+    (when (:version info) (lib/about-set-version d (:version info)))
+    (when (:copyright info) (lib/about-set-copyright d (:copyright info)))
+    (when (:comments info) (lib/about-set-comments d (:comments info)))
+    (when (:website info) (lib/about-set-website d (:website info)))
+    (when (:icon info) (lib/about-set-logo d (texture (:icon info))))
+    (lib/window-present d)))
+
+(defn- find-button
+  "The GtkButton whose label is label among the toplevel windows' widgets, or nil."
+  [label]
+  (first (filter (fn [w] (and (= "GtkButton" (lib/type-name-of w))
+                              (= label (lib/button-get-label w))))
+                 (mapcat lib/widgets-under (toplevels)))))
+
+(defn- auto-answer! []
+  (let [{answer :answer} @next-answer
+        {:keys [kind cancellable prompt]} @open-dialog]
+    (reset! next-answer nil)
+    (case kind
+      :alert (if (nil? answer)
+               (lib/g-cancellable-cancel cancellable)
+               (if-let [button (find-button answer)]
+                 (lib/emit! button "clicked")
+                 (lib/g-cancellable-cancel cancellable)))
+      :file (lib/g-cancellable-cancel cancellable)
+      :prompt (if (nil? answer)
+                (answer-prompt! prompt false)
+                (do (lib/editable-set-text (:entry prompt) answer)
+                    (answer-prompt! prompt true)))
+      nil)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Timers, the clipboard and the system
+
+(def ^:private timer-ids (atom 0))
+
+(defmethod ui/backend-start-timer [(b gtk-backend) t]
+  (let [id (swap! timer-ids inc)]
+    (swap! timers assoc id t)
+    [id (lib/g-timeout-add (max 1 (int (math/round (* 1000 (:interval t))))) timer-imp
+                           (lib/signal-data id))]))
+
+(defmethod ui/backend-stop-timer [(b gtk-backend) t [id source]]
+  (when (contains? @timers id)
+    (swap! timers dissoc id)
+    (lib/g-source-remove source)))
+
+(defn- clipboard [] (lib/display-get-clipboard (lib/display-get-default)))
+
+(defmethod ui/backend-clipboard-text [(b gtk-backend)]
+  (let [r (await-async :clipboard (fn [id c] (lib/clipboard-read-text-async (clipboard) c
+                                                                            async-imp id)))
+        text (lib/owned-string (lib/clipboard-read-text-finish (clipboard) r (ffi/null)))]
+    (lib/g-object-unref r)
+    text))
+
+(defmethod ui/backend-set-clipboard-text [(b gtk-backend) s]
+  (lib/clipboard-set-text (clipboard) s))
+
+(defmethod ui/backend-beep [(b gtk-backend)]
+  (lib/display-beep (lib/display-get-default)))
+
+(defmethod ui/backend-open-url [(b gtk-backend) url]
+  (lib/uri-launcher-launch (lib/uri-launcher-new url) (ffi/null) (ffi/null) (ffi/null) (ffi/null)))
+
+(defmethod ui/backend-dark-mode? [(b gtk-backend)]
+  (ffi/with-foreign [v (ffi/alloc i32 1)]
+    (lib/g-object-get-bool (lib/settings-get-default) "gtk-application-prefer-dark-theme" v
+                           (ffi/null))
+    (not= 0 (ffi/get v i32))))
+
+(def ^:private adwaita
+  "GTK has no system colors to ask for: Adwaita's, light and dark."
+  {false {:text "#000000" :secondary-text "#5e5c64" :disabled-text "#9a9996"
+          :background "#ffffff" :control-background "#ffffff" :window-background "#fafafb"
+          :selection "#c0d5f6" :accent "#3584e4" :separator "#d7d7d7" :link "#1c71d8"
+          :grid "#e6e6e6"}
+   true {:text "#ffffff" :secondary-text "#c0bfbc" :disabled-text "#77767b"
+         :background "#1e1e1e" :control-background "#242424" :window-background "#222226"
+         :selection "#1c4e8c" :accent "#78aeed" :separator "#3a3a3a" :link "#78aeed"
+         :grid "#303030"}})
+
+(def ^:private palette
+  {:system-red "#e01b24" :system-orange "#ff7800" :system-yellow "#f6d32d"
+   :system-green "#33d17a" :system-mint "#2ec27e" :system-teal "#2190a4"
+   :system-cyan "#62a0ea" :system-blue "#3584e4" :system-indigo "#5e5ce6"
+   :system-purple "#9141ac" :system-pink "#dc8add" :system-brown "#986a44"
+   :system-gray "#9a9996"})
+
+(defmethod ui/backend-system-color [(b gtk-backend) name]
+  (ui/parse-color (or (get palette name)
+                      (get (get adwaita (ui/backend-dark-mode? b)) name)
+                      "#808080")))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; For tests: the real widgets, read and acted on
@@ -1790,3 +2354,37 @@ x, y."
   [c x y]
   (lib/g-signal-emit-press (get @click-gestures (ffi/address (native c))) "pressed" 1 (f64 x)
                            (f64 y) (ffi/null)))
+
+(defn answer-next-dialog!
+  "For tests: make the next dialog answer by itself, as the user would: a message box
+clicks the button labelled answer (nil cancels it); a text prompt types answer and
+clicks OK (nil cancels it); a file chooser is cancelled."
+  [answer]
+  (reset! next-answer {:answer answer})
+  nil)
+
+(defn run-for!
+  "Run the main loop for seconds, so timers fire, outside ui/run!."
+  [seconds]
+  (let [end (+ (time/now) seconds)]
+    (while (< (time/now) end)
+      (lib/g-main-context-iteration (ffi/null) false)
+      (sleep 0.005))))
+
+(defn activate-menu-item-natively!
+  "Activate the menu item's action, as GTK does when it is chosen."
+  [item]
+  (lib/g-action-activate (native item) (ffi/null)))
+
+(defn menu-labels
+  "The labels of the items of a menu bar's or menu's GMenu, as GTK shows them."
+  [m]
+  (lib/menu-model-labels (if (instance? ui/menu-bar-widget m)
+                           (get @bar-models (ffi/address (native m)))
+                           (native m))))
+
+(defmethod ui/backend-destroy :before [(b gtk-backend) (w ui/window-widget)]
+  ;; Forget what the backend keeps by the window's address, which a new window may get.
+  (let [a (ffi/address (native w))]
+    (doseq [m [inner-fixed window-boxes menu-bar-heights window-of-bar window-shortcuts]]
+      (swap! m dissoc a))))
