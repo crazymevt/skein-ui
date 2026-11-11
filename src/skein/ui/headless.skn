@@ -169,11 +169,6 @@ pixels a character, 16 a line of text, 24 for a field. Calls the core asks to ma
 (defmethod ui/backend-natural-size [(b headless-backend) widget]
   (natural-size widget))
 
-(defn- position-of
-  "The index of x in coll (compared with identical?), or nil."
-  [x coll]
-  (first (keep-indexed (fn [i y] (when (identical? x y) i)) coll)))
-
 (defmethod ui/backend-decoration-size [(b headless-backend) (n ui/notebook-widget)]
   [8 32])
 
@@ -200,7 +195,7 @@ pixels a character, 16 a line of text, 24 for a field. Calls the core asks to ma
   (swap! (:native s) assoc :scrolled-to [x y]))
 
 (defmethod ui/backend-set-page-label [(b headless-backend) n page label]
-  (swap! (:native n) assoc-in [:page-labels (position-of page (:children n))] label))
+  (swap! (:native n) assoc-in [:page-labels (index-of (:children n) page)] label))
 
 (defmethod ui/backend-text-size [(b headless-backend) s font]
   (text-size s))
