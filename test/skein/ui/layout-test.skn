@@ -1,0 +1,202 @@
+(ns skein.ui.layout-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless :refer [bounds]]))
+
+;; Layout on the headless backend (step 2 of M2.14, D-097): distributing space, boxes,
+;; grids and frames, expansion, alignment and margins, and laying out again after a change.
+;; The headless backend's natural sizes: 8 pixels a character, 16 a line of text; a button
+;; is 24 wider than its label and 28 high; an entry is 8 + 8 a character wide and 24 high.
+
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)))
+
+(defn- text [s] (ui/label {:text s}))
+
+(deftest distribute
+  (are [total sizes expanding homogeneous result]
+       (= result (ui/distribute total sizes expanding homogeneous))
+    100 [10 20 30] [false true false] false [10 60 30]
+    11 [0 0 0] [true true true] false [4 4 3]
+    100 [10 20] [false false] false [10 20]
+    30 [20 40] [false false] false [10 20]
+    10 [10 10 10] [false false false] false [3 3 4]
+    10 [1 2 3] nil true [4 3 3]
+    10 [] [] false [])
+  (testing "against its rules, for random sizes"
+    (dotimes [_ 500]
+      (let [n (rand-int 6)
+            sizes (vec (repeatedly n (fn [] (rand-int 50))))
+            expanding (vec (repeatedly n (fn [] (zero? (rand-int 2)))))
+            homogeneous (zero? (rand-int 4))
+            total (rand-int 200)
+            natural (reduce + 0 sizes)
+            out (ui/distribute total sizes expanding homogeneous)]
+        (is (= n (count out)))
+        (is (every? (fn [s] (>= s 0)) out))
+        (cond
+          (zero? n) nil
+          homogeneous (do (is (= total (reduce + 0 out)))
+                          (is (<= (- (reduce max out) (reduce min out)) 1)))
+          (< total natural) (do (is (= total (reduce + 0 out)))
+                                (is (every? true? (map <= (butlast out) (butlast sizes)))))
+          (some true? expanding) (do (is (= total (reduce + 0 out)))
+                                     (is (every? true? (map (fn [o s e] (if e (>= o s) (= o s)))
+                                                            out sizes expanding))))
+          :else (is (= sizes out)))))))
+
+(deftest sides
+  (is (= [8 8 8 8] (ui/sides 8)))
+  (is (= [4 8 4 8] (ui/sides [4 8])))
+  (is (= [1 2 3 4] (ui/sides [1 2 3 4])))
+  (is (thrown-with-msg? error "a margin is" (ui/sides [1 2 3]))))
+
+(deftest boxes
+  (let [a (text "abc")
+        b (ui/button {:label "Go"})
+        box (ui/vbox {:spacing 4 :padding 10} a b)
+        w (ui/window {:title "Box"} box)]
+    (testing "natural sizes add up"
+      (is (= [24 16] (ui/preferred-size a)))
+      (is (= [40 28] (ui/preferred-size b)))
+      (is (= [60 68] (ui/preferred-size box))))
+    (testing "a window fits its content when shown"
+      (ui/show! w)
+      (is (= [60 68] [(:width w) (:height w)]))
+      (is (= [0 0 60 68] (bounds box)))
+      (is (= [10 10 40 16] (bounds a)))
+      (is (= [10 30 40 28] (bounds b))))
+    (testing "extra space goes nowhere until a child expands"
+      (headless/resize! w 100 100)
+      (is (= [10 10 80 16] (bounds a)))
+      (is (= [10 30 80 28] (bounds b)))
+      (set-slot! b :expand true)
+      (is (= [10 30 80 28] (bounds b)) "the new layout waits for the event loop")
+      (set-slot! b :valign :center)
+      (set-slot! b :halign :end)
+      (is (= 1 (headless/run-pending!)) "once for all the changes")
+      (is (= [50 46 40 28] (bounds b)))
+      (is (ui/expands? b :vertical))
+      (is (not (ui/expands? b :horizontal)))
+      (is (ui/expands? box :vertical) "a box expands when a child does"))
+    (testing "a property that doesn't change the size doesn't lay out again"
+      (set-slot! a :tooltip "A")
+      (is (= 0 (headless/run-pending!))))
+    (testing "hidden children take no space"
+      (set-slot! a :visible false)
+      (headless/run-pending!)
+      (is (= [50 36 40 28] (bounds b)) "b now has all the height, and stays centered")
+      (is (= [60 48] (ui/preferred-size box))))))
+
+(deftest rows-spacers-and-shrinking
+  (let [l (text "ab")
+        r (text "cd")
+        row (ui/hbox {:spacing 0} l (ui/spacer) r)
+        w (ui/window {:width 100} row)]
+    (ui/show! w)
+    (is (= 16 (:height w)))
+    (is (= [0 0 16 16] (bounds l)))
+    (is (= [84 0 16 16] (bounds r)) "the spacer pushes it to the end"))
+  (let [a (text "a") b (text "abcd")
+        row (ui/hbox {:spacing 0 :homogeneous true} a b)]
+    (ui/show! (ui/window {} row))
+    (is (= [64 16] (ui/preferred-size row)))
+    (is (= [0 0 32 16] (bounds a)))
+    (is (= [32 0 32 16] (bounds b))))
+  (let [a (text "ab") b (text "abcdef")]
+    (ui/show! (ui/window {:width 32} (ui/hbox {:spacing 0} a b)))
+    (is (= [0 0 8 16] (bounds a)) "too little room: each shrinks in proportion")
+    (is (= [8 0 24 16] (bounds b)))))
+
+(deftest margins-alignment-and-requests
+  (let [l (ui/label {:text "abcd" :margin [2 4] :halign :center :valign :end})]
+    (ui/show! (ui/window {:width 100 :height 50} l))
+    (is (= [40 20] (ui/outer-size l)))
+    (is (= [34 32 32 16] (bounds l)))
+    (set-slot! l :halign :middle)
+    (is (thrown-with-msg? error "an alignment is" (headless/run-pending!))))
+  (is (= [50 16] (ui/preferred-size (ui/label {:text "a" :width 50}))))
+  (is (= [0 0] (ui/outer-size (ui/label {:text "a" :visible false :margin 5}))))
+  (is (ui/expands? (ui/vbox {} (ui/entry {:hexpand true})) :horizontal)))
+
+(deftest grids
+  (let [name-label (text "Name")
+        name-field (ui/entry {:width-chars 10})
+        age-label (text "Age")
+        age-field (ui/spin-button {})
+        ok (ui/button {:label "OK" :column-span 2})
+        g (ui/grid {:columns 2 :column-spacing 10 :row-spacing 5}
+                   name-label name-field age-label age-field ok)
+        w (ui/window {} g)]
+    (testing "children fill the columns in reading order"
+      (is (= [[0 0] [1 0] [0 1] [1 1] [0 2]]
+             (mapv (fn [c] [(:column c) (:row c)]) (:children g)))))
+    (testing "each column is as wide as its widest child"
+      (ui/show! w)
+      (is (= [130 86] [(:width w) (:height w)]))
+      (is (= [0 0 32 24] (bounds name-label)))
+      (is (= [42 0 88 24] (bounds name-field)))
+      (is (= [0 29 32 24] (bounds age-label)))
+      (is (= [42 29 88 24] (bounds age-field)))
+      (is (= [0 58 130 28] (bounds ok))))
+    (testing "a column expands when a child in it does"
+      (set-slot! name-field :hexpand true)
+      (headless/resize! w 200 86)
+      (is (= [42 0 158 24] (bounds name-field)))
+      (is (= [0 58 200 28] (bounds ok)))))
+  (testing "without :columns, children go one to a row"
+    (let [g (ui/grid {} (text "a") (text "b") (text "c"))]
+      (is (= [0 1 2] (mapv :row (:children g))))
+      (is (= [0 0 0] (mapv :column (:children g))))))
+  (testing "attach! places a child; a spanning child widens its columns"
+    (let [wide (text "abcdefgh")
+          g (ui/grid {:column-spacing 0})]
+      (ui/attach! g (text "a") 0 0)
+      (ui/attach! g (text "b") 1 0)
+      (ui/attach! g wide 0 1 2 1)
+      (is (= [1 0] [(:row-span wide) (:column wide)]))
+      (is (= [64 38] (ui/preferred-size g))))))
+
+(deftest frames-and-windows-hold-one-widget
+  (let [l (text "ab")
+        f (ui/frame {:title "T"} l)]
+    (ui/show! (ui/window {} f))
+    (is (= [20 36] (ui/preferred-size f)))
+    (is (= [2 18 16 16] (bounds l)))
+    (is (= "T" (headless/native-property f :title)))
+    (is (identical? l (ui/content f)))
+    (is (thrown-with-msg? error "holds one widget" (ui/add! f (text "more"))))
+    (let [m (text "more")]
+      (ui/set-content! f m)
+      (is (identical? m (ui/content f)))
+      (is (headless/destroyed? l))))
+  (is (thrown-with-msg? error "holds one widget" (ui/window {} (text "a") (text "b")))))
+
+(deftest layout-follows-changes
+  (let [l (ui/label {:text "ab" :halign :start})
+        w (ui/window {:width 200 :height 200} (ui/vbox {} l))]
+    (ui/show! w)
+    (is (= [0 0 16 16] (bounds l)))
+    (set-slot! l :text "abcdef")
+    (headless/run-pending!)
+    (is (= [0 0 48 16] (bounds l)))
+    (testing "adding and removing children lays out again"
+      (let [box (ui/content w)
+            b (ui/button {:label "B"})]
+        (ui/add! box b)
+        (headless/run-pending!)
+        (is (= [0 22 200 28] (bounds b)))
+        (ui/remove! box l)
+        (headless/run-pending!)
+        (is (= [0 0 200 28] (bounds b)))))))
+
+(defclass half-pixel-widget [ui/widget])
+
+(defmethod ui/measure [(w half-pixel-widget)]
+  [10.5 3.2])
+
+(deftest pixels-are-whole
+  (let [h (ui/build half-pixel-widget {} nil)]
+    (is (= [11 4] (ui/preferred-size h)) "natural sizes round up")
+    (ui/allocate h 1.4 2.6 10.5 3.5)
+    (is (= [1 3 11 4] (bounds h)))
+    (is (every? integer? (bounds h)))))

@@ -22,7 +22,8 @@
       (is (= "Goodbye!" (headless/native-property l :text)))
       (set-slot! l :enabled false)
       (is (= false (headless/native-property l :enabled))))
-    (is (= [:visible :enabled :tooltip :text] (ui/properties l)))))
+    (is (= [:visible :enabled :tooltip :text :alignment :wrap :selectable]
+           (ui/properties l)))))
 
 (deftest events-and-handlers
   (let [clicks (atom [])

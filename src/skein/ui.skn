@@ -18,15 +18,22 @@ native control follows (property-changed). Events are objects emitted under a si
 options, or specialize handle-event. A handler is a function; written (fn [e] (save! e))
 it calls save! through its var, so redefining save! takes effect while the program runs.
 
+Layout is done here, the same on every platform: boxes and grids divide their space
+among their children by the children's natural sizes and their :hexpand, :vexpand,
+:expand, :halign, :valign and :margin options. Backends only move and size the native
+controls.
+
 The backend protocol is a set of generic functions on a backend object (backend-realize,
 backend-set-property, ...), which skein.ui.headless, skein.ui.cocoa, skein.ui.win32 and
-skein.ui.gtk implement. The core calls them through backend-in-ui-thread.")
+skein.ui.gtk implement. The core calls them through backend-in-ui-thread."
+  (:require [skein.math :as math]))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Backends
 
 (defclass backend []
-  "The superclass of UI backends: a backend implements the backend- generic functions.")
+  "The superclass of UI backends: a backend implements the backend- generic functions."
+  (layout-queue :cell :atom :init [] :doc "The windows waiting to be laid out again."))
 
 (def ^:private current (atom nil))
 
@@ -45,6 +52,10 @@ skein.ui.gtk implement. The core calls them through backend-in-ui-thread.")
 
 (defgeneric backend-in-ui-thread [backend f]
   "Call f, a function of no arguments, on the backend's UI thread and return its value.")
+
+(defgeneric backend-call-later [backend f]
+  "Call f, a function of no arguments, on the UI thread soon, after the event being
+handled. Returns at once.")
 
 (defgeneric backend-realize [backend object]
   "Make and return the native counterpart of object: a widget or a window. Its properties
@@ -73,6 +84,29 @@ reads back.")
 (defgeneric backend-close [backend window]
   "Close the window: take it off the screen.")
 
+(defgeneric backend-natural-size [backend widget]
+  "The natural [width height] of widget's native control, in pixels, for its contents.")
+
+(defgeneric backend-set-bounds [backend widget x y width height]
+  "Move and size widget's native control to x, y, width, height in pixels, relative to the
+top left of its container's.")
+
+(defgeneric backend-decoration-size [backend widget]
+  "The [width height] that a container's native control, such as a frame's border and
+title, adds around its content.")
+
+(defmethod backend-decoration-size [(b backend) widget]
+  [0 0])
+
+(defgeneric backend-content-area [backend widget width height]
+  "For a container of width by height, the [x y width height] its content goes in.")
+
+(defmethod backend-content-area [(b backend) widget width height]
+  [0 0 width height])
+
+(defgeneric backend-image-size [backend path]
+  "The [width height] in pixels of the image in the file at path.")
+
 (defgeneric backend-run-loop [backend]
   "Run the native event loop until backend-quit-loop.")
 
@@ -98,6 +132,11 @@ reads back.")
 (defclass value-event [event]
   "A value changed: text edited, a slider moved, a check box toggled. :value is the new
 value."
+  (value :init nil))
+
+(defclass selection-event [event]
+  "An item was chosen: :index is its index (nil for none) and :value the item."
+  (index :init nil)
   (value :init nil))
 
 (defclass vetoable-event [event]
@@ -129,18 +168,24 @@ value."
   (name :init nil)
   (parent :cell :atom :init nil)
   (children :cell :atom :init [])
-  (destroyed :cell :atom :init false))
+  (destroyed :cell :atom :init false)
+  (size-cache :cell :atom :init nil :doc "The preferred size, until invalidate-size!.")
+  (allocation :cell :atom :init nil
+              :doc "[x y width height], where layout put it in its container."))
 
 (def ^:private declared
-  "class -> {:properties [keyword ...] :signals {signal event-class}}, what each widget
-class declares itself."
+  "class -> {:properties [keyword ...] :layout [keyword ...] :signals {signal event-class}},
+what each widget class declares itself."
   (atom {}))
 
 (defn declare-widget!
-  "Declare which of class's cell slots are properties (keywords), and its signals, a map
-of signal to event class. Constructors take :on-<signal> options for them."
-  [class {:keys [properties signals]}]
-  (swap! declared assoc class {:properties (vec properties) :signals (or signals {})})
+  "Declare which of class's cell slots are properties (keywords) shown by the native
+control, which change its size or place (:layout, which may overlap the properties), and
+its signals, a map of signal to event class. Constructors take :on-<signal> options for
+them."
+  [class {:keys [properties layout signals]}]
+  (swap! declared assoc class {:properties (vec properties) :layout (vec layout)
+                               :signals (or signals {})})
   class)
 
 (defn- declared-for [object k]
@@ -173,14 +218,72 @@ without sending it back (backends call this before they emit the change)."
   [object]
   (and (some? (:native object)) (not (:destroyed object))))
 
+;;; Laying out again
+
+(defgeneric layout-root? [object]
+  "True for objects laid out on their own, such as windows, rather than by a container.")
+
+(defmethod layout-root? [object]
+  false)
+
+(defgeneric update-layout! [root]
+  "Lay out root, such as a window, and everything in it, in its current size.")
+
+(defn- layout-root
+  "The window object is in, object included, or nil."
+  [object]
+  (let [top (loop [o object] (if-let [p (:parent o)] (recur p) o))]
+    (when (layout-root? top) top)))
+
+(defn flush-layouts!
+  "Lay out every window that asked for it. The event loop does this soon after a change;
+call it to see a change's layout at once."
+  []
+  (let [q (cell (current-backend) :layout-queue)]
+    (loop []
+      (let [[old _] (swap-vals! q (fn [ws] (vec (rest ws))))]
+        (when-let [w (first old)]
+          (when (realized? w) (update-layout! w))
+          (recur))))))
+
+(defn- schedule-layout!
+  "Lay window out again soon, once however many changes ask for it."
+  [window]
+  (when (realized? window)
+    (let [b (current-backend)
+          [old _] (swap-vals! (cell b :layout-queue)
+                              (fn [ws] (if (some (fn [w] (identical? w window)) ws)
+                                         ws
+                                         (conj ws window))))]
+      (when (empty? old)
+        (backend-call-later b flush-layouts!)))))
+
+(defn invalidate-size!
+  "Forget object's measured size and its containers', and lay its window out again soon.
+Custom widgets call this when something changes their natural size."
+  [object]
+  (loop [o object]
+    (when o
+      (set-slot! o :size-cache nil)
+      (recur (:parent o))))
+  (when-let [root (layout-root object)]
+    (schedule-layout! root))
+  nil)
+
+;;; Property changes
+
 (defgeneric property-changed [object property value]
   "Called when object's property changed to value (not by the native control itself):
-the default shows it in the native control. Specialize it to react to property changes.")
+the default shows it in the native control, and lays the window out again for a layout
+property. Specialize it to react to property changes.")
 
 (defmethod property-changed [(o ui-object) property value]
   (when (realized? o)
-    (let [b (current-backend)]
-      (in-ui (fn [] (backend-set-property b o property value))))))
+    (when (some #{property} (properties o))
+      (let [b (current-backend)]
+        (in-ui (fn [] (backend-set-property b o property value)))))
+    (when (some #{property} (declared-for o :layout))
+      (invalidate-size! o))))
 
 (defn realize!
   "Make object's native counterpart, give it object's properties, and watch them. make
@@ -192,7 +295,7 @@ does this, so programs rarely call it."
       (in-ui (fn []
                (set-slot! object :native (backend-realize b object))
                (doseq [p props] (backend-set-property b object p (slot object p)))))
-      (doseq [p props]
+      (doseq [p (distinct (concat props (declared-for object :layout)))]
         (add-watch (cell object p) ::property
                    (fn [_ _ old new]
                      (when (and (not *syncing*) (not= old new))
@@ -262,17 +365,28 @@ Returns the event, so a caller can ask whether it was vetoed."
                               (pr-str signal))))]
     (apply make class :source object :signal signal kvs)))
 
+(defn changed-by-user!
+  "Backends call this when the user changed object's property to value in its native
+control (text typed, a slider moved): it stores the value without sending it back, then
+emits :changed with it. Returns the event."
+  [object property value]
+  (sync-property! object property value)
+  (emit! object (event-for object :changed :value value)))
+
 ;;; Children
 
-(defn add!
-  "Put child in the container parent, after its other children. Returns child."
-  [parent child]
+(defgeneric add! [parent child]
+  "Put child in the container parent, after its other children. Returns child. Containers
+specialize it (:before) to check or place the child.")
+
+(defmethod add! [(parent ui-object) child]
   (when (some? (:parent child))
     (error "the widget is in a container already; remove! it first"))
   (update-slot! parent :children conj child)
   (set-slot! child :parent parent)
   (let [b (current-backend)]
     (in-ui (fn [] (backend-add-child b parent child))))
+  (invalidate-size! parent)
   child)
 
 (defn remove!
@@ -282,14 +396,40 @@ Returns the event, so a caller can ask whether it was vetoed."
   (set-slot! child :parent nil)
   (let [b (current-backend)]
     (in-ui (fn [] (backend-remove-child b parent child))))
+  (invalidate-size! parent)
   child)
+
+(defn content
+  "The one widget in a window or frame, or nil."
+  [container]
+  (first (:children container)))
+
+(defn set-content!
+  "Make w (or nil) the content of a window or frame, destroying the content it had.
+Returns w."
+  [container w]
+  (doseq [c (:children container)]
+    (when-not (identical? c w)
+      (remove! container c)
+      (destroy! c)))
+  (when (and w (not (identical? (:parent w) container)))
+    (add! container w))
+  w)
+
+(defn- check-one-child [container]
+  (when (seq (:children container))
+    (error (str (pr-str (class-name (class-of container)))
+                " holds one widget, and has one already: put a box in it to hold more"))))
+
+(defn widgets-in
+  "root and every widget inside it, depth first."
+  [root]
+  (tree-seq (fn [o] (seq (:children o))) :children root))
 
 (defn find-widget
   "The widget named name (its :name option) in root or inside it, or nil."
   [root name]
-  (if (= name (:name root))
-    root
-    (some (fn [c] (find-widget c name)) (:children root))))
+  (first (filter (fn [w] (= name (:name w))) (widgets-in root))))
 
 ;;; Building widgets
 
@@ -315,57 +455,197 @@ handlers) and add the children to it. Constructors call this."
 ;;; Widgets
 
 (defclass widget [ui-object]
-  "The superclass of widgets: what windows and containers hold."
+  "The superclass of widgets: what windows and containers hold. Its layout options:
+:hexpand and :vexpand (true, false or :auto, when a child expands) say whether it takes
+extra width or height; :expand true makes it take extra space along a box; :halign and
+:valign (:fill, :start, :center or :end) place it across the space it gets; :margin is
+the space around it (a number, [vertical horizontal] or [top right bottom left]); :width
+and :height are the least size it asks for; :column, :row, :column-span and :row-span
+place it in a grid."
   (visible :cell :atom :init true :doc "Whether the widget is shown.")
   (enabled :cell :atom :init true :doc "Whether the widget responds to the user.")
-  (tooltip :cell :atom :init nil :doc "Text shown when the pointer rests on it, or nil."))
+  (tooltip :cell :atom :init nil :doc "Text shown when the pointer rests on it, or nil.")
+  (hexpand :cell :atom :init :auto)
+  (vexpand :cell :atom :init :auto)
+  (expand :cell :atom :init false)
+  (halign :cell :atom :init :fill)
+  (valign :cell :atom :init :fill)
+  (margin :cell :atom :init 0)
+  (width :cell :atom :init nil)
+  (height :cell :atom :init nil)
+  (column :cell :atom :init nil)
+  (row :cell :atom :init nil)
+  (column-span :cell :atom :init 1)
+  (row-span :cell :atom :init 1))
 
-(declare-widget! widget {:properties [:visible :enabled :tooltip]})
+(declare-widget! widget {:properties [:visible :enabled :tooltip]
+                         :layout [:visible :hexpand :vexpand :expand :halign :valign :margin
+                                  :width :height :column :row :column-span :row-span]})
 
-(defclass label-widget [widget]
-  "Text that the user can't edit."
-  (text :cell :atom :init ""))
+;;; ------------------------------------------------------------------------------------
+;;; Layout
+;;
+;; Each widget has a natural size: leaves ask the backend, containers add up their
+;; children's. A window gives its content its whole area; each container then divides
+;; what it gets among its children (arrange), top down.
 
-(declare-widget! label-widget {:properties [:text]})
+(defn sides
+  "A margin or padding m as [top right bottom left]: m is a number for all four sides,
+[vertical horizontal], or [top right bottom left]."
+  [m]
+  (cond (nil? m) [0 0 0 0]
+        (number? m) [m m m m]
+        (and (vector? m) (= 2 (count m))) (let [[v h] m] [v h v h])
+        (and (vector? m) (= 4 (count m))) m
+        :else (error "a margin is a number, [vertical horizontal] or [top right bottom left],"
+                     "not" (pr-str m))))
 
-(defn label
-  "A label: (label {:text \"Name\"})."
-  ([] (label {}))
-  ([opts] (build label-widget opts nil)))
+(defn- px
+  "x as a whole number of pixels."
+  [x]
+  (int (math/round x)))
 
-(defclass button-widget [widget]
-  "A push button. It emits :clicked."
-  (label :cell :atom :init "")
-  (default :cell :atom :init false :doc "Whether Return presses it."))
+(defgeneric measure [widget]
+  "widget's natural [width height], without its margin: the default asks the backend,
+and containers measure their children. Specialize it to give a custom widget a natural
+size; preferred-size caches it until invalidate-size!.")
 
-(declare-widget! button-widget {:properties [:label :default] :signals {:clicked action-event}})
+(defmethod measure [(w widget)]
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-natural-size b w)))))
 
-(defn button
-  "A button: (button {:label \"Save\" :on-clicked f})."
-  ([] (button {}))
-  ([opts] (build button-widget opts nil)))
+(defn preferred-size
+  "widget's natural size, at least its :width and :height, as [width height], without its
+margin. A hidden widget's is [0 0]."
+  [w]
+  (cond (not (:visible w)) [0 0]
+        (:size-cache w) (:size-cache w)
+        :else (let [[mw mh] (measure w)
+                    size [(max (int (math/ceil mw)) (or (:width w) 0))
+                          (max (int (math/ceil mh)) (or (:height w) 0))]]
+                (set-slot! w :size-cache size)
+                size)))
 
-(defclass entry-widget [widget]
-  "A one-line text field. It emits :changed (a value-event) as the user edits, and
-:activate on Return."
-  (text :cell :atom :init "")
-  (placeholder :cell :atom :init nil :doc "Text shown, greyed, while it's empty."))
+(defn outer-size
+  "widget's preferred size with its margin, as [width height]."
+  [w]
+  (if (:visible w)
+    (let [[pw ph] (preferred-size w)
+          [top right bottom left] (sides (:margin w))]
+      [(+ pw left right) (+ ph top bottom)])
+    [0 0]))
 
-(declare-widget! entry-widget {:properties [:text :placeholder]
-                               :signals {:changed value-event :activate action-event}})
+(defgeneric main-axis [container]
+  "The orientation along which container hands out extra space to children with :expand
+(:horizontal or :vertical), or nil if it doesn't.")
 
-(defn entry
-  "An entry: (entry {:placeholder \"Your name\" :on-changed f})."
-  ([] (entry {}))
-  ([opts] (build entry-widget opts nil)))
+(defmethod main-axis [container]
+  nil)
+
+(defn expands?
+  "Whether widget wants extra space along orientation (:horizontal or :vertical). An
+explicit :hexpand or :vexpand wins; :auto means true when it has :expand in a container
+of that orientation, or a child of it expands."
+  [w orientation]
+  (let [flag (if (= orientation :horizontal) (:hexpand w) (:vexpand w))]
+    (cond (not (:visible w)) false
+          (= flag :auto) (boolean (or (and (:expand w)
+                                           (= orientation (main-axis (:parent w))))
+                                      (some (fn [c] (expands? c orientation)) (:children w))))
+          :else (boolean flag))))
+
+(defgeneric arrange [widget width height]
+  "Place widget's children in its area of width by height, by calling allocate (or
+allocate-in-cell) on each. Containers define methods; leaves have nothing to place.")
+
+(defmethod arrange [(w widget) width height]
+  nil)
+
+(defn allocate
+  "Give widget the area x, y, width, height in its container's coordinates, then let it
+arrange its children."
+  [w x y width height]
+  (let [a [(px x) (px y) (max 0 (px width)) (max 0 (px height))]
+        [ax ay aw ah] a]
+    (when (not= a (:allocation w))
+      (set-slot! w :allocation a)
+      (let [b (current-backend)]
+        (in-ui (fn [] (backend-set-bounds b w ax ay aw ah)))))
+    (arrange w aw ah)))
+
+(defn- align-in
+  "[start size] of something of natural size pref aligned by align in avail pixels from
+start."
+  [align start avail pref]
+  (let [size (if (= align :fill) avail (min pref avail))]
+    [(case align
+       :fill start
+       :start start
+       :center (+ start (quot (- avail size) 2))
+       :end (+ start (- avail size))
+       (error "an alignment is :fill, :start, :center or :end, not" (pr-str align)))
+     size]))
+
+(defn allocate-in-cell
+  "Place widget in the cell x, y, width, height, after taking off its margin, by its
+:halign and :valign."
+  [w x y width height]
+  (when (:visible w)
+    (let [[top right bottom left] (sides (:margin w))
+          [pw ph] (preferred-size w)
+          [ax aw] (align-in (:halign w) (+ x left) (max 0 (- width left right)) pw)
+          [ay ah] (align-in (:valign w) (+ y top) (max 0 (- height top bottom)) ph)]
+      (allocate w ax ay aw ah))))
+
+(defn distribute
+  "Split total pixels among items of the natural sizes given: when there is more, the
+items that expanding (booleans, one per item) marks share the extra equally; when less,
+all shrink in proportion. With homogeneous every item gets the same size. Returns a
+vector of sizes."
+  ([total sizes expanding] (distribute total sizes expanding false))
+  ([total sizes expanding homogeneous]
+   (let [n (count sizes)
+         natural (reduce + 0 sizes)
+         k (count (filter identity expanding))]
+     (cond
+       (zero? n) []
+       homogeneous (let [each (quot total n) more (rem total n)]
+                     (mapv (fn [i] (+ each (if (< i more) 1 0))) (range n)))
+       (and (>= total natural) (zero? k)) (vec sizes)
+       (>= total natural)
+       (let [extra (- total natural) each (quot extra k) more (rem extra k)
+             ;; for each item, how many expanding items come before it
+             ranks (reductions + 0 (map (fn [e] (if e 1 0)) expanding))]
+         (mapv (fn [s e r] (if e (+ s each (if (< r more) 1 0)) s)) sizes expanding ranks))
+       (pos? natural)
+       (let [out (mapv (fn [s] (quot (* s total) natural)) sizes)]
+         (update out (dec n) + (- total (reduce + 0 out))))
+       :else (vec sizes)))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Containers
+
+(defn visible-children
+  "container's children that are shown."
+  [container]
+  (filterv :visible (:children container)))
+
+;;; Box
 
 (defclass box-widget [widget]
-  "A container that lays its children out in a row or a column."
-  (orientation :init :vertical :doc ":vertical or :horizontal.")
-  (spacing :cell :atom :init 0 :doc "The space between children, in pixels.")
-  (padding :cell :atom :init 0 :doc "The space around the children, in pixels."))
+  "Lays its children out in a column or a row. Children with :vexpand (in a column) or
+:hexpand (in a row), or with :expand, share the extra space."
+  (orientation :cell :atom :init :vertical :doc ":vertical or :horizontal.")
+  (spacing :cell :atom :init 6 :doc "Pixels between children.")
+  (padding :cell :atom :init 0 :doc "Space around the children, as for a margin.")
+  (homogeneous :cell :atom :init false :doc "Whether every child gets the same size."))
 
-(declare-widget! box-widget {:properties [:spacing :padding]})
+(declare-widget! box-widget {:layout [:orientation :spacing :padding :homogeneous]})
+
+(defn box
+  "A box: (box {:orientation :horizontal :spacing 8} child ...)."
+  [opts & children]
+  (build box-widget opts children))
 
 (defn vbox
   "A column of children: (vbox {:spacing 8} child ...)."
@@ -377,25 +657,253 @@ handlers) and add the children to it. Constructors call this."
   [opts & children]
   (build box-widget (assoc opts :orientation :horizontal) children))
 
+(defmethod main-axis [(b box-widget)]
+  (:orientation b))
+
+(defmethod measure [(b box-widget)]
+  (let [kids (visible-children b)
+        horizontal (= :horizontal (:orientation b))
+        sizes (map outer-size kids)
+        mains (map (fn [[w h]] (if horizontal w h)) sizes)
+        cross (reduce max 0 (map (fn [[w h]] (if horizontal h w)) sizes))
+        main (+ (if (:homogeneous b)
+                  (* (count kids) (reduce max 0 mains))
+                  (reduce + 0 mains))
+                (* (:spacing b) (max 0 (dec (count kids)))))
+        [top right bottom left] (sides (:padding b))]
+    (if horizontal
+      [(+ main left right) (+ cross top bottom)]
+      [(+ cross left right) (+ main top bottom)])))
+
+(defmethod arrange [(b box-widget) width height]
+  (let [[top right bottom left] (sides (:padding b))
+        kids (visible-children b)
+        horizontal (= :horizontal (:orientation b))
+        gap (:spacing b)
+        inner-main (- (if horizontal (- width left right) (- height top bottom))
+                      (* gap (max 0 (dec (count kids)))))
+        inner-cross (if horizontal (- height top bottom) (- width left right))
+        sizes (mapv (fn [c] (let [[w h] (outer-size c)] (if horizontal w h))) kids)
+        expanding (mapv (fn [c] (expands? c (:orientation b))) kids)
+        alloc (distribute (max 0 inner-main) sizes expanding (:homogeneous b))]
+    (reduce (fn [pos [c size]]
+              (if horizontal
+                (allocate-in-cell c pos top size inner-cross)
+                (allocate-in-cell c left pos inner-cross size))
+              (+ pos size gap))
+            (if horizontal left top)
+            (map vector kids alloc))
+    nil))
+
+;;; Grid
+
+(defclass grid-widget [widget]
+  "Lays its children out in rows and columns. Give each child :column and :row (and
+optionally :column-span and :row-span), or set the grid's :columns and add children in
+reading order. A column expands when a child in it has :hexpand; a row, when one has
+:vexpand."
+  (column-spacing :cell :atom :init 8 :doc "Pixels between columns.")
+  (row-spacing :cell :atom :init 6 :doc "Pixels between rows.")
+  (padding :cell :atom :init 0 :doc "Space around the cells, as for a margin.")
+  (columns :cell :atom :init nil
+           :doc "When set, children added without :column and :row fill this many
+columns, row by row.")
+  (column-homogeneous :cell :atom :init false)
+  (row-homogeneous :cell :atom :init false)
+  (next-cell :cell :atom :init 0))
+
+(declare-widget! grid-widget {:layout [:column-spacing :row-spacing :padding
+                                       :column-homogeneous :row-homogeneous]})
+
+(defn grid
+  "A grid: (grid {:columns 2} (label {:text \"Name\"}) (entry {}) ...)."
+  [opts & children]
+  (build grid-widget opts children))
+
+(defmethod add! :before [(g grid-widget) child]
+  (when (and (nil? (:column child)) (nil? (:row child)))
+    (if-let [n (:columns g)]
+      (let [span (:column-span child)
+            cell (:next-cell g)
+            cell (if (> (+ (mod cell n) span) n) (* n (quot (+ cell n -1) n)) cell)]
+        (set-slot! child :column (mod cell n))
+        (set-slot! child :row (quot cell n))
+        (set-slot! g :next-cell (+ cell span)))
+      (do (set-slot! child :column 0)
+          (set-slot! child :row (inc (reduce max -1 (map (fn [c] (or (:row c) 0))
+                                                         (:children g)))))))))
+
+(defn attach!
+  "Add child to grid at column and row, counting from 0, spanning column-span columns and
+row-span rows (1 by default). Returns child."
+  ([grid child column row] (attach! grid child column row 1 1))
+  ([grid child column row column-span row-span]
+   (set-slot! child :column column)
+   (set-slot! child :row row)
+   (set-slot! child :column-span column-span)
+   (set-slot! child :row-span row-span)
+   (add! grid child)))
+
+(defn- grid-tracks
+  "For axis :column or :row: [sizes expanding], the natural size of each column or row,
+and whether it expands."
+  [g axis]
+  (let [cols? (= axis :column)
+        pos (fn [c] (or (if cols? (:column c) (:row c)) 0))
+        span (fn [c] (if cols? (:column-span c) (:row-span c)))
+        tracks (fn [c] (range (pos c) (+ (pos c) (span c))))
+        size-of (fn [c] (let [[w h] (outer-size c)] (if cols? w h)))
+        gap (if cols? (:column-spacing g) (:row-spacing g))
+        kids (visible-children g)
+        n (reduce max 0 (map (fn [c] (+ (pos c) (span c))) kids))
+        expanding (reduce (fn [ex c]
+                            (if (expands? c (if cols? :horizontal :vertical))
+                              (reduce (fn [ex k] (assoc ex k true)) ex (tracks c))
+                              ex))
+                          (vec (repeat n false)) kids)
+        ;; Children in one track size it; then spanning ones widen their tracks if needed.
+        singles (reduce (fn [s c] (if (= 1 (span c)) (update s (pos c) max (size-of c)) s))
+                        (vec (repeat n 0)) kids)
+        sizes (reduce (fn [s c]
+                        (let [have (+ (* gap (dec (span c)))
+                                      (reduce + 0 (map (fn [k] (nth s k)) (tracks c))))
+                              need (- (size-of c) have)]
+                          (if (and (> (span c) 1) (pos? need))
+                            (reduce (fn [s [k share]] (update s k + share))
+                                    s
+                                    (map vector (tracks c)
+                                         (distribute need (repeat (span c) 0) nil true)))
+                            s)))
+                      singles kids)]
+    [sizes expanding]))
+
+(defn- tracks-total [sizes gap homogeneous]
+  (+ (if homogeneous (* (count sizes) (reduce max 0 sizes)) (reduce + 0 sizes))
+     (* gap (max 0 (dec (count sizes))))))
+
+(defmethod measure [(g grid-widget)]
+  (let [[top right bottom left] (sides (:padding g))]
+    [(+ left right (tracks-total (first (grid-tracks g :column)) (:column-spacing g)
+                                 (:column-homogeneous g)))
+     (+ top bottom (tracks-total (first (grid-tracks g :row)) (:row-spacing g)
+                                 (:row-homogeneous g)))]))
+
+(defmethod arrange [(g grid-widget) width height]
+  (let [[cols col-expand] (grid-tracks g :column)
+        [rows row-expand] (grid-tracks g :row)
+        [top right bottom left] (sides (:padding g))
+        cg (:column-spacing g)
+        rg (:row-spacing g)
+        cw (distribute (max 0 (- width left right (* cg (max 0 (dec (count cols))))))
+                       cols col-expand (:column-homogeneous g))
+        rh (distribute (max 0 (- height top bottom (* rg (max 0 (dec (count rows))))))
+                       rows row-expand (:row-homogeneous g))
+        start (fn [sizes gap i origin] (+ origin (reduce + 0 (map (fn [s] (+ s gap))
+                                                                 (take i sizes)))))
+        extent (fn [sizes gap i span] (+ (* gap (dec span))
+                                         (reduce + 0 (take span (drop i sizes)))))]
+    (doseq [c (visible-children g)]
+      (let [col (or (:column c) 0) row (or (:row c) 0)]
+        (allocate-in-cell c (start cw cg col left) (start rh rg row top)
+                          (extent cw cg col (:column-span c))
+                          (extent rh rg row (:row-span c)))))))
+
+;;; Frame
+
+(defclass bin-widget [widget]
+  "A container of at most one widget, its content.")
+
+(defmethod add! :before [(b bin-widget) child]
+  (check-one-child b))
+
+(defmethod measure [(b bin-widget)]
+  (let [[dw dh] (backend-decoration-size (current-backend) b)
+        [cw ch] (if-let [c (content b)] (outer-size c) [0 0])]
+    [(+ cw dw) (+ ch dh)]))
+
+(defmethod arrange [(b bin-widget) width height]
+  (when-let [c (content b)]
+    (let [[x y w h] (backend-content-area (current-backend) b width height)]
+      (allocate-in-cell c x y w h))))
+
+(defclass frame-widget [bin-widget]
+  "A border with an optional title around one widget."
+  (title :cell :atom :init nil :doc "The frame's title, or nil for none."))
+
+(declare-widget! frame-widget {:properties [:title] :layout [:title]})
+
+(defn frame
+  "A frame: (frame {:title \"Options\"} content)."
+  [opts & children]
+  (build frame-widget opts children))
+
+;;; Separator and spacer
+
+(defclass separator-widget [widget]
+  "A thin line between groups of widgets."
+  (orientation :cell :atom :init :horizontal
+               :doc ":horizontal for a line across, :vertical for one down.")
+  (hexpand :cell :atom :init false)
+  (vexpand :cell :atom :init false))
+
+(declare-widget! separator-widget {:properties [:orientation] :layout [:orientation]})
+
+(defn separator
+  "A separator: (separator {:orientation :vertical})."
+  ([] (separator {}))
+  ([opts] (build separator-widget opts nil)))
+
+(defclass spacer-widget [widget]
+  "Empty space that takes the room left over in a box, pushing the widgets after it to
+the end."
+  (expand :cell :atom :init true))
+
+(defn spacer
+  "A spacer: (hbox {} (label {:text \"Total\"}) (spacer) (label {:text \"42\"}))."
+  ([] (spacer {}))
+  ([opts] (build spacer-widget opts nil)))
+
+(defmethod measure [(s spacer-widget)]
+  [0 0])
+
+;;; ------------------------------------------------------------------------------------
+;;; Windows
+
 (defclass window-widget [ui-object]
-  "A top-level window. It emits :close-request (a close-event, which veto refuses) when
-asked to close."
+  "A top-level window, holding one widget. It emits :close-request (a close-event, which
+veto refuses) when asked to close."
   (title :cell :atom :init "")
-  (width :cell :atom :init 400)
-  (height :cell :atom :init 300)
+  (width :cell :atom :init nil :doc "The width of its content area; nil to fit the content.")
+  (height :cell :atom :init nil :doc "The height of its content area; nil to fit the content.")
   (shown :cell :atom :init false))
 
-(declare-widget! window-widget {:properties [:title :width :height]
+(declare-widget! window-widget {:properties [:title :width :height] :layout [:width :height]
                                 :signals {:close-request close-event}})
 
 (defn window
-  "A window: (window {:title \"Hello\"} content ...)."
+  "A window: (window {:title \"Hello\"} content)."
   [opts & children]
   (build window-widget opts children))
 
+(defmethod add! :before [(w window-widget) child]
+  (check-one-child w))
+
+(defmethod layout-root? [(w window-widget)]
+  true)
+
+(defmethod update-layout! [(w window-widget)]
+  (when-let [c (content w)]
+    (let [[cw ch] (outer-size c)]
+      (allocate-in-cell c 0 0 (or (:width w) cw) (or (:height w) ch)))))
+
 (defn show!
-  "Show the window. Returns it."
+  "Show the window, at its content's natural size unless it has :width and :height.
+Returns it."
   [w]
+  (let [[cw ch] (if-let [c (content w)] (outer-size c) [0 0])]
+    (when (nil? (:width w)) (set-slot! w :width cw))
+    (when (nil? (:height w)) (set-slot! w :height ch)))
+  (update-layout! w)
   (let [b (current-backend)]
     (in-ui (fn [] (backend-show b w))))
   (set-slot! w :shown true)
@@ -413,6 +921,345 @@ it. True if it closed."
         (set-slot! w :shown false)
         (destroy! w)
         true))))
+
+(defn resized-by-user!
+  "Backends call this when the user resized the window's content area to width by
+height: it lays the window out at once."
+  [w width height]
+  (sync-property! w :width width)
+  (sync-property! w :height height)
+  (update-layout! w))
+
+;;; ------------------------------------------------------------------------------------
+;;; Images
+
+(defclass image []
+  "A picture that image views and buttons show: from a file (image-from-file) or from
+RGBA pixels (image-from-pixels)."
+  (path :init nil)
+  (pixels :init nil :doc "A byte array of width × height RGBA pixels, row by row.")
+  (width :init 0)
+  (height :init 0))
+
+(defn image-from-file
+  "The image in the file at path (PNG, and the formats the platform reads)."
+  [path]
+  (let [b (current-backend)
+        [w h] (in-ui (fn [] (backend-image-size b path)))]
+    (make image :path path :width w :height h)))
+
+(defn image-from-pixels
+  "An image of width by height pixels from pixels, RGBA bytes row by row."
+  [width height pixels]
+  (when-not (= (count pixels) (* 4 width height))
+    (error "an image of" width "by" height "needs" (* 4 width height) "bytes, not"
+           (count pixels)))
+  (make image :pixels pixels :width width :height height))
+
+;;; ------------------------------------------------------------------------------------
+;;; Text
+
+(defclass label-widget [widget]
+  "Text that the user can't edit."
+  (text :cell :atom :init "")
+  (alignment :cell :atom :init :left :doc "How lines line up: :left, :center or :right.")
+  (wrap :cell :atom :init false :doc "Whether long text wraps (set :width to say where).")
+  (selectable :cell :atom :init false :doc "Whether the user can select and copy the text."))
+
+(declare-widget! label-widget {:properties [:text :alignment :wrap :selectable]
+                               :layout [:text :wrap]})
+
+(defn label
+  "A label: (label {:text \"Name\"})."
+  ([] (label {}))
+  ([opts] (build label-widget opts nil)))
+
+(defclass entry-widget [widget]
+  "A one-line text field. It emits :changed (a value-event) as the user edits, and
+:activate on Return."
+  (text :cell :atom :init "")
+  (placeholder :cell :atom :init nil :doc "Text shown, greyed, while it's empty.")
+  (editable :cell :atom :init true :doc "Whether the user can change the text.")
+  (alignment :cell :atom :init :left :doc ":left, :center or :right.")
+  (width-chars :cell :atom :init 20 :doc "About how many characters wide it is naturally."))
+
+(declare-widget! entry-widget {:properties [:text :placeholder :editable :alignment :width-chars]
+                               :layout [:width-chars]
+                               :signals {:changed value-event :activate action-event}})
+
+(defn entry
+  "An entry: (entry {:placeholder \"Your name\" :on-changed f})."
+  ([] (entry {}))
+  ([opts] (build entry-widget opts nil)))
+
+(defclass password-entry-widget [entry-widget]
+  "An entry that hides what is typed.")
+
+(defn password-entry
+  "A password entry: (password-entry {:on-activate f})."
+  ([] (password-entry {}))
+  ([opts] (build password-entry-widget opts nil)))
+
+(defclass search-entry-widget [entry-widget]
+  "An entry styled for searching, with a clear button.")
+
+(defn search-entry
+  "A search entry: (search-entry {:placeholder \"Search\" :on-changed f})."
+  ([] (search-entry {}))
+  ([opts] (build search-entry-widget opts nil)))
+
+;;; Buttons
+
+(defclass button-widget [widget]
+  "A push button. It emits :clicked."
+  (label :cell :atom :init "")
+  (image :cell :atom :init nil :doc "An image shown on the button, or nil.")
+  (default :cell :atom :init false :doc "Whether Return presses it.")
+  (cancel :cell :atom :init false :doc "Whether Escape presses it.")
+  (style :cell :atom :init :push
+         :doc ":push, :flat or :borderless, or :icon to show only the image."))
+
+(declare-widget! button-widget {:properties [:label :image :default :cancel :style]
+                                :layout [:label :image :style]
+                                :signals {:clicked action-event}})
+
+(defn button
+  "A button: (button {:label \"Save\" :on-clicked f})."
+  ([] (button {}))
+  ([opts] (build button-widget opts nil)))
+
+(defclass toggle-button-widget [widget]
+  "A button that stays pressed in until clicked again. It emits :toggled (a value-event
+with the new state) when the user turns it on or off."
+  (label :cell :atom :init "")
+  (image :cell :atom :init nil :doc "An image shown on the button, or nil.")
+  (style :cell :atom :init :push :doc "As for a button.")
+  (checked :cell :atom :init false :doc "Whether it is on."))
+
+(declare-widget! toggle-button-widget {:properties [:label :image :style :checked]
+                                       :layout [:label :image :style]
+                                       :signals {:toggled value-event}})
+
+(defn toggle-button
+  "A toggle button: (toggle-button {:label \"Bold\" :on-toggled f})."
+  ([] (toggle-button {}))
+  ([opts] (build toggle-button-widget opts nil)))
+
+(defclass check-box-widget [toggle-button-widget]
+  "A box with a check mark that the user turns on and off, and a label.")
+
+(defn check-box
+  "A check box: (check-box {:label \"Wrap lines\" :checked true :on-toggled f})."
+  ([] (check-box {}))
+  ([opts] (build check-box-widget opts nil)))
+
+(defclass radio-button-widget [toggle-button-widget]
+  "One of a set of choices, of which one is on at a time. The radio buttons of one
+choice share a :group (any value); those without one form a group with the others in
+their container."
+  (group :init nil))
+
+(defn radio-button
+  "A radio button: (radio-button {:label \"Small\" :group :size})."
+  ([] (radio-button {}))
+  ([opts] (build radio-button-widget opts nil)))
+
+(defn- root-of [w]
+  (loop [w w] (if-let [p (:parent w)] (recur p) w)))
+
+(defn radio-group
+  "The radio buttons in button's group, button included, in order."
+  [button]
+  (if-let [g (:group button)]
+    (filterv (fn [w] (and (instance? radio-button-widget w) (= g (:group w))))
+             (widgets-in (root-of button)))
+    (if-let [p (:parent button)]
+      (filterv (fn [w] (and (instance? radio-button-widget w) (nil? (:group w))))
+               (:children p))
+      [button])))
+
+(defn radio-selection
+  "The radio button that is on in button's group, or nil."
+  [button]
+  (first (filter :checked (radio-group button))))
+
+(defn- others-off!
+  "Turn off the radio buttons in button's group other than button; returns those that
+were on."
+  [button]
+  (let [on (filterv (fn [o] (and (not (identical? o button)) (:checked o)))
+                    (radio-group button))]
+    (doseq [o on] (set-slot! o :checked false))
+    on))
+
+(defmethod property-changed :after [(b radio-button-widget) property value]
+  (when (and (= property :checked) value)
+    (others-off! b)))
+
+(defn toggled-by-user!
+  "Backends call this when the user turned button on or off: it stores the state, turns
+the rest of a radio button's group off (each emitting :toggled), and emits :toggled.
+Returns the event."
+  [button value]
+  (sync-property! button :checked value)
+  (when (and value (instance? radio-button-widget button))
+    (doseq [o (others-off! button)]
+      (emit! o (event-for o :toggled :value false))))
+  (emit! button (event-for button :toggled :value value)))
+
+;;; Numbers in a range
+
+(defclass range-widget [widget]
+  "The superclass of widgets showing a number between :min and :max."
+  (min :cell :atom :init 0 :doc "The smallest value.")
+  (max :cell :atom :init 100 :doc "The largest value.")
+  (value :cell :atom :init 0 :doc "The current value."))
+
+(declare-widget! range-widget {:properties [:min :max :value]})
+
+(defclass slider-widget [range-widget]
+  "A knob the user drags along a track to choose a number. It emits :changed (a
+value-event) as the user moves it."
+  (orientation :cell :atom :init :horizontal :doc ":horizontal or :vertical.")
+  (ticks :cell :atom :init 0 :doc "How many tick marks to draw; 0 for none.")
+  (snap :cell :atom :init false :doc "Whether the value stops only at ticks."))
+
+(declare-widget! slider-widget {:properties [:orientation :ticks :snap]
+                                :layout [:orientation :ticks]
+                                :signals {:changed value-event}})
+
+(defn slider
+  "A slider: (slider {:min 0 :max 10 :value 5 :on-changed f})."
+  ([] (slider {}))
+  ([opts] (build slider-widget opts nil)))
+
+(defclass spin-button-widget [range-widget]
+  "A number field with up and down arrows. It emits :changed (a value-event)."
+  (step :cell :atom :init 1 :doc "How much the arrows change the value.")
+  (digits :cell :atom :init 0 :doc "How many digits to show after the decimal point."))
+
+(declare-widget! spin-button-widget {:properties [:step :digits] :layout [:digits]
+                                     :signals {:changed value-event}})
+
+(defn spin-button
+  "A spin button: (spin-button {:min 1 :max 99 :value 1 :on-changed f})."
+  ([] (spin-button {}))
+  ([opts] (build spin-button-widget opts nil)))
+
+(defclass progress-bar-widget [range-widget]
+  "Shows how much of a task is done; :value runs from 0 to 1 unless :max says otherwise."
+  (max :cell :atom :init 1)
+  (indeterminate :cell :atom :init false
+                 :doc "Whether it shows activity without saying how much is done."))
+
+(declare-widget! progress-bar-widget {:properties [:indeterminate]})
+
+(defn progress-bar
+  "A progress bar: (progress-bar {:value 0.25})."
+  ([] (progress-bar {}))
+  ([opts] (build progress-bar-widget opts nil)))
+
+(defclass spinner-widget [widget]
+  "A small spinning wheel that says the program is busy."
+  (active :cell :atom :init true :doc "Whether it spins."))
+
+(declare-widget! spinner-widget {:properties [:active]})
+
+(defn spinner
+  "A spinner: (spinner {:active true})."
+  ([] (spinner {}))
+  ([opts] (build spinner-widget opts nil)))
+
+;;; Choosing from items
+
+(defclass item-widget [widget]
+  "The superclass of widgets showing a vector of items, of any kind: :item-label is a
+function from an item to the text shown for it (str by default)."
+  (items :cell :atom :init [])
+  (item-label :cell :atom :init str))
+
+(declare-widget! item-widget {:properties [:items :item-label] :layout [:items :item-label]})
+
+(defn item-text
+  "The text w shows for its item at index i, or \"\"."
+  [w i]
+  (let [items (vec (:items w))]
+    (if (and (integer? i) (< -1 i (count items)))
+      (str ((:item-label w) (nth items i)))
+      "")))
+
+(defn add-item!
+  "Add item at the end of w's items. Returns item."
+  [w item]
+  (update-slot! w :items (fn [items] (conj (vec items) item)))
+  item)
+
+(defn remove-item!
+  "Remove item (the ones = to it) from w's items. Returns item."
+  [w item]
+  (update-slot! w :items (fn [items] (vec (remove (fn [x] (= x item)) items))))
+  item)
+
+(defclass combo-box-widget [item-widget]
+  "A button that pops up a list of items to choose one from. It emits :changed (a
+selection-event) when the user chooses one."
+  (selected-index :cell :atom :init nil :doc "The index of the chosen item, or nil."))
+
+(declare-widget! combo-box-widget {:properties [:selected-index]
+                                   :signals {:changed selection-event}})
+
+(defn combo-box
+  "A combo box: (combo-box {:items [\"Red\" \"Green\"] :selected-index 0 :on-changed f})."
+  ([] (combo-box {}))
+  ([opts] (build combo-box-widget opts nil)))
+
+(defmethod property-changed :after [(c combo-box-widget) property value]
+  (when (and (= property :items)
+             (some? (:selected-index c))
+             (>= (:selected-index c) (count value)))
+    (set-slot! c :selected-index nil)))
+
+(defn selected-item
+  "The chosen item of a combo box, or nil."
+  [w]
+  (when-let [i (:selected-index w)]
+    (get (vec (:items w)) i)))
+
+(defn chosen-by-user!
+  "Backends call this when the user chose the item at index (or nil) in w: it stores the
+index and emits :changed. Returns the event."
+  [w index]
+  (sync-property! w :selected-index index)
+  (emit! w (event-for w :changed :index index
+                      :value (when index (get (vec (:items w)) index)))))
+
+(defclass combo-entry-widget [item-widget]
+  "A text field with a list of suggestions. It emits :changed (a value-event with the
+text) when the user types or chooses, and :activate on Return."
+  (text :cell :atom :init ""))
+
+(declare-widget! combo-entry-widget {:properties [:text]
+                                     :signals {:changed value-event :activate action-event}})
+
+(defn combo-entry
+  "A combo entry: (combo-entry {:items [\"8\" \"10\" \"12\"] :text \"10\"})."
+  ([] (combo-entry {}))
+  ([opts] (build combo-entry-widget opts nil)))
+
+;;; Images
+
+(defclass image-view-widget [widget]
+  "Shows an image."
+  (image :cell :atom :init nil :doc "The image shown, or nil.")
+  (scaling :cell :atom :init :fit
+           :doc ":none at its size, :fit scaled down to fit keeping its shape, :fill stretched."))
+
+(declare-widget! image-view-widget {:properties [:image :scaling] :layout [:image]})
+
+(defn image-view
+  "An image view: (image-view {:image (image-from-file \"logo.png\")})."
+  ([] (image-view {}))
+  ([opts] (build image-view-widget opts nil)))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Running

@@ -31,10 +31,16 @@ programs look and behave the way their users expect.
   with `ui/on` (or `:on-clicked` options) and disconnect them with `ui/off`, or
   specialize `ui/handle-event`. `ui/veto` refuses a vetoable event, such as a window's
   `:close-request`.
+- **Layout** is boxes (`ui/vbox`, `ui/hbox`) and grids (`ui/grid`), done the same on
+  every platform from the widgets' natural sizes and their layout options: `:hexpand`,
+  `:vexpand` and `:expand` take extra space, `:halign` and `:valign` place a widget in
+  its space, `:margin` goes around it, and `:column` and `:row` place it in a grid.
 
 This is Skein's milestone M2.14 (its D-090 and D-097), a port of the design of LGT, a
-Common Lisp toolkit. It is at its first step: the core and the headless backend, for
-tests. Cocoa, Win32 and GTK 4 backends, and LGT's widget set, come next.
+Common Lisp toolkit. It has the core, layout and the simple controls (labels, buttons,
+toggles, check boxes, radio buttons, entries, sliders, spin buttons, progress bars,
+spinners, combo boxes, images and frames) on the headless backend, for tests. LGT's
+other widgets, then the Cocoa, Win32 and GTK 4 backends, come next.
 
 ## Using it
 

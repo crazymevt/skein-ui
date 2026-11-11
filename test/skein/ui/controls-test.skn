@@ -1,0 +1,117 @@
+(ns skein.ui.controls-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]))
+
+;; The simple controls on the headless backend (step 2 of M2.14, D-097): toggles and radio
+;; groups, numbers in a range, choices from items, entries and images.
+
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)))
+
+(deftest toggles-and-check-boxes
+  (let [seen (atom [])
+        c (ui/check-box {:label "Wrap" :on-toggled (fn [e] (swap! seen conj (:value e)))})]
+    (is (= false (headless/native-property c :checked)))
+    (headless/toggle! c)
+    (headless/toggle! c)
+    (is (= [true false] @seen))
+    (set-slot! c :checked true)
+    (is (= true (headless/native-property c :checked)))
+    (is (= [true false] @seen) "a program's change emits nothing"))
+  (let [t (ui/toggle-button {:label "Bold" :checked true})]
+    (is (= true (headless/native-property t :checked)))
+    (is (= false (:value (headless/toggle! t))))))
+
+(deftest radio-buttons
+  (testing "the radio buttons in a container form a group"
+    (let [seen (atom [])
+          note (fn [e] (swap! seen conj [(:label (:source e)) (:value e)]))
+          s (ui/radio-button {:label "S" :checked true :on-toggled note})
+          m (ui/radio-button {:label "M" :on-toggled note})
+          l (ui/radio-button {:label "L" :on-toggled note})
+          box (ui/vbox {} s m l)]
+      (is (= [s m l] (ui/radio-group m)))
+      (set-slot! m :checked true)
+      (is (= [false true false] (mapv :checked [s m l])))
+      (is (= false (headless/native-property s :checked)))
+      (is (empty? @seen))
+      (headless/toggle! l)
+      (is (identical? l (ui/radio-selection s)))
+      (is (= [["M" false] ["L" true]] @seen))))
+  (testing "a :group joins radio buttons across containers"
+    (let [a (ui/radio-button {:label "A" :group :size :checked true})
+          b (ui/radio-button {:label "B" :group :size})
+          other (ui/radio-button {:label "X" :checked true})
+          w (ui/window {} (ui/vbox {} (ui/hbox {} a other) (ui/hbox {} b)))]
+      (is (= [a b] (ui/radio-group a)))
+      (headless/toggle! b)
+      (is (= [false true true] (mapv :checked [a b other]))))))
+
+(deftest ranges
+  (let [seen (atom [])
+        s (ui/slider {:min 0 :max 10 :value 5 :ticks 10
+                      :on-changed (fn [e] (swap! seen conj (:value e)))})]
+    (is (= [0 10 5] (mapv (fn [p] (headless/native-property s p)) [:min :max :value])))
+    (headless/set-value! s 7)
+    (is (= 7 (:value s)))
+    (is (= [7] @seen))
+    (update-slot! s :value + 2)
+    (is (= 9 (headless/native-property s :value)))
+    (is (= [120 32] (ui/preferred-size s))))
+  (let [p (ui/progress-bar {})]
+    (is (= 1 (:max p)) "a progress bar runs from 0 to 1")
+    (set-slot! p :value 0.5)
+    (is (= 0.5 (headless/native-property p :value))))
+  (let [n (ui/spin-button {:min 1 :max 99 :value 1 :step 2})]
+    (is (= 2 (headless/native-property n :step)))
+    (is (= 3 (:value (headless/set-value! n 3)))))
+  (let [sp (ui/spinner {})]
+    (is (= true (headless/native-property sp :active)))))
+
+(deftest choices
+  (let [seen (atom nil)
+        c (ui/combo-box {:items ["Red" "Green" "Blue"] :selected-index 1
+                         :on-changed (fn [e] (reset! seen [(:index e) (:value e)]))})]
+    (is (= "Green" (ui/selected-item c)))
+    (is (= ["Red" "Green" "Blue"] (headless/native-property c :items)))
+    (headless/choose! c 2)
+    (is (= [2 "Blue"] @seen))
+    (is (= "Blue" (ui/selected-item c)))
+    (ui/add-item! c "Black")
+    (is (= 4 (count (:items c))))
+    (ui/remove-item! c "Red")
+    (is (= ["Green" "Blue" "Black"] (:items c)))
+    (set-slot! c :items ["Only"])
+    (is (nil? (:selected-index c)) "the chosen item went away")
+    (is (nil? (ui/selected-item c))))
+  (let [c (ui/combo-box {:items [{:name "ab"} {:name "abcdef"}] :item-label :name})]
+    (is (= "abcdef" (ui/item-text c 1)))
+    (is (= "" (ui/item-text c 5)))
+    (is (= [80 28] (ui/preferred-size c))))
+  (let [e (ui/combo-entry {:items ["8" "10"] :text "10"})]
+    (is (= "12" (:value (headless/type-text! e "12"))))
+    (is (= "12" (:text e)))))
+
+(deftest entries
+  (let [p (ui/password-entry {:width-chars 4})
+        s (ui/search-entry {:placeholder "Search"})]
+    (is (instance? ui/entry-widget p))
+    (is (= [40 24] (ui/preferred-size p)))
+    (headless/type-text! p "secret")
+    (is (= "secret" (:text p)))
+    (is (= "Search" (headless/native-property s :placeholder)))
+    (set-slot! s :editable false)
+    (is (= false (headless/native-property s :editable)))))
+
+(deftest images
+  (let [img (ui/image-from-file "test/skein/ui/red-3x2.png")
+        v (ui/image-view {:image img})]
+    (is (= [3 2] [(:width img) (:height img)]))
+    (is (= [3 2] (ui/preferred-size v)))
+    (is (identical? img (headless/native-property v :image)))
+    (let [b (ui/button {:label "Go" :image img})]
+      (is (= [47 28] (ui/preferred-size b)) "image, gap and label")))
+  (let [px (ui/image-from-pixels 2 1 (make-array u8 8))]
+    (is (= 2 (:width px))))
+  (is (thrown-with-msg? error "needs 8 bytes" (ui/image-from-pixels 2 1 (make-array u8 3))))
+  (is (thrown-with-msg? error "reads only PNG" (ui/image-from-file "project.skn"))))
