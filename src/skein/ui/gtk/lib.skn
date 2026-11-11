@@ -169,6 +169,180 @@ hasn't placed it."
 
 (ffi/defcfun ^:blocking separator-new "gtk_separator_new" ptr [orientation i32])
 
+;;; Toggles, ranges and choices
+
+(ffi/defcfun ^:blocking toggle-button-new "gtk_toggle_button_new" ptr [])
+(ffi/defcfun ^:blocking toggle-set-active "gtk_toggle_button_set_active" void [b ptr, v bool])
+(ffi/defcfun ^:blocking toggle-get-active "gtk_toggle_button_get_active" bool [b ptr])
+(ffi/defcfun ^:blocking check-button-new "gtk_check_button_new" ptr [])
+(ffi/defcfun ^:blocking check-set-label "gtk_check_button_set_label" void [b ptr, l c-string])
+(ffi/defcfun ^:blocking check-get-label "gtk_check_button_get_label" c-string [b ptr])
+(ffi/defcfun ^:blocking check-set-active "gtk_check_button_set_active" void [b ptr, v bool])
+(ffi/defcfun ^:blocking check-get-active "gtk_check_button_get_active" bool [b ptr])
+(ffi/defcfun ^:blocking check-set-group "gtk_check_button_set_group" void [b ptr, group ptr])
+
+(ffi/defcfun ^:blocking scale-new "gtk_scale_new" ptr [orientation i32, adjustment ptr])
+(ffi/defcfun ^:blocking scale-set-draw-value "gtk_scale_set_draw_value" void [s ptr, v bool])
+(ffi/defcfun ^:blocking scale-add-mark "gtk_scale_add_mark" void
+  [s ptr, value f64, position i32, markup c-string])
+(ffi/defcfun ^:blocking scale-clear-marks "gtk_scale_clear_marks" void [s ptr])
+(ffi/defcfun ^:blocking range-set-range "gtk_range_set_range" void [r ptr, min f64, max f64])
+(ffi/defcfun ^:blocking range-set-value "gtk_range_set_value" void [r ptr, v f64])
+(ffi/defcfun ^:blocking range-get-value "gtk_range_get_value" f64 [r ptr])
+(ffi/defcfun ^:blocking orientable-set "gtk_orientable_set_orientation" void [o ptr, v i32])
+
+(ffi/defcfun ^:blocking spin-new "gtk_spin_button_new_with_range" ptr
+  [min f64, max f64, step f64])
+(ffi/defcfun ^:blocking spin-set-range "gtk_spin_button_set_range" void [s ptr, min f64, max f64])
+(ffi/defcfun ^:blocking spin-set-increments "gtk_spin_button_set_increments" void
+  [s ptr, step f64, page f64])
+(ffi/defcfun ^:blocking spin-set-digits "gtk_spin_button_set_digits" void [s ptr, n u32])
+(ffi/defcfun ^:blocking spin-set-value "gtk_spin_button_set_value" void [s ptr, v f64])
+(ffi/defcfun ^:blocking spin-get-value "gtk_spin_button_get_value" f64 [s ptr])
+
+(ffi/defcfun ^:blocking progress-new "gtk_progress_bar_new" ptr [])
+(ffi/defcfun ^:blocking progress-set-fraction "gtk_progress_bar_set_fraction" void [p ptr, f f64])
+(ffi/defcfun ^:blocking progress-get-fraction "gtk_progress_bar_get_fraction" f64 [p ptr])
+(ffi/defcfun ^:blocking progress-pulse "gtk_progress_bar_pulse" void [p ptr])
+(ffi/defcfun ^:blocking spinner-new "gtk_spinner_new" ptr [])
+(ffi/defcfun ^:blocking spinner-set-spinning "gtk_spinner_set_spinning" void [s ptr, v bool])
+
+(ffi/defcfun ^:blocking string-list-new "gtk_string_list_new" ptr [strings ptr])
+(ffi/defcfun ^:blocking string-list-append "gtk_string_list_append" void [l ptr, s c-string])
+(ffi/defcfun ^:blocking string-list-get-string "gtk_string_list_get_string" c-string
+  [l ptr, i u32])
+(ffi/defcfun ^:blocking list-model-n-items "g_list_model_get_n_items" u32 [m ptr])
+(ffi/defcfun ^:blocking drop-down-new "gtk_drop_down_new" ptr [model ptr, expression ptr])
+(ffi/defcfun ^:blocking drop-down-set-model "gtk_drop_down_set_model" void [d ptr, model ptr])
+(ffi/defcfun ^:blocking drop-down-set-selected "gtk_drop_down_set_selected" void [d ptr, i u32])
+(ffi/defcfun ^:blocking drop-down-get-selected "gtk_drop_down_get_selected" u32 [d ptr])
+(def invalid-position "GTK_INVALID_LIST_POSITION." 4294967295)
+
+(ffi/defcfun ^:blocking combo-text-new-with-entry "gtk_combo_box_text_new_with_entry" ptr [])
+(ffi/defcfun ^:blocking combo-text-append "gtk_combo_box_text_append_text" void
+  [c ptr, s c-string])
+(ffi/defcfun ^:blocking combo-text-remove-all "gtk_combo_box_text_remove_all" void [c ptr])
+(ffi/defcfun ^:blocking combo-get-child "gtk_combo_box_get_child" ptr [c ptr])
+(ffi/defcfun ^:blocking combo-set-active "gtk_combo_box_set_active" void [c ptr, i i32])
+
+(ffi/defcstruct gdk-rgba (red f32) (green f32) (blue f32) (alpha f32))
+(ffi/defcfun ^:blocking color-dialog-new "gtk_color_dialog_new" ptr [])
+(ffi/defcfun ^:blocking color-dialog-button-new "gtk_color_dialog_button_new" ptr [dialog ptr])
+(ffi/defcfun ^:blocking color-dialog-button-set-rgba "gtk_color_dialog_button_set_rgba" void
+  [b ptr, color ptr])
+(ffi/defcfun ^:blocking color-dialog-button-get-rgba "gtk_color_dialog_button_get_rgba" ptr
+  [b ptr])
+
+(ffi/defcfun ^:blocking calendar-new "gtk_calendar_new" ptr [])
+(ffi/defcfun ^:blocking calendar-select-day "gtk_calendar_select_day" void [c ptr, date ptr])
+(ffi/defcfun ^:blocking calendar-get-date "gtk_calendar_get_date" ptr [c ptr])
+(ffi/defcfun ^:blocking date-time-new-from-unix-local "g_date_time_new_from_unix_local" ptr
+  [t i64])
+(ffi/defcfun ^:blocking date-time-new-local "g_date_time_new_local" ptr
+  [year i32, month i32, day i32, hour i32, minute i32, seconds f64])
+(ffi/defcfun ^:blocking date-time-to-unix "g_date_time_to_unix" i64 [d ptr])
+(ffi/defcfun ^:blocking date-time-get-ymd "g_date_time_get_ymd" void
+  [d ptr, year ptr, month ptr, day ptr])
+(ffi/defcfun ^:blocking date-time-get-hour "g_date_time_get_hour" i32 [d ptr])
+(ffi/defcfun ^:blocking date-time-get-minute "g_date_time_get_minute" i32 [d ptr])
+(ffi/defcfun ^:blocking date-time-unref "g_date_time_unref" void [d ptr])
+(ffi/defcfun ^:blocking box-new "gtk_box_new" ptr [orientation i32, spacing i32])
+(ffi/defcfun ^:blocking box-append "gtk_box_append" void [b ptr, child ptr])
+
+;;; Images
+
+(ffi/defcfun ^:blocking texture-new-from-filename "gdk_texture_new_from_filename" ptr
+  [path c-string, error ptr])
+(ffi/defcfun ^:blocking texture-get-width "gdk_texture_get_width" i32 [t ptr])
+(ffi/defcfun ^:blocking texture-get-height "gdk_texture_get_height" i32 [t ptr])
+(ffi/defcfun ^:blocking g-bytes-new "g_bytes_new" ptr [data ptr, size u64])
+(ffi/defcfun ^:blocking g-bytes-unref "g_bytes_unref" void [b ptr])
+(ffi/defcfun ^:blocking memory-texture-new "gdk_memory_texture_new" ptr
+  [width i32, height i32, format i32, bytes ptr, stride u64])
+(ffi/defcfun ^:blocking picture-new "gtk_picture_new" ptr [])
+(ffi/defcfun ^:blocking picture-set-paintable "gtk_picture_set_paintable" void [p ptr, t ptr])
+(ffi/defcfun ^:blocking picture-get-paintable "gtk_picture_get_paintable" ptr [p ptr])
+(ffi/defcfun ^:blocking picture-set-content-fit "gtk_picture_set_content_fit" void
+  [p ptr, fit i32])
+(ffi/defcfun ^:blocking picture-set-can-shrink "gtk_picture_set_can_shrink" void [p ptr, v bool])
+(ffi/defcfun ^:blocking image-new-from-paintable "gtk_image_new_from_paintable" ptr [t ptr])
+(ffi/defcfun ^:blocking image-set-pixel-size "gtk_image_set_pixel_size" void [i ptr, n i32])
+(ffi/defcfun ^:blocking button-set-child "gtk_button_set_child" void [b ptr, child ptr])
+
+;;; Frames, text views, notebooks, panes and scrolled windows
+
+(ffi/defcfun ^:blocking frame-new "gtk_frame_new" ptr [label c-string])
+(ffi/defcfun ^:blocking frame-set-label "gtk_frame_set_label" void [f ptr, label c-string])
+(ffi/defcfun ^:blocking frame-set-child "gtk_frame_set_child" void [f ptr, child ptr])
+(ffi/defcfun ^:blocking frame-get-child "gtk_frame_get_child" ptr [f ptr])
+
+(ffi/defcfun ^:blocking scrolled-new "gtk_scrolled_window_new" ptr [])
+(ffi/defcfun ^:blocking scrolled-set-child "gtk_scrolled_window_set_child" void [s ptr, c ptr])
+(ffi/defcfun ^:blocking scrolled-get-child "gtk_scrolled_window_get_child" ptr [s ptr])
+(ffi/defcfun ^:blocking scrolled-set-policy "gtk_scrolled_window_set_policy" void
+  [s ptr, h i32, v i32])
+(ffi/defcfun ^:blocking scrolled-set-has-frame "gtk_scrolled_window_set_has_frame" void
+  [s ptr, v bool])
+(ffi/defcfun ^:blocking scrolled-get-hadjustment "gtk_scrolled_window_get_hadjustment" ptr
+  [s ptr])
+(ffi/defcfun ^:blocking scrolled-get-vadjustment "gtk_scrolled_window_get_vadjustment" ptr
+  [s ptr])
+(ffi/defcfun ^:blocking adjustment-set-value "gtk_adjustment_set_value" void [a ptr, v f64])
+(ffi/defcfun ^:blocking adjustment-get-value "gtk_adjustment_get_value" f64 [a ptr])
+(ffi/defcfun ^:blocking viewport-get-child "gtk_viewport_get_child" ptr [v ptr])
+
+(ffi/defcfun ^:blocking text-view-new "gtk_text_view_new" ptr [])
+(ffi/defcfun ^:blocking text-view-get-buffer "gtk_text_view_get_buffer" ptr [v ptr])
+(ffi/defcfun ^:blocking text-view-set-editable "gtk_text_view_set_editable" void [v ptr, e bool])
+(ffi/defcfun ^:blocking text-view-set-wrap-mode "gtk_text_view_set_wrap_mode" void
+  [v ptr, mode i32])
+(ffi/defcfun ^:blocking text-buffer-set-text "gtk_text_buffer_set_text" void
+  [b ptr, text c-string, n i32])
+(ffi/defcfun ^:blocking text-buffer-get-text "gtk_text_buffer_get_text" ptr
+  [b ptr, start ptr, end ptr, hidden bool])
+(ffi/defcfun ^:blocking text-buffer-get-start-iter "gtk_text_buffer_get_start_iter" void
+  [b ptr, iter ptr])
+(ffi/defcfun ^:blocking text-buffer-get-end-iter "gtk_text_buffer_get_end_iter" void
+  [b ptr, iter ptr])
+(ffi/defcfun ^:blocking text-buffer-get-iter-at-offset "gtk_text_buffer_get_iter_at_offset" void
+  [b ptr, iter ptr, offset i32])
+(ffi/defcfun ^:blocking text-buffer-insert "gtk_text_buffer_insert" void
+  [b ptr, iter ptr, text c-string, n i32])
+(ffi/defcfun ^:blocking text-buffer-delete "gtk_text_buffer_delete" void
+  [b ptr, start ptr, end ptr])
+(ffi/defcfun ^:blocking text-buffer-get-selection-bounds "gtk_text_buffer_get_selection_bounds"
+  bool [b ptr, start ptr, end ptr])
+(ffi/defcfun ^:blocking text-buffer-select-range "gtk_text_buffer_select_range" void
+  [b ptr, ins ptr, bound ptr])
+(ffi/defcfun ^:blocking text-iter-get-offset "gtk_text_iter_get_offset" i32 [iter ptr])
+
+(ffi/defcfun ^:blocking notebook-new "gtk_notebook_new" ptr [])
+(ffi/defcfun ^:blocking notebook-append-page "gtk_notebook_append_page" i32
+  [n ptr, child ptr, label ptr])
+(ffi/defcfun ^:blocking notebook-remove-page "gtk_notebook_remove_page" void [n ptr, i i32])
+(ffi/defcfun ^:blocking notebook-page-num "gtk_notebook_page_num" i32 [n ptr, child ptr])
+(ffi/defcfun ^:blocking notebook-set-current-page "gtk_notebook_set_current_page" void
+  [n ptr, i i32])
+(ffi/defcfun ^:blocking notebook-get-current-page "gtk_notebook_get_current_page" i32 [n ptr])
+(ffi/defcfun ^:blocking notebook-set-tab-pos "gtk_notebook_set_tab_pos" void [n ptr, pos i32])
+(ffi/defcfun ^:blocking notebook-set-tab-label-text "gtk_notebook_set_tab_label_text" void
+  [n ptr, child ptr, text c-string])
+(ffi/defcfun ^:blocking notebook-get-tab-label-text "gtk_notebook_get_tab_label_text" c-string
+  [n ptr, child ptr])
+(ffi/defcfun ^:blocking notebook-get-nth-page "gtk_notebook_get_nth_page" ptr [n ptr, i i32])
+
+(ffi/defcfun ^:blocking paned-new "gtk_paned_new" ptr [orientation i32])
+(ffi/defcfun ^:blocking paned-set-start-child "gtk_paned_set_start_child" void [p ptr, c ptr])
+(ffi/defcfun ^:blocking paned-set-end-child "gtk_paned_set_end_child" void [p ptr, c ptr])
+(ffi/defcfun ^:blocking paned-get-start-child "gtk_paned_get_start_child" ptr [p ptr])
+(ffi/defcfun ^:blocking paned-get-end-child "gtk_paned_get_end_child" ptr [p ptr])
+(ffi/defcfun ^:blocking paned-set-position "gtk_paned_set_position" void [p ptr, pos i32])
+(ffi/defcfun ^:blocking paned-get-position "gtk_paned_get_position" i32 [p ptr])
+(ffi/defcfun ^:blocking paned-set-shrink-start "gtk_paned_set_shrink_start_child" void
+  [p ptr, v bool])
+(ffi/defcfun ^:blocking paned-set-shrink-end "gtk_paned_set_shrink_end_child" void
+  [p ptr, v bool])
+
 ;;; ------------------------------------------------------------------------------------
 ;;; From GTK objects to Skein's
 

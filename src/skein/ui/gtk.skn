@@ -37,6 +37,13 @@ sets them next.")
 (defmethod native-signal [w kind instance arg]
   nil)
 
+(defgeneric layout-native [w width height]
+  "w's GTK widget got the size width by height from layout: place what GTK doesn't (a
+split pane's divider).")
+
+(defmethod layout-native [w width height]
+  nil)
+
 (defgeneric native-natural-size [w]
   "w's natural [width height]: by default its GTK widget's natural size.")
 
@@ -48,13 +55,16 @@ sets them next.")
 
 (defn- native [o] (:native o))
 
+(def ^:private show-button-content!
+  "Show a button's label and image (defined with the images, below).")
+
 ;;; ------------------------------------------------------------------------------------
 ;;; Signals: a few callbacks, one for each C signature. The handler's user data is a
 ;;; small integer saying which signal it is.
 
 (def ^:private signal-kinds
   [:clicked :activate :changed :toggled :value-changed :resized :selected :switch-page
-   :close-request])
+   :close-request :position])
 
 (defn- kind-of [data] (nth signal-kinds (ffi/address data)))
 
@@ -83,6 +93,19 @@ this namespace's), reporting it as kind. Returns o."
 (ffi/defcallback idle-imp bool [data ptr]
   (drain-main-thread!)
   false)
+
+(ffi/defcallback switch-page-imp void [notebook ptr, page ptr, number u32, data ptr]
+  (when-let [w (lib/object-for notebook)]
+    (native-signal w :switch-page notebook number)))
+
+(def ^:private pulsing
+  "progress bar id -> the indeterminate progress bar it pulses."
+  (atom {}))
+
+(ffi/defcallback pulse-imp bool [data ptr]
+  (if-let [w (get @pulsing (ffi/address data))]
+    (do (lib/progress-pulse (:native w)) true)
+    false))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; The backend, and running on the main thread
@@ -164,8 +187,11 @@ for the user's doing."
 (defmethod ui/backend-destroy [(b gtk-backend) o]
   (let [n (native o)]
     (cond (instance? ui/window-widget o) (lib/window-destroy n)
-          (instance? ui/widget o) (when-not (ffi/null? (lib/widget-get-parent n))
-                                    (lib/widget-unparent n)))
+          ;; Out of its container as remove! takes it: a split pane or a notebook must let
+          ;; go of it itself.
+          (and (instance? ui/widget o) (:parent o)
+               (not (ffi/null? (lib/widget-get-parent n))))
+          (ui/backend-remove-child b (:parent o) o))
     (lib/unregister! n)
     (lib/g-object-unref n)))
 
@@ -193,10 +219,14 @@ for the user's doing."
   (native-natural-size w))
 
 (defmethod ui/backend-set-bounds [(b gtk-backend) w x y width height]
-  (let [n (native w)]
-    (when-let [p (:parent w)]
-      (lib/fixed-move (container-view p) n (f64 x) (f64 y)))
-    (lib/widget-set-size-request n width height)))
+  (let [n (native w)
+        p (:parent w)]
+    ;; Its GTK parent is the GtkFixed it was put in (a notebook page's own), except in a
+    ;; split pane, which places its panes itself.
+    (when (and p (not (instance? ui/paned-widget p)))
+      (lib/fixed-move (lib/widget-get-parent n) n (f64 x) (f64 y)))
+    (lib/widget-set-size-request n width height)
+    (layout-native w width height)))
 
 (defmethod set-native [(w ui/widget) (p (= :visible)) v]
   (lib/widget-set-visible (native w) (boolean v)))
@@ -212,22 +242,23 @@ for the user's doing."
 ;;; ------------------------------------------------------------------------------------
 ;;; Windows
 
-(def ^:private window-contents
-  "window's GtkWindow address -> its GtkFixed content."
+(def ^:private inner-fixed
+  "The address of a window's, frame's or scrolled window's GTK widget -> the GtkFixed
+inside it that holds its children."
   (atom {}))
 
 (defmethod make-native [(w ui/window-widget)]
   (let [win (lib/g-object-ref (lib/window-new))
         content (lib/fixed-new)]
     (lib/window-set-child win content)
-    (swap! window-contents assoc (ffi/address win) content)
+    (swap! inner-fixed assoc (ffi/address win) content)
     (connect! win "close-request" :close-request close-request-imp)
     (connect! win "notify::default-width" :resized signal-arg-imp)
     (connect! win "notify::default-height" :resized signal-arg-imp)
     win))
 
 (defmethod container-view [(w ui/window-widget)]
-  (get @window-contents (ffi/address (native w))))
+  (get @inner-fixed (ffi/address (native w))))
 
 (defmethod set-native [(w ui/window-widget) (p (= :title)) v]
   (lib/window-set-title (native w) (or v "")))
@@ -285,7 +316,9 @@ for the user's doing."
   (connect! (owned (lib/button-new)) "clicked" :clicked signal-imp))
 
 (defmethod set-native [(b ui/button-widget) (p (= :label)) v]
-  (lib/button-set-label (native b) (str (or v ""))))
+  (if (:image b)
+    (show-button-content! b)
+    (lib/button-set-label (native b) (str (or v "")))))
 
 (defmethod set-native [(b ui/button-widget) (p (= :style)) v]
   (lib/button-set-has-frame (native b) (= v :push)))
@@ -332,6 +365,621 @@ for the user's doing."
   (ui/emit! e (ui/event-for e :activate)))
 
 ;;; ------------------------------------------------------------------------------------
+;;; Helpers
+
+(defn- also-register!
+  "Register the GTK object o, part of w, as standing for w too. Returns o."
+  [o w]
+  (lib/register! o w))
+
+(defn- whole [x] (if (= x (math/floor x)) (int x) x))
+
+(def ^:private textures
+  "image (by identity) -> its GdkTexture, made once and kept: images don't change."
+  (atom {}))
+
+(defn texture
+  "The GdkTexture of a skein.ui image, or null for nil."
+  [image]
+  (cond
+    (nil? image) (ffi/null)
+    (get @textures image) (get @textures image)
+    :else
+    (let [t (if (:path image)
+              (lib/texture-new-from-filename (:path image) (ffi/null))
+              (let [w (:width image) h (:height image)
+                    bytes (ffi/pin [p (:pixels image)] (lib/g-bytes-new p (* 4 w h)))
+                    t (lib/memory-texture-new w h 5 bytes (* 4 w))]  ; GDK_MEMORY_R8G8B8A8
+                (lib/g-bytes-unref bytes)
+                t))]
+      (when (ffi/null? t) (error "GTK can't read the image" (pr-str (:path image))))
+      (swap! textures assoc image t)
+      t)))
+
+(defmethod ui/backend-image-size [(b gtk-backend) path]
+  (let [t (lib/texture-new-from-filename path (ffi/null))]
+    (when (ffi/null? t) (error "GTK can't read the image" (pr-str path)))
+    (let [size [(lib/texture-get-width t) (lib/texture-get-height t)]]
+      (lib/g-object-unref t)
+      size)))
+
+;;; Images and button contents
+
+(defmethod make-native [(v ui/image-view-widget)] (owned (lib/picture-new)))
+
+(defmethod set-native [(v ui/image-view-widget) (p (= :image)) image]
+  (lib/picture-set-paintable (native v) (texture image)))
+
+(defmethod set-native [(v ui/image-view-widget) (p (= :scaling)) s]
+  ;; GTK_CONTENT_FIT_FILL 0, SCALE_DOWN 3
+  (lib/picture-set-content-fit (native v) (if (= s :fill) 0 3))
+  (lib/picture-set-can-shrink (native v) (not= s :none)))
+
+(defmethod native-natural-size [(v ui/image-view-widget)]
+  (if-let [i (:image v)] [(:width i) (:height i)] [0 0]))
+
+(defn- show-button-content!
+  "Show the button's label, or its image and label in a box (only the image for the
+:icon style)."
+  [b]
+  (let [n (native b)
+        image (:image b)]
+    (if (nil? image)
+      (lib/button-set-label n (str (or (:label b) "")))
+      (let [box (lib/box-new 0 4)
+            icon (lib/image-new-from-paintable (texture image))]
+        (lib/image-set-pixel-size icon (:height image))
+        (lib/box-append box icon)
+        (when (not= :icon (:style b))
+          (lib/box-append box (lib/label-new (str (or (:label b) "")))))
+        (lib/button-set-child n box)))))
+
+(defmethod set-native [(b ui/button-widget) (p (= :image)) v] (show-button-content! b))
+
+;;; ------------------------------------------------------------------------------------
+;;; Toggles, check boxes and radio buttons
+
+(defmethod make-native [(t ui/toggle-button-widget)]
+  (connect! (owned (lib/toggle-button-new)) "toggled" :toggled signal-imp))
+
+(defmethod make-native [(c ui/check-box-widget)]
+  (connect! (owned (lib/check-button-new)) "toggled" :toggled signal-imp))
+
+(defmethod make-native [(r ui/radio-button-widget)]
+  (connect! (owned (lib/check-button-new)) "toggled" :toggled signal-imp))
+
+(defn- check-like? [t] (instance? ui/check-box-widget t))
+(defn- radio? [t] (instance? ui/radio-button-widget t))
+
+(defmethod set-native [(t ui/toggle-button-widget) (p (= :label)) v]
+  (if (or (check-like? t) (radio? t))
+    (lib/check-set-label (native t) (str (or v "")))
+    (show-button-content! t)))
+
+(defmethod set-native [(t ui/toggle-button-widget) (p (= :image)) v]
+  (when-not (or (check-like? t) (radio? t))
+    (show-button-content! t)))
+
+(defmethod set-native [(t ui/toggle-button-widget) (p (= :checked)) v]
+  (if (or (check-like? t) (radio? t))
+    (lib/check-set-active (native t) (boolean v))
+    (lib/toggle-set-active (native t) (boolean v))))
+
+(defmethod native-signal [(t ui/toggle-button-widget) (k (= :toggled)) instance arg]
+  (when-not (quiet?)
+    (let [on (if (or (check-like? t) (radio? t))
+               (lib/check-get-active instance)
+               (lib/toggle-get-active instance))]
+      ;; GTK turns the rest of a radio group off itself; the core does it with events.
+      (when (and (not= on (boolean (:checked t))) (or on (not (radio? t))))
+        (ui/toggled-by-user! t on)))))
+
+(defmethod ui/backend-add-child :after [(b gtk-backend) parent (r ui/radio-button-widget)]
+  ;; GTK draws a check button as a radio button when it is in a group: join the first
+  ;; other radio button of its group that has a GTK widget.
+  (when-let [other (first (remove (fn [x] (identical? x r)) (ui/radio-group r)))]
+    (quietly (fn [] (lib/check-set-group (native r) (native other))))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Sliders, spin buttons, progress bars and spinners
+
+(defmethod make-native [(s ui/slider-widget)]
+  (let [n (owned (lib/scale-new (if (= :vertical (:orientation s)) 1 0) (ffi/null)))]
+    (lib/scale-set-draw-value n false)
+    (connect! n "value-changed" :value-changed signal-imp)))
+
+(defn- show-range! [s]
+  (let [n (native s)]
+    (lib/range-set-range n (f64 (:min s)) (f64 (max (:max s) (+ (:min s) 1.0e-9))))
+    (lib/range-set-value n (f64 (or (:value s) 0)))
+    (lib/scale-clear-marks n)
+    (let [ticks (or (:ticks s) 0)]
+      (when (> ticks 1)
+        (doseq [i (range ticks)]
+          (lib/scale-add-mark n (f64 (+ (:min s) (* i (/ (- (:max s) (:min s)) (dec ticks)))))
+                              3 (ffi/null)))))))
+
+(defmethod set-native [(s ui/slider-widget) (p (= :min)) v] (show-range! s))
+(defmethod set-native [(s ui/slider-widget) (p (= :max)) v] (show-range! s))
+(defmethod set-native [(s ui/slider-widget) (p (= :value)) v] (show-range! s))
+(defmethod set-native [(s ui/slider-widget) (p (= :ticks)) v] (show-range! s))
+(defmethod set-native [(s ui/slider-widget) (p (= :orientation)) v]
+  (lib/orientable-set (native s) (if (= v :vertical) 1 0)))
+
+(defmethod native-natural-size [(s ui/slider-widget)]
+  (let [[w h] (call-next-method)]
+    (if (= :vertical (:orientation s)) [w (max h 120)] [(max w 120) h])))
+
+(defmethod native-signal [(s ui/slider-widget) (k (= :value-changed)) instance arg]
+  (when-not (quiet?)
+    (let [v (whole (lib/range-get-value instance))]
+      (when (not= v (:value s))
+        (ui/changed-by-user! s :value v)))))
+
+(defmethod make-native [(s ui/spin-button-widget)]
+  (connect! (owned (lib/spin-new 0.0 100.0 1.0)) "value-changed" :value-changed signal-imp))
+
+(defn- show-spin! [s]
+  (let [n (native s)]
+    (lib/spin-set-range n (f64 (:min s)) (f64 (:max s)))
+    (lib/spin-set-increments n (f64 (:step s)) (f64 (* 10 (:step s))))
+    (lib/spin-set-digits n (or (:digits s) 0))
+    (lib/spin-set-value n (f64 (or (:value s) 0)))))
+
+(defmethod set-native [(s ui/spin-button-widget) (p (= :min)) v] (show-spin! s))
+(defmethod set-native [(s ui/spin-button-widget) (p (= :max)) v] (show-spin! s))
+(defmethod set-native [(s ui/spin-button-widget) (p (= :step)) v] (show-spin! s))
+(defmethod set-native [(s ui/spin-button-widget) (p (= :digits)) v] (show-spin! s))
+(defmethod set-native [(s ui/spin-button-widget) (p (= :value)) v] (show-spin! s))
+
+(defmethod native-signal [(s ui/spin-button-widget) (k (= :value-changed)) instance arg]
+  (when-not (quiet?)
+    (let [v (whole (lib/spin-get-value instance))]
+      (when (not= v (:value s))
+        (ui/changed-by-user! s :value v)))))
+
+(defmethod make-native [(b ui/progress-bar-widget)] (owned (lib/progress-new)))
+
+(defn- show-fraction! [b]
+  (let [span (- (:max b) (:min b))]
+    (lib/progress-set-fraction (native b)
+                               (f64 (if (pos? span)
+                                      (math/clamp (/ (- (or (:value b) 0) (:min b)) span) 0 1)
+                                      0)))))
+
+(defmethod set-native [(b ui/progress-bar-widget) (p (= :value)) v] (show-fraction! b))
+(defmethod set-native [(b ui/progress-bar-widget) (p (= :min)) v] (show-fraction! b))
+(defmethod set-native [(b ui/progress-bar-widget) (p (= :max)) v] (show-fraction! b))
+
+(def ^:private pulse-ids (atom 0))
+
+(defmethod set-native [(b ui/progress-bar-widget) (p (= :indeterminate)) v]
+  (swap! pulsing (fn [m] (into {} (remove (fn [[_ w]] (identical? w b)) m))))
+  (if v
+    (let [id (swap! pulse-ids inc)]
+      (swap! pulsing assoc id b)
+      (lib/g-timeout-add 100 pulse-imp (lib/signal-data id)))
+    (show-fraction! b)))
+
+(defmethod native-natural-size [(b ui/progress-bar-widget)]
+  (let [[w h] (call-next-method)] [(max w 120) h]))
+
+(defmethod make-native [(s ui/spinner-widget)] (owned (lib/spinner-new)))
+
+(defmethod set-native [(s ui/spinner-widget) (p (= :active)) v]
+  (lib/spinner-set-spinning (native s) (boolean v)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Drop-downs and combo entries
+
+(defn- string-list [w]
+  (let [l (lib/string-list-new (ffi/null))]
+    (doseq [i (range (count (:items w)))]
+      (lib/string-list-append l (ui/item-text w i)))
+    l))
+
+(defmethod make-native [(c ui/combo-box-widget)]
+  (connect! (owned (lib/drop-down-new (ffi/null) (ffi/null))) "notify::selected" :selected
+            signal-arg-imp))
+
+(defn- show-selected! [c]
+  (lib/drop-down-set-selected (native c) (or (:selected-index c) lib/invalid-position)))
+
+(defmethod set-native [(c ui/combo-box-widget) (p (= :items)) v]
+  (let [l (string-list c)]
+    (lib/drop-down-set-model (native c) l)
+    (lib/g-object-unref l)
+    (show-selected! c)))
+
+(defmethod set-native [(c ui/combo-box-widget) (p (= :item-label)) v]
+  (set-native c :items (:items c)))
+
+(defmethod set-native [(c ui/combo-box-widget) (p (= :selected-index)) v]
+  (show-selected! c))
+
+(defmethod native-signal [(c ui/combo-box-widget) (k (= :selected)) instance arg]
+  (when-not (quiet?)
+    (let [i (lib/drop-down-get-selected instance)
+          i (when (not= i lib/invalid-position) i)]
+      (when (not= i (:selected-index c))
+        (ui/chosen-by-user! c i)))))
+
+(defn- combo-entry-of [c] (lib/combo-get-child (native c)))
+
+(defmethod make-native [(c ui/combo-entry-widget)]
+  (let [n (owned (lib/combo-text-new-with-entry))
+        e (lib/combo-get-child n)]
+    (also-register! e c)
+    (connect! e "changed" :changed signal-imp)
+    (connect! e "activate" :activate signal-imp)
+    n))
+
+(defmethod set-native [(c ui/combo-entry-widget) (p (= :items)) v]
+  (let [n (native c)]
+    (lib/combo-text-remove-all n)
+    (doseq [i (range (count v))]
+      (lib/combo-text-append n (ui/item-text c i)))))
+
+(defmethod set-native [(c ui/combo-entry-widget) (p (= :item-label)) v]
+  (set-native c :items (:items c)))
+
+(defmethod set-native [(c ui/combo-entry-widget) (p (= :text)) v]
+  (lib/editable-set-text (combo-entry-of c) (str (or v ""))))
+
+(defmethod native-signal [(c ui/combo-entry-widget) (k (= :changed)) instance arg]
+  (when-not (quiet?)
+    (let [t (lib/editable-get-text instance)]
+      (when (not= t (:text c))
+        (ui/changed-by-user! c :text t)))))
+
+(defmethod native-signal [(c ui/combo-entry-widget) (k (= :activate)) instance arg]
+  (ui/emit! c (ui/event-for c :activate)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Color buttons and date pickers
+
+(defmethod make-native [(c ui/color-button-widget)]
+  (connect! (owned (lib/color-dialog-button-new (lib/color-dialog-new))) "notify::rgba"
+            :selected signal-arg-imp))
+
+(defn rgba-of
+  "[r g b a] of a color designator; a system color as GTK's theme would have it, roughly
+(GTK has no named system colors)."
+  [d]
+  (let [c (ui/ensure-color d)
+        c (if (keyword? c) (ui/system-color c) c)]
+    [(f64 (ui/color-red c)) (f64 (ui/color-green c)) (f64 (ui/color-blue c))
+     (f64 (ui/color-alpha c))]))
+
+(defmethod set-native [(c ui/color-button-widget) (p (= :color)) v]
+  (let [[r g b a] (rgba-of v)]
+    (ffi/with-foreign [rgba (ffi/alloc lib/gdk-rgba)]
+      (ffi/put-field! rgba lib/gdk-rgba :red (f32 r))
+      (ffi/put-field! rgba lib/gdk-rgba :green (f32 g))
+      (ffi/put-field! rgba lib/gdk-rgba :blue (f32 b))
+      (ffi/put-field! rgba lib/gdk-rgba :alpha (f32 a))
+      (lib/color-dialog-button-set-rgba (native c) rgba))))
+
+(defn native-color
+  "The color a color button shows."
+  [c]
+  (let [rgba (lib/color-dialog-button-get-rgba (native c))]
+    (ui/rgb (ffi/field rgba lib/gdk-rgba :red) (ffi/field rgba lib/gdk-rgba :green)
+            (ffi/field rgba lib/gdk-rgba :blue) (ffi/field rgba lib/gdk-rgba :alpha))))
+
+(defmethod native-signal [(c ui/color-button-widget) (k (= :selected)) instance arg]
+  (when-not (quiet?)
+    (ui/changed-by-user! c :color (native-color c))))
+
+(def ^:private date-parts
+  "A date picker's GtkBox address -> {:calendar :hour :minute}."
+  (atom {}))
+
+(defn- parts [d] (get @date-parts (ffi/address (native d))))
+
+(defmethod make-native [(d ui/date-picker-widget)]
+  (let [box (owned (lib/box-new 0 6))
+        calendar (lib/calendar-new)
+        hour (lib/spin-new 0.0 23.0 1.0)
+        minute (lib/spin-new 0.0 59.0 1.0)]
+    (doseq [x [calendar hour minute]]
+      (lib/box-append box x)
+      (also-register! x d))
+    (connect! calendar "day-selected" :selected signal-imp)
+    (connect! hour "value-changed" :value-changed signal-imp)
+    (connect! minute "value-changed" :value-changed signal-imp)
+    (swap! date-parts assoc (ffi/address box) {:calendar calendar :hour hour :minute minute})
+    box))
+
+(defmethod set-native [(d ui/date-picker-widget) (p (= :date)) ms]
+  (let [{:keys [calendar hour minute]} (parts d)
+        dt (lib/date-time-new-from-unix-local (quot (or ms 0) 1000))]
+    (lib/calendar-select-day calendar dt)
+    (lib/spin-set-value hour (f64 (lib/date-time-get-hour dt)))
+    (lib/spin-set-value minute (f64 (lib/date-time-get-minute dt)))
+    (lib/date-time-unref dt)))
+
+(defmethod set-native [(d ui/date-picker-widget) (p (= :mode)) mode]
+  (let [{:keys [calendar hour minute]} (parts d)]
+    (lib/widget-set-visible calendar (not= mode :time))
+    (lib/widget-set-visible hour (not= mode :date))
+    (lib/widget-set-visible minute (not= mode :date))))
+
+(defn- picked-millis [d]
+  (let [{:keys [calendar hour minute]} (parts d)
+        day (lib/calendar-get-date calendar)]
+    (ffi/with-foreign [y (ffi/alloc i32 1)]
+      (ffi/with-foreign [m (ffi/alloc i32 1)]
+        (ffi/with-foreign [dd (ffi/alloc i32 1)]
+          (lib/date-time-get-ymd day y m dd)
+          (lib/date-time-unref day)
+          (let [dt (lib/date-time-new-local (ffi/get y i32) (ffi/get m i32) (ffi/get dd i32)
+                                            (int (lib/spin-get-value hour))
+                                            (int (lib/spin-get-value minute)) 0.0)
+                ms (* 1000 (lib/date-time-to-unix dt))]
+            (lib/date-time-unref dt)
+            ms))))))
+
+(defmethod native-signal [(d ui/date-picker-widget) k instance arg]
+  (when-not (quiet?)
+    (let [ms (picked-millis d)]
+      (when (not= ms (:date d))
+        (ui/changed-by-user! d :date ms)))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Frames
+
+(defmethod make-native [(f ui/frame-widget)]
+  (let [n (owned (lib/frame-new (ffi/null)))
+        inner (lib/fixed-new)]
+    (lib/frame-set-child n inner)
+    (swap! inner-fixed assoc (ffi/address n) inner)
+    n))
+
+(defmethod container-view [(f ui/frame-widget)]
+  (get @inner-fixed (ffi/address (native f))))
+
+(defmethod set-native [(f ui/frame-widget) (p (= :title)) v]
+  (lib/frame-set-label (native f) v))
+
+(defn- decoration
+  "What the GTK widget n adds around its inner one."
+  [n inner]
+  (let [[w h] (lib/natural-size n)
+        [iw ih] (lib/natural-size inner)]
+    [(max 0 (- w iw)) (max 0 (- h ih))]))
+
+(defmethod ui/backend-decoration-size [(b gtk-backend) (f ui/frame-widget)]
+  (decoration (native f) (container-view f)))
+
+(defmethod ui/backend-content-area [(b gtk-backend) (f ui/frame-widget) width height]
+  (let [[dw dh] (decoration (native f) (container-view f))]
+    [0 0 (max 0 (- width dw)) (max 0 (- height dh))]))
+
+(defmethod native-natural-size [(f ui/frame-widget)]
+  (lib/natural-size (native f)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Text views
+
+(def ^:private text-views
+  "A text view widget's GtkScrolledWindow address -> its GtkTextView."
+  (atom {}))
+
+(defn- text-view-of [v] (get @text-views (ffi/address (native v))))
+(defn- buffer-of [v] (lib/text-view-get-buffer (text-view-of v)))
+
+(defmethod make-native [(v ui/text-view-widget)]
+  (let [scroll (owned (lib/scrolled-new))
+        tv (lib/text-view-new)]
+    (lib/scrolled-set-child scroll tv)
+    (swap! text-views assoc (ffi/address scroll) tv)
+    (let [buffer (lib/text-view-get-buffer tv)]
+      (also-register! buffer v)
+      (connect! buffer "changed" :changed signal-imp))
+    scroll))
+
+(defn- with-iters [f]
+  (ffi/with-foreign [a (ffi/alloc u8 128)]
+    (ffi/with-foreign [b (ffi/alloc u8 128)]
+      (f a b))))
+
+(defn- buffer-text [buffer]
+  (with-iters
+   (fn [start end]
+     (lib/text-buffer-get-start-iter buffer start)
+     (lib/text-buffer-get-end-iter buffer end)
+     (let [p (lib/text-buffer-get-text buffer start end true)
+           s (ffi/c-string p)]
+       (lib/g-free p)
+       s))))
+
+(defmethod set-native [(v ui/text-view-widget) (p (= :text)) s]
+  (lib/text-buffer-set-text (buffer-of v) (str (or s "")) -1))
+
+(defmethod set-native [(v ui/text-view-widget) (p (= :editable)) e]
+  (lib/text-view-set-editable (text-view-of v) (boolean e)))
+
+(defmethod set-native [(v ui/text-view-widget) (p (= :wrap)) w]
+  (lib/text-view-set-wrap-mode (text-view-of v) (if w 3 0)))   ; GTK_WRAP_WORD_CHAR 3
+
+(defmethod set-native [(v ui/text-view-widget) (p (= :border)) b]
+  (lib/scrolled-set-has-frame (native v) (boolean b)))
+
+(defmethod native-natural-size [(v ui/text-view-widget)]
+  [240 120])
+
+(defmethod native-signal [(v ui/text-view-widget) (k (= :changed)) buffer arg]
+  (when-not (quiet?)
+    (let [t (buffer-text buffer)]
+      (when (not= t (:text v))
+        (ui/changed-by-user! v :text t)))))
+
+(defmethod ui/backend-text-append [(b gtk-backend) v s]
+  (quietly
+   (fn []
+     (with-iters (fn [end _]
+                   (lib/text-buffer-get-end-iter (buffer-of v) end)
+                   (lib/text-buffer-insert (buffer-of v) end s -1))))))
+
+(defmethod ui/backend-text-selection [(b gtk-backend) v]
+  (with-iters (fn [start end]
+                (lib/text-buffer-get-selection-bounds (buffer-of v) start end)
+                [(lib/text-iter-get-offset start) (lib/text-iter-get-offset end)])))
+
+(defmethod ui/backend-set-text-selection [(b gtk-backend) v start end]
+  (with-iters (fn [ins bound]
+                (lib/text-buffer-get-iter-at-offset (buffer-of v) ins start)
+                (lib/text-buffer-get-iter-at-offset (buffer-of v) bound end)
+                (lib/text-buffer-select-range (buffer-of v) ins bound))))
+
+(defmethod ui/backend-text-insert [(b gtk-backend) v s]
+  (let [[start end] (ui/backend-text-selection b v)
+        buffer (buffer-of v)]
+    (quietly
+     (fn []
+       (with-iters (fn [a z]
+                     (lib/text-buffer-get-iter-at-offset buffer a start)
+                     (lib/text-buffer-get-iter-at-offset buffer z end)
+                     (lib/text-buffer-delete buffer a z)
+                     (lib/text-buffer-get-iter-at-offset buffer a start)
+                     (lib/text-buffer-insert buffer a s -1)))))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Notebooks: each page is a GtkFixed holding the page widget
+
+(defmethod make-native [(n ui/notebook-widget)]
+  (let [nb (owned (lib/notebook-new))]
+    (lib/g-signal-connect-data nb "switch-page" switch-page-imp (ffi/null) (ffi/null) 0)
+    nb))
+
+(defn- page-wrapper [page] (lib/widget-get-parent (native page)))
+
+(defmethod ui/backend-add-child [(b gtk-backend) (n ui/notebook-widget) page]
+  (let [wrapper (lib/fixed-new)]
+    (lib/fixed-put wrapper (native page) 0.0 0.0)
+    (quietly (fn [] (lib/notebook-append-page (native n) wrapper
+                                              (lib/label-new (or (:tab-label page) "")))))))
+
+(defmethod ui/backend-remove-child [(b gtk-backend) (n ui/notebook-widget) page]
+  (let [wrapper (page-wrapper page)
+        i (lib/notebook-page-num (native n) wrapper)]
+    (lib/fixed-remove wrapper (native page))
+    (when (>= i 0) (quietly (fn [] (lib/notebook-remove-page (native n) i))))))
+
+(defmethod ui/backend-set-page-label [(b gtk-backend) n page label]
+  (lib/notebook-set-tab-label-text (native n) (page-wrapper page) (or label "")))
+
+(defmethod set-native [(n ui/notebook-widget) (p (= :selected-index)) i]
+  (lib/notebook-set-current-page (native n) (or i 0)))
+
+(defmethod set-native [(n ui/notebook-widget) (p (= :tab-position)) v]
+  ;; GTK_POS_LEFT 0, RIGHT 1, TOP 2, BOTTOM 3
+  (lib/notebook-set-tab-pos (native n) (case v :left 0 :right 1 :bottom 3 2)))
+
+(defn- notebook-decoration [n]
+  (let [[w h] (lib/natural-size (native n))
+        pages (map (fn [p] (lib/natural-size (page-wrapper p))) (:children n))]
+    [(max 0 (- w (reduce max 0 (map first pages))))
+     (max 0 (- h (reduce max 0 (map second pages))))]))
+
+(defmethod ui/backend-decoration-size [(b gtk-backend) (n ui/notebook-widget)]
+  (notebook-decoration n))
+
+(defmethod ui/backend-content-area [(b gtk-backend) (n ui/notebook-widget) width height]
+  (let [[dw dh] (notebook-decoration n)]
+    [0 0 (max 0 (- width dw)) (max 0 (- height dh))]))
+
+(defmethod native-signal [(n ui/notebook-widget) (k (= :switch-page)) instance number]
+  (when-not (quiet?)
+    (when (not= number (:selected-index n))
+      (ui/page-changed-by-user! n number))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Split panes: GtkPaned holds two panes and places them itself
+
+(defmethod make-native [(p ui/paned-widget)]
+  (let [n (owned (lib/paned-new (if (= :vertical (:orientation p)) 1 0)))]
+    (lib/paned-set-shrink-start n false)
+    (lib/paned-set-shrink-end n false)
+    (connect! n "notify::position" :position signal-arg-imp)))
+
+(defmethod set-native [(p ui/paned-widget) (k (= :orientation)) v]
+  (lib/orientable-set (native p) (if (= v :vertical) 1 0)))
+
+(defmethod ui/backend-add-child [(b gtk-backend) (p ui/paned-widget) child]
+  (let [n (native p)]
+    (cond (ffi/null? (lib/paned-get-start-child n)) (lib/paned-set-start-child n (native child))
+          (ffi/null? (lib/paned-get-end-child n)) (lib/paned-set-end-child n (native child))
+          :else (error "a GTK split pane holds two panes"))))
+
+(defmethod ui/backend-remove-child [(b gtk-backend) (p ui/paned-widget) child]
+  (let [n (native p)]
+    (if (= (ffi/address (lib/paned-get-start-child n)) (ffi/address (native child)))
+      (lib/paned-set-start-child n (ffi/null))
+      (lib/paned-set-end-child n (ffi/null)))))
+
+(defmethod layout-native [(p ui/paned-widget) width height]
+  (let [lengths (ui/pane-lengths p (if (= :horizontal (:orientation p)) width height))]
+    (when (seq lengths)
+      (quietly (fn [] (lib/paned-set-position (native p) (first lengths)))))))
+
+(defmethod native-signal [(p ui/paned-widget) (k (= :position)) instance arg]
+  (when-not (quiet?)
+    (let [position (lib/paned-get-position instance)]
+      (when (not= position (:position p))
+        (ui/divider-moved-by-user! p position)))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Scrolled windows: a GtkFixed inside, as big as the content
+
+(defmethod make-native [(s ui/scrolled-window-widget)]
+  (let [n (owned (lib/scrolled-new))
+        inner (lib/fixed-new)]
+    (lib/scrolled-set-child n inner)
+    (swap! inner-fixed assoc (ffi/address n) inner)
+    (doseq [a [(lib/scrolled-get-hadjustment n) (lib/scrolled-get-vadjustment n)]]
+      (also-register! a s)
+      (connect! a "value-changed" :value-changed signal-imp))
+    n))
+
+(defmethod container-view [(s ui/scrolled-window-widget)]
+  (get @inner-fixed (ffi/address (native s))))
+
+(defn- show-policy! [s]
+  ;; GTK_POLICY_ALWAYS 0, AUTOMATIC 1, NEVER 2
+  (let [policy (fn [p] (case p :always 0 :never 2 1))]
+    (lib/scrolled-set-policy (native s) (policy (:horizontal-policy s))
+                             (policy (:vertical-policy s)))))
+
+(defmethod set-native [(s ui/scrolled-window-widget) (p (= :horizontal-policy)) v]
+  (show-policy! s))
+
+(defmethod set-native [(s ui/scrolled-window-widget) (p (= :vertical-policy)) v]
+  (show-policy! s))
+
+(defmethod set-native [(s ui/scrolled-window-widget) (p (= :border)) v]
+  (lib/scrolled-set-has-frame (native s) (boolean v)))
+
+(defmethod ui/backend-set-scroll-extent [(b gtk-backend) s width height]
+  (lib/widget-set-size-request (container-view s) width height)
+  nil)
+
+(defmethod ui/backend-scroll-to [(b gtk-backend) s x y]
+  (quietly
+   (fn []
+     (lib/adjustment-set-value (lib/scrolled-get-hadjustment (native s)) (f64 x))
+     (lib/adjustment-set-value (lib/scrolled-get-vadjustment (native s)) (f64 y)))))
+
+(defmethod native-signal [(s ui/scrolled-window-widget) (k (= :value-changed)) instance arg]
+  (when-not (quiet?)
+    (ui/scrolled-by-user! s
+                          (int (math/round (lib/adjustment-get-value
+                                            (lib/scrolled-get-hadjustment (native s)))))
+                          (int (math/round (lib/adjustment-get-value
+                                            (lib/scrolled-get-vadjustment (native s))))))))
+
+;;; ------------------------------------------------------------------------------------
 ;;; For tests: the real widgets, read and acted on
 
 (defn native-frame
@@ -368,3 +1016,78 @@ for the user's doing."
   "Press Return in the entry: GTK emits activate."
   [e]
   (lib/emit! (native e) "activate"))
+
+(defn native-active?
+  "True if the toggle button, check box or radio button is on in GTK."
+  [t]
+  (if (instance? ui/toggle-button-widget t)
+    (if (or (instance? ui/check-box-widget t) (instance? ui/radio-button-widget t))
+      (lib/check-get-active (native t))
+      (lib/toggle-get-active (native t)))
+    false))
+
+(defn toggle!
+  "Click the toggle, check box or radio button, as the user does: GTK toggles it."
+  [t]
+  (if (or (instance? ui/check-box-widget t) (instance? ui/radio-button-widget t))
+    (lib/check-set-active (native t) (not (lib/check-get-active (native t))))
+    (lib/toggle-set-active (native t) (not (lib/toggle-get-active (native t))))))
+
+(defn native-value
+  "The value a slider or spin button shows, or a progress bar's fraction."
+  [w]
+  (cond (instance? ui/slider-widget w) (lib/range-get-value (native w))
+        (instance? ui/spin-button-widget w) (lib/spin-get-value (native w))
+        (instance? ui/progress-bar-widget w) (lib/progress-get-fraction (native w))))
+
+(defn move-slider!
+  "Move the slider to v, as dragging it does."
+  [s v]
+  (lib/range-set-value (native s) (f64 v)))
+
+(defn choose-item!
+  "Choose the item at index in a combo box, as the user does."
+  [c index]
+  (lib/drop-down-set-selected (native c) index))
+
+(defn native-selected
+  "The index a combo box shows chosen, or nil."
+  [c]
+  (let [i (lib/drop-down-get-selected (native c))]
+    (when (not= i lib/invalid-position) i)))
+
+(defn native-date
+  "The date and time a date picker shows, in milliseconds since 1970."
+  [d]
+  (picked-millis d))
+
+(defn has-image?
+  "True if the image view shows an image."
+  [v]
+  (not (ffi/null? (lib/picture-get-paintable (native v)))))
+
+(defn native-text
+  "The text in a text view's buffer."
+  [v]
+  (buffer-text (buffer-of v)))
+
+(defn edit-text!
+  "Make a text view's text s, as typing does: its buffer emits changed."
+  [v s]
+  (lib/text-buffer-set-text (buffer-of v) s -1))
+
+(defn tab-labels
+  "The labels of a notebook's tabs."
+  [n]
+  (mapv (fn [p] (lib/notebook-get-tab-label-text (native n) (page-wrapper p))) (:children n)))
+
+(defn choose-tab!
+  "Click the notebook's tab at index, as the user does."
+  [n index]
+  (lib/notebook-set-current-page (native n) index))
+
+(defn scroll-origin
+  "The point of a scrolled window's content at its top left, [x y]."
+  [s]
+  [(int (math/round (lib/adjustment-get-value (lib/scrolled-get-hadjustment (native s)))))
+   (int (math/round (lib/adjustment-get-value (lib/scrolled-get-vadjustment (native s)))))])
