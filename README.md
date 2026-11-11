@@ -67,12 +67,28 @@ code views on shared text buffers (undo, styled runs, line numbers).
  :deps {skein/ui {:git "https://github.com/crazymevt/skein-ui" :tag "v0.1.0"}}}
 ```
 
+## Examples
+
+`examples/` is a project of its own (it uses this checkout through `:deps {skein/ui
+{:local ".."}}`): the examples of LGT, the toolkit skein-ui follows, ported, and a launcher
+that lists them. From `examples/`:
+
+```sh
+../../skein/skein run src/examples/launcher.skn                    # the launcher
+../../skein/skein run src/examples/launcher.skn widget-explorer    # one example
+../../skein/skein run src/examples/launcher.skn editor --gtk       # with GTK on macOS
+```
+
+The widget explorer shows every kind of widget live beside the source that makes it.
+Each example is also built and exercised by a test on the headless backend.
+
 ## Testing
 
 With a Skein checkout beside this one:
 
 ```sh
 ../skein/skein test
+(cd examples && ../../skein/skein test)
 ```
 
 CI does the same on macOS, Linux and Windows with Skein's main branch.

@@ -153,3 +153,6 @@ jobs:
           else
             ../skein/skein test
           fi
+
+      - name: Run the examples' tests
+        run: cd skein-ui/examples && ../../skein/skein test
