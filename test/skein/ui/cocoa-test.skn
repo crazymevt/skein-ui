@@ -511,3 +511,32 @@
       (ui/close! w))
     (ui/free-image! i)
     (is (thrown-with-msg? error "freed" (ui/image-view {:image i})))))
+
+(deftest window-states
+  (let [seen (atom [])
+        w (ui/window {:title "States" :width 400 :height 300 :position [100 120]
+                      :on-state-changed (fn [e] (swap! seen conj (:value e)))}
+                     (ui/label {:text "x"}))]
+    (ui/show! w)
+    (is (= :normal (ui/window-state w)))
+    (testing "maximized, the normal frame is kept"
+      (set-slot! w :state :maximized)
+      (cocoa/run-for! 0.3)
+      (is (= :maximized (ui/window-state w)))
+      (is (< 400 (:width w)) "zoomed to the screen")
+      (is (= {:position [100 120] :size [400 300] :state :maximized} (ui/window-frame w))))
+    (testing "back to normal"
+      (set-slot! w :state :normal)
+      (cocoa/run-for! 0.3)
+      (is (= :normal (ui/window-state w)))
+      (is (= [400 300] [(:width w) (:height w)])))
+    (testing "minimized"
+      (set-slot! w :state :minimized)
+      (cocoa/run-for! 0.8)
+      (is (= :minimized (ui/window-state w)))
+      (is (= :normal (:state (ui/window-frame w))) "saved as normal")
+      (set-slot! w :state :normal)
+      (cocoa/run-for! 0.8)
+      (is (= :normal (ui/window-state w))))
+    (is (= [:maximized :normal :minimized :normal] @seen))
+    (ui/close! w)))

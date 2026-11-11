@@ -118,7 +118,9 @@ button the mouse button, event the NSEvent.")
             height (int (math/round height))]
         (when (not= [width height] [(:width w) (:height w)])
           (ui/dismiss-popups! w :dismissed nil)
-          (ui/resized-by-user! w width height))))))
+          (ui/resized-by-user! w width height))
+        (when-not (:state-transition w)
+          (ui/state-changed-by-user! w (ui/backend-window-state (ui/current-backend) w)))))))
 
 (ffi/defcallback text-changed-imp void [self ptr, cmd ptr, note ptr]
   (let [field (objc/send note (objc/sel "object"))]
@@ -223,6 +225,18 @@ button the mouse button, event the NSEvent.")
 (ffi/defcallback resign-key-imp void [self ptr, cmd ptr, note ptr]
   (when-let [w (objc/object-for (objc/send note (objc/sel "object")))]
     (ui/activated-by-user! w false)))
+
+(def ^:private window-state-noticed!
+  "A window's state notice from AppKit (defined below).")
+
+(ffi/defcallback window-state-imp void [self ptr, cmd ptr, note ptr]
+  (when-let [w (objc/object-for (objc/send note (objc/sel "object")))]
+    (window-state-noticed! w (objc/sel-name cmd))))
+
+(ffi/defcallback should-zoom-imp bool [self ptr, cmd ptr, window ptr, frame objc/ns-rect]
+  (when-let [w (objc/object-for window)]
+    (window-state-noticed! w "windowShouldZoom:toFrame:"))
+  true)
 
 (def ^:private window-moved!
   "Report a window the user moved (defined below).")
@@ -363,7 +377,15 @@ consumed it (defined below).")
                        ["windowDidResize:" did-resize-imp "v@:@"]
                        ["windowDidBecomeKey:" key-window-imp "v@:@"]
                        ["windowDidResignKey:" resign-key-imp "v@:@"]
-                       ["windowDidMove:" did-move-imp "v@:@"]])
+                       ["windowDidMove:" did-move-imp "v@:@"]
+                       ["windowDidMiniaturize:" window-state-imp "v@:@"]
+                       ["windowDidDeminiaturize:" window-state-imp "v@:@"]
+                       ["windowWillEnterFullScreen:" window-state-imp "v@:@"]
+                       ["windowDidEnterFullScreen:" window-state-imp "v@:@"]
+                       ["windowWillExitFullScreen:" window-state-imp "v@:@"]
+                       ["windowDidExitFullScreen:" window-state-imp "v@:@"]
+                       ["windowShouldZoom:toFrame:" should-zoom-imp
+                        "B@:@{CGRect={CGPoint=dd}{CGSize=dd}}"]])
   (objc/define-class! "SkeinTextDelegate" "NSObject"
                       [["controlTextDidChange:" text-changed-imp "v@:@"]
                        ["textDidChange:" text-changed-imp "v@:@"]
@@ -4323,3 +4345,92 @@ selection."
 
 (defmethod set-native [(t ui/tree-view-widget) (p (= :icon-fn)) f]
   (reload! (table-of t)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Window states. Zooming and miniaturizing take effect at once; full screen animates
+;;; into a space of its own, so a state asked for meanwhile waits for it to finish.
+
+(defmethod ui/backend-window-state [(b cocoa-backend) w]
+  (let [n (view w)]
+    (cond (objc/send-bool n (objc/sel "isMiniaturized")) :minimized
+          (pos? (bit-and (bit-shift-left 1 14) (objc/send-long n (objc/sel "styleMask")))) :fullscreen
+          (objc/send-bool n (objc/sel "isZoomed")) :maximized
+          :else :normal)))
+
+(def ^:private deferred-states
+  "A window's address -> the state asked for during a full-screen transition, or to take
+after leaving full screen."
+  (atom {}))
+
+(defn- settle-state! [w]
+  (when-not (:state-transition w)
+    (ui/state-changed-by-user! w (ui/backend-window-state (ui/current-backend) w))))
+
+(defn- remember-normal-frame! [w]
+  (when (and (:shown w) (= :normal (ui/backend-window-state (ui/current-backend) w)))
+    (set-slot! w :normal-frame {:position (:position w) :size [(:width w) (:height w)]})))
+
+(defn- apply-window-state! [w state]
+  (let [b (ui/current-backend)
+        n (view w)
+        a (ffi/address n)
+        now (ui/backend-window-state b w)]
+    (cond
+      (:state-transition w) (swap! deferred-states assoc a state)
+      (= now state) (settle-state! w)
+      (and (= now :fullscreen) (not= state :fullscreen))
+      (do (swap! deferred-states assoc a state)
+          ;; AppKit starts the transition a moment later: until it ends, states wait.
+          (set-slot! w :state-transition true)
+          (objc/send-p-void n (objc/sel "toggleFullScreen:") (ffi/null)))
+      :else
+      (do (remember-normal-frame! w)
+          (when (and (= now :minimized) (not= state :minimized))
+            (objc/send-p-void n (objc/sel "deminiaturize:") (ffi/null)))
+          (cond
+            (= state :fullscreen) (do (set-slot! w :state-transition true)
+                                      (objc/send-p-void n (objc/sel "toggleFullScreen:") (ffi/null)))
+            (= state :minimized) (objc/send-p-void n (objc/sel "miniaturize:") (ffi/null))
+            (not= (= state :maximized) (objc/send-bool n (objc/sel "isZoomed")))
+            (do (set-slot! w :state-transition true)
+                (try (objc/send-p-void n (objc/sel "zoom:") (ffi/null))
+                     (finally (set-slot! w :state-transition false))))
+            :else nil)
+          (when-not (= state :fullscreen) (settle-state! w))))))
+
+(defmethod set-native [(w ui/window-widget) (p (= :state)) state]
+  ;; Before the window shows, show applies it. (A miniaturized window isn't visible.)
+  (when (:shown w)
+    (apply-window-state! w state)))
+
+(defmethod ui/backend-show :after [(b cocoa-backend) (w ui/window-widget)]
+  (when (not= (:state w) (ui/backend-window-state b w))
+    (when (nil? (:normal-frame w))
+      (set-slot! w :normal-frame {:position (:position w) :size [(:width w) (:height w)]}))
+    (apply-window-state! w (:state w))))
+
+(defn- window-state-noticed! [w selector]
+  (let [a (ffi/address (view w))
+        ;; AppKit ignores a full-screen toggle from inside its notice that one ended.
+        take-deferred! (fn []
+                         (let [state (get @deferred-states a)]
+                           (swap! deferred-states dissoc a)
+                           (when state
+                             (ui/after 0.1 (fn [] (when-not (:destroyed w)
+                                                    (apply-window-state! w state)))))))]
+    (cond
+      (or (= selector "windowWillEnterFullScreen:") (= selector "windowWillExitFullScreen:"))
+      (do (when (= selector "windowWillEnterFullScreen:") (remember-normal-frame! w))
+          (set-slot! w :state-transition true))
+      (or (= selector "windowDidEnterFullScreen:") (= selector "windowDidExitFullScreen:"))
+      (do (set-slot! w :state-transition false)
+          (settle-state! w)
+          (take-deferred!))
+      (= selector "windowShouldZoom:toFrame:")
+      ;; The user zooms from the title bar: keep the normal frame through the resizes.
+      (when-not (:state-transition w)
+        (remember-normal-frame! w)
+        (set-slot! w :state-transition true)
+        (ui/backend-call-later (ui/current-backend)
+                               (fn [] (set-slot! w :state-transition false) (settle-state! w))))
+      :else (settle-state! w))))
