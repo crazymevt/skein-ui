@@ -232,6 +232,37 @@ consumed it (defined below).")
         (when-let [w (objc/object-for win)]
           (ui/notify-appearance-changed! w))))))
 
+(def ^:private storage-edited!
+  "A text storage of a buffer was edited (defined below).")
+
+(ffi/defcallback storage-edited-imp void [self ptr, cmd ptr, storage ptr, actions u64,
+                                          range objc/ns-range, delta i64]
+  (storage-edited! storage actions (ffi/field range objc/ns-range :location)
+                   (ffi/field range objc/ns-range :length) delta))
+
+(def ^:private editing-view
+  "The code view whose text view last asked to change its text."
+  (atom nil))
+
+(ffi/defcallback should-change-imp bool [self ptr, cmd ptr, tv ptr, range objc/ns-range, s ptr]
+  (let [w (objc/object-for tv)]
+    (when (instance? ui/code-view-widget w) (reset! editing-view w)))
+  true)
+
+(ffi/defcallback code-undo-imp void [self ptr, cmd ptr, sender ptr]
+  (when-let [w (objc/object-for self)]
+    (if (= "undo:" (objc/sel-name cmd)) (ui/undo! w) (ui/redo! w))))
+
+(def ^:private code-mouse!
+  "Emit the pointer's moves over a code view (defined below).")
+
+(ffi/defcallback code-mouse-imp void [self ptr, cmd ptr, event ptr]
+  (when-let [w (objc/object-for self)]
+    (code-mouse! w (objc/sel-name cmd) event)))
+
+(ffi/defcallback no-hit-imp ptr [self ptr, cmd ptr, p objc/ns-point]
+  (ffi/null))
+
 (def ^:private popover-closed!
   "A popover closed natively (defined below).")
 
@@ -326,7 +357,22 @@ consumed it (defined below).")
                        ["boundsDidChange:" selection-imp "v@:@"]
                        ["tabView:didSelectTabViewItem:" tab-selected-imp "v@:@@"]
                        ["menuNeedsUpdate:" menu-opening-imp "v@:@"]
-                       ["popoverDidClose:" popover-closed-imp "v@:@"]])
+                       ["popoverDidClose:" popover-closed-imp "v@:@"]
+                       ["textViewDidChangeSelection:" selection-imp "v@:@"]
+                       ["textView:shouldChangeTextInRange:replacementString:" should-change-imp
+                        "B@:@{_NSRange=QQ}@"]
+                       ["textStorage:didProcessEditing:range:changeInLength:" storage-edited-imp
+                        "v@:@Q{_NSRange=QQ}q"]])
+  (objc/define-class! "SkeinCodeTextView" "NSTextView"
+                      [["undo:" code-undo-imp "v@:@"] ["redo:" code-undo-imp "v@:@"]])
+  (objc/define-class! "SkeinTracker" "NSObject"
+                      [["mouseMoved:" code-mouse-imp "v@:@"] ["mouseEntered:" code-mouse-imp "v@:@"]
+                       ["mouseExited:" code-mouse-imp "v@:@"]])
+  (objc/define-class! "SkeinGutterView" "NSView"
+                      [["isFlipped" yes-imp "B@:"]
+                       ["drawRect:" draw-imp "v@:{CGRect={CGPoint=dd}{CGSize=dd}}"]])
+  (objc/define-class! "SkeinPassiveLabel" "NSTextField"
+                      [["hitTest:" no-hit-imp "@@:{CGPoint=dd}"]])
   (objc/define-class! "SkeinFlippedView" "NSView"
                       [["isFlipped" yes-imp "B@:"]
                        ["viewDidChangeEffectiveAppearance" appearance-imp "v@:"]])
@@ -2506,7 +2552,9 @@ a widget with input signals other than a canvas, which handles its own."
 
 (defn- emit-input! [w signal & kvs]
   (let [e (apply ui/event-for w signal kvs)]
-    (ui/emit! w e)
+    ;; The native control acts on what no handler consumes.
+    (binding [ui/*native-input* true]
+      (ui/emit! w e))
     (ui/consumed? e)))
 
 (defn- printable? [s]
@@ -3406,8 +3454,13 @@ own coordinates."
     (when-let [p (objc/object-for shell)]
       (ui/surface-closed! p :dismissed))))
 
+(def ^:private code-text-view
+  "A code view's NSTextView (defined below).")
+
 (defn- text-view-or-view [w]
-  (if (instance? ui/text-view-widget w) (text-view-of w) (view w)))
+  (cond (instance? ui/text-view-widget w) (text-view-of w)
+        (instance? ui/code-view-widget w) (code-text-view w)
+        :else (view w)))
 
 (defmethod ui/backend-caret-rectangle [(b cocoa-backend) w position]
   ;; NSTextInputClient gives a screen rectangle: through the window to the widget's view.
@@ -3415,8 +3468,11 @@ own coordinates."
    (fn []
      (let [tv (text-view-or-view w)
            win (objc/send tv (objc/sel "window"))
+           units (if (instance? ui/code-view-widget w)
+                   (ui/buffer-utf16-position (:buffer w) position)
+                   position)
            screen-rect (objc/send-rangep-rect tv (objc/sel "firstRectForCharacterRange:actualRange:")
-                                              {:location position :length 0} (ffi/null))
+                                              {:location units :length 0} (ffi/null))
            window-rect (objc/send-r-rect win (objc/sel "convertRectFromScreen:") screen-rect)
            v (view w)
            [x y width height] (objc/rect-vec (objc/send-rp-rect v (objc/sel "convertRect:fromView:")
@@ -3505,3 +3561,587 @@ height] from the top left of the main screen."
                                        (objc/send-rp-rect v (objc/sel "convertRect:toView:")
                                                           (anchor-rect w rectangle) (ffi/null))))]
     (mapv (fn [n] (int (math/round n))) [x (- (screen-height) y rh) rw rh])))
+
+;;; ------------------------------------------------------------------------------------
+;;; Code views: an NSTextView over a text storage shared by the buffer's views. Each text
+;;; buffer with views has one NSTextStorage; each code view is a flipped view holding a
+;;; gutter of line numbers and, beside it, an NSScrollView with an NSTextView that has its
+;;; own NSLayoutManager and NSTextContainer on the shared storage (TextKit's way of showing
+;;; one text in several views). The core's edits reach the storage through
+;;; backend-buffer-replaced; the storage's own (typing, pasting, input methods) come back
+;;; from textStorage:didProcessEditing:... as native-buffer-edited!. AppKit hasn't told the
+;;; layout managers of an edit when that runs, so what the core asks of the views meanwhile
+;;; is done just after. Runs are layout-manager temporary attributes, so they are per
+;;; view; bold and italic change the font, which only the shared storage can.
+
+(def ^:private code-parts
+  "A code view's view address -> {:inner :scroll :layout :gutter :clip :tracker
+:placeholder :gutter-thickness :visible-lines :font-runs}."
+  (atom {}))
+
+(def ^:private storages
+  "A text buffer -> [its NSTextStorage, the number of views on it]."
+  (atom {}))
+
+(def ^:private pushing
+  "Above 0 while skein-ui changes a storage or selection itself, so the delegate methods
+that report the user's changes ignore it."
+  (atom 0))
+
+(defn- pushing! [f]
+  (swap! pushing inc)
+  (try (f) (finally (swap! pushing dec))))
+
+(def ^:private in-storage-edit
+  "True while a storage edit is being reported, before the layout managers know of it."
+  (atom false))
+
+(def ^:private deferred
+  "Calls on code views waiting for the storage edit being reported to finish."
+  (atom []))
+
+(defn- flush-deferred! []
+  (loop []
+    (let [[calls _] (reset-vals! deferred [])]
+      (when (seq calls)
+        (doseq [f calls] (f))
+        (recur)))))
+
+(defn- defer-native!
+  "Call f now, or during a storage edit as soon as the text view has finished it
+(textDidChange:), or failing that from the event loop."
+  [f]
+  (if @in-storage-edit
+    (do (when (empty? @deferred)
+          (ui/backend-call-later (ui/current-backend) flush-deferred!))
+        (swap! deferred conj f))
+    (do (flush-deferred!) (f))))
+
+(defn- parts [w] (get @code-parts (ffi/address (view w))))
+(defn- code-text-view [w] (:inner (parts w)))
+
+(defn- u16 [w position] (ui/buffer-utf16-position (:buffer w) position))
+(defn- from-u16 [w units] (ui/buffer-position-from-utf16 (:buffer w) units))
+
+(defn- base-attributes
+  "The attributes of plain text in the code view: its font, text color and tab stops."
+  [w]
+  (let [d (text-attributes (:font w) nil)
+        style (objc/send (objc/send (objc/cls "NSParagraphStyle") (objc/sel "defaultParagraphStyle"))
+                         (objc/sel "mutableCopy"))]
+    (objc/send-p-void style (objc/sel "setTabStops:") (objc/send (objc/cls "NSArray") (objc/sel "array")))
+    (objc/send-d-void style (objc/sel "setDefaultTabInterval:")
+                      (f64 (* (max 1 (:tab-width w)) (first (string-size " " (:font w))))))
+    (objc/autorelease style)
+    (objc/send-pp-void d (objc/sel "setObject:forKey:") (palette-ns-color w :text)
+                       (objc/ns-string "NSColor"))
+    (objc/send-pp-void d (objc/sel "setObject:forKey:") style (objc/ns-string "NSParagraphStyle"))
+    d))
+
+(defn- attributed [s attributes]
+  (objc/autorelease (objc/send-pp (objc/alloc "NSAttributedString")
+                                  (objc/sel "initWithString:attributes:")
+                                  (objc/ns-string s) attributes)))
+
+(defn- storage-of [buffer] (first (get @storages buffer)))
+
+(defn- storage-length [storage] (objc/send-long storage (objc/sel "length")))
+
+(def ^:private update-gutter!
+  "Size the gutter for the number of lines, and redraw it (defined below).")
+
+(def ^:private update-placeholder!
+  "Show the code view's placeholder while it is empty (defined below).")
+
+(defn- apply-base-attributes!
+  "Give the code view's storage its font and tab stops, and its text view the same for
+typing."
+  [w]
+  (let [storage (storage-of (:buffer w))
+        attributes (base-attributes w)]
+    (when storage
+      (pushing! (fn []
+                  (objc/send-void storage (objc/sel "beginEditing"))
+                  (objc/send-prange-void storage (objc/sel "setAttributes:range:") attributes
+                                         {:location 0 :length (storage-length storage)})
+                  (objc/send-void storage (objc/sel "endEditing")))))
+    (objc/send-p-void (code-text-view w) (objc/sel "setTypingAttributes:") attributes)
+    (update-gutter! w)))
+
+(defn- attach-storage!
+  "Put the code view's layout manager on its buffer's storage, making the storage first."
+  [w]
+  (let [buffer (:buffer w)]
+    (when-not (get @storages buffer)
+      (let [storage (objc/new-object "NSTextStorage")]
+        (pushing! (fn [] (objc/send-range-p-void storage (objc/sel "replaceCharactersInRange:withAttributedString:")
+                                                 {:location 0 :length 0}
+                                                 (attributed (ui/buffer-text buffer) (base-attributes w)))))
+        (objc/send-p-void storage (objc/sel "setDelegate:") (:text-delegate (ui/current-backend)))
+        (objc/register! storage buffer)
+        (swap! storages assoc buffer [storage 0])))
+    (swap! storages update-in [buffer 1] inc)
+    (objc/send-p-void (storage-of buffer) (objc/sel "addLayoutManager:") (:layout (parts w)))
+    (swap! code-parts assoc-in [(ffi/address (view w)) :storage-buffer] buffer)
+    (apply-base-attributes! w)))
+
+(defn- detach-storage! [w]
+  (when-let [buffer (:storage-buffer (parts w))]
+    (when-let [[storage n] (get @storages buffer)]
+      (objc/send-p-void storage (objc/sel "removeLayoutManager:") (:layout (parts w)))
+      (swap! code-parts update (ffi/address (view w)) dissoc :storage-buffer)
+      (if (> n 1)
+        (swap! storages update-in [buffer 1] dec)
+        (do (objc/unregister! storage)
+            (objc/send-p-void storage (objc/sel "setDelegate:") (ffi/null))
+            (objc/release storage)
+            (swap! storages dissoc buffer))))))
+
+(defmethod make-native [(w ui/code-view-widget)]
+  (let [big 1.0e7
+        b (ui/current-backend)
+        host (flipped-view)
+        scroll (init-frame "NSScrollView")
+        container (objc/send-z (objc/alloc "NSTextContainer") (objc/sel "initWithSize:")
+                               {:width big :height big})
+        layout (objc/new-object "NSLayoutManager")
+        tv (objc/send-rp (objc/alloc "SkeinCodeTextView") (objc/sel "initWithFrame:textContainer:")
+                         (objc/rect 0 0 300 200) container)
+        gutter (init-frame "SkeinGutterView")
+        clip (objc/send scroll (objc/sel "contentView"))
+        tracker (objc/new-object "SkeinTracker")]
+    (objc/send-b-void container (objc/sel "setWidthTracksTextView:") false)
+    (objc/send-p-void layout (objc/sel "addTextContainer:") container)
+    (objc/send-b-void layout (objc/sel "setAllowsNonContiguousLayout:") true)
+    (objc/release container)
+    (doseq [setting ["setRichText:" "setAllowsUndo:" "setUsesRuler:" "setImportsGraphics:"
+                     "setAutomaticQuoteSubstitutionEnabled:" "setAutomaticDashSubstitutionEnabled:"
+                     "setAutomaticTextReplacementEnabled:" "setAutomaticSpellingCorrectionEnabled:"
+                     "setContinuousSpellCheckingEnabled:" "setGrammarCheckingEnabled:"
+                     "setSmartInsertDeleteEnabled:" "setAutomaticLinkDetectionEnabled:"]]
+      (objc/send-b-void tv (objc/sel setting) false))
+    ;; The pointer over the text: one tracking area that follows the visible rectangle.
+    (let [area (objc/send-rlpp (objc/alloc "NSTrackingArea") (objc/sel "initWithRect:options:owner:userInfo:")
+                               (objc/rect 0 0 0 0) (+ 0x01 0x02 0x40 0x200) tracker (ffi/null))]
+      (objc/send-p-void tv (objc/sel "addTrackingArea:") area)
+      (objc/release area))
+    (objc/send-b-void tv (objc/sel "setUsesFindBar:") true)
+    (objc/send-b-void tv (objc/sel "setIncrementalSearchingEnabled:") true)
+    (objc/send-b-void tv (objc/sel "setHorizontallyResizable:") true)
+    (objc/send-b-void tv (objc/sel "setVerticallyResizable:") true)
+    (objc/send-z-void tv (objc/sel "setMaxSize:") {:width big :height big})
+    (objc/send-l-void tv (objc/sel "setAutoresizingMask:") 18)
+    (objc/send-z-void tv (objc/sel "setTextContainerInset:") {:width 2.0 :height 4.0})
+    (objc/send-p-void tv (objc/sel "setDelegate:") (:text-delegate b))
+    (objc/send-p-void scroll (objc/sel "setDocumentView:") tv)
+    (objc/send-b-void scroll (objc/sel "setHasVerticalScroller:") true)
+    (objc/send-b-void scroll (objc/sel "setHasHorizontalScroller:") true)
+    (objc/send-b-void scroll (objc/sel "setAutohidesScrollers:") true)
+    (objc/send-l-void scroll (objc/sel "setBorderType:") 0)
+    (objc/send-p-void host (objc/sel "addSubview:") gutter)
+    (objc/send-p-void host (objc/sel "addSubview:") scroll)
+    (objc/release gutter)
+    (objc/release scroll)
+    (objc/release tv)
+    (objc/send-b-void clip (objc/sel "setPostsBoundsChangedNotifications:") true)
+    (objc/send-pppp-void (objc/send (objc/cls "NSNotificationCenter") (objc/sel "defaultCenter"))
+                         (objc/sel "addObserver:selector:name:object:")
+                         (:text-delegate b) (objc/sel "boundsDidChange:")
+                         (objc/ns-string "NSViewBoundsDidChangeNotification") clip)
+    (doseq [o [tv gutter clip tracker]] (also-register! o w))
+    (swap! code-parts assoc (ffi/address host)
+           {:inner tv :scroll scroll :layout layout :gutter gutter :clip clip :tracker tracker})
+    host))
+
+(defmethod ui/backend-destroy :before [(b cocoa-backend) (w ui/code-view-widget)]
+  (let [{:keys [inner layout gutter clip tracker]} (parts w)]
+    (objc/send-ppp-void (objc/send (objc/cls "NSNotificationCenter") (objc/sel "defaultCenter"))
+                        (objc/sel "removeObserver:name:object:") (:text-delegate b)
+                        (objc/ns-string "NSViewBoundsDidChangeNotification") clip)
+    (objc/send-p-void inner (objc/sel "setDelegate:") (ffi/null))
+    (detach-storage! w)
+    (doseq [o [inner gutter clip tracker]] (objc/unregister! o))
+    (objc/release layout)
+    (objc/release tracker)
+    (swap! code-parts dissoc (ffi/address (view w)))))
+
+(defn- gutter-thickness [w]
+  (f64 (math/ceil (+ 20 (* (max 3 (count (str (ui/buffer-line-count (:buffer w)))))
+                           (first (string-size "0" (:font w))))))))
+
+(defn- place-parts!
+  "Put the gutter at the code view's left and the scroll view in the rest."
+  [w]
+  (let [{:keys [gutter scroll]} (parts w)
+        [_ _ width height] (objc/rect-vec (objc/send-rect (view w) (objc/sel "bounds")))
+        g (if (:line-numbers w) (gutter-thickness w) 0.0)]
+    (objc/send-b-void gutter (objc/sel "setHidden:") (zero? g))
+    (objc/send-r-void gutter (objc/sel "setFrame:") (objc/rect 0 0 g height))
+    (objc/send-r-void scroll (objc/sel "setFrame:") (objc/rect g 0 (max 0 (- width g)) height))
+    (swap! code-parts assoc-in [(ffi/address (view w)) :gutter-thickness] g)))
+
+(defn- update-gutter! [w]
+  (when-let [gutter (:gutter (parts w))]
+    (when (and (:line-numbers w) (not= (gutter-thickness w) (:gutter-thickness (parts w))))
+      (place-parts! w))
+    (objc/send-b-void gutter (objc/sel "setNeedsDisplay:") true)))
+
+(defmethod layout-subviews [(w ui/code-view-widget) width height]
+  (place-parts! w)
+  (update-placeholder! w))
+
+(defmethod native-natural-size [(w ui/code-view-widget)] [300 200])
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :buffer)) buffer]
+  (detach-storage! w)
+  (attach-storage! w)
+  (update-placeholder! w))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :font)) f]
+  (apply-base-attributes! w)
+  (update-placeholder! w))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :tab-width)) v]
+  (apply-base-attributes! w))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :editable)) v]
+  (objc/send-b-void (code-text-view w) (objc/sel "setEditable:") (boolean (and v (:enabled w)))))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :enabled)) v]
+  (objc/send-b-void (code-text-view w) (objc/sel "setSelectable:") (boolean v))
+  (objc/send-b-void (code-text-view w) (objc/sel "setEditable:") (boolean (and v (:editable w)))))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :line-numbers)) v]
+  (place-parts! w))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :wrap)) v]
+  (let [{:keys [inner scroll]} (parts w)
+        container (objc/send inner (objc/sel "textContainer"))]
+    (objc/send-b-void scroll (objc/sel "setHasHorizontalScroller:") (not v))
+    (objc/send-b-void inner (objc/sel "setHorizontallyResizable:") (not v))
+    (objc/send-b-void container (objc/sel "setWidthTracksTextView:") (boolean v))
+    (if v
+      (let [[cw _] (objc/size-vec (objc/send-size scroll (objc/sel "contentSize")))
+            [_ _ _ th] (objc/rect-vec (objc/send-rect inner (objc/sel "frame")))]
+        (objc/send-z-void inner (objc/sel "setFrameSize:") {:width cw :height th}))
+      (objc/send-z-void container (objc/sel "setContainerSize:") {:width 1.0e7 :height 1.0e7}))
+    (place-parts! w)))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :placeholder)) v]
+  (update-placeholder! w))
+
+;;; Edits both ways
+
+(defmethod ui/backend-buffer-replaced [(b cocoa-backend) buffer start old-end text removed]
+  (let [storage (storage-of buffer)
+        w (first (filter ui/realized? (:views buffer)))]
+    (when (and storage w)
+      (pushing! (fn []
+                  (objc/send-void storage (objc/sel "beginEditing"))
+                  (objc/send-range-p-void storage (objc/sel "replaceCharactersInRange:withAttributedString:")
+                                          {:location (ui/buffer-utf16-position buffer start)
+                                           :length (ui/utf16-length removed)}
+                                          (attributed text (base-attributes w)))
+                  (objc/send-void storage (objc/sel "endEditing")))))))
+
+(defn- storage-edited! [storage actions location len delta]
+  ;; NSTextStorageEditedCharacters 2
+  (let [buffer (objc/object-for storage)]
+    (when (and buffer (pos? (bit-and actions 2)) (zero? @pushing))
+      (let [start (ui/buffer-position-from-utf16 buffer location)
+            old-end (ui/buffer-position-from-utf16 buffer (+ location (- len delta)))
+            text (objc/string-of (objc/send-range-p (objc/send storage (objc/sel "string"))
+                                                    (objc/sel "substringWithRange:")
+                                                    {:location location :length len}))
+            origin (let [v @editing-view] (when (and v (identical? (:buffer v) buffer)) v))]
+        (reset! in-storage-edit true)
+        (try (ui/native-buffer-edited! buffer start old-end (or text "") origin)
+             (finally (reset! in-storage-edit false)))))
+    (when buffer
+      (doseq [v (:views buffer)] (when (ui/realized? v) (update-placeholder! v))))))
+
+(defmethod native-text-changed [(w ui/code-view-widget) tv]
+  (flush-deferred!))
+
+(defmethod native-selection-changed [(w ui/code-view-widget) o]
+  (let [{:keys [inner gutter]} (parts w)]
+    (if (= (ffi/address o) (ffi/address inner))
+      (when (and (zero? @pushing) (not @in-storage-edit))
+        (let [r (objc/send-range inner (objc/sel "selectedRange"))
+              location (ffi/field r objc/ns-range :location)
+              start (from-u16 w location)
+              end (from-u16 w (+ location (ffi/field r objc/ns-range :length)))
+              upstream (zero? (objc/send-long inner (objc/sel "selectionAffinity")))
+              [anchor cursor] (cond (= start end) [start start]
+                                    (= (:anchor w) start) [start end]
+                                    (= (:anchor w) end) [end start]
+                                    upstream [end start]
+                                    :else [start end])]
+          (ui/native-selection-changed! w anchor cursor)
+          (objc/send-b-void gutter (objc/sel "setNeedsDisplay:") true)))
+      ;; Its clip view scrolled.
+      (when-not (:destroyed w)
+        (objc/send-b-void gutter (objc/sel "setNeedsDisplay:") true)
+        (ui/code-view-scrolled! w)))))
+
+(defmethod ui/backend-code-set-selection [(b cocoa-backend) w anchor cursor]
+  (defer-native!
+   (fn []
+     (when-not (:destroyed w)
+       ;; The selection when this runs, which may be later than the call.
+       (let [n (ui/text-length w)
+             anchor (min (:anchor w) n)
+             cursor (min (:cursor w) n)
+             a (u16 w anchor)
+             c (u16 w cursor)]
+         (pushing! (fn [] (objc/send-range-lb-void (code-text-view w)
+                                                   (objc/sel "setSelectedRange:affinity:stillSelecting:")
+                                                   {:location (min a c) :length (abs (- a c))}
+                                                   (if (< cursor anchor) 0 1) false)))
+         (objc/send-b-void (:gutter (parts w)) (objc/sel "setNeedsDisplay:") true))))))
+
+(defmethod ui/backend-redraw [(b cocoa-backend) (w ui/code-view-widget) rect]
+  (defer-native! (fn [] (when-not (:destroyed w) (update-gutter! w)))))
+
+;;; Geometry
+
+(defn- container-origin [w]
+  (let [p (objc/send-point (code-text-view w) (objc/sel "textContainerOrigin"))]
+    [(ffi/field p objc/ns-point :x) (ffi/field p objc/ns-point :y)]))
+
+(defn- visible-character-range
+  "[location length] of the UTF-16 units the code view shows."
+  [w]
+  (let [tv (code-text-view w)
+        [x y vw vh] (objc/rect-vec (objc/send-rect tv (objc/sel "visibleRect")))
+        [ox oy] (container-origin w)
+        layout (:layout (parts w))
+        glyphs (objc/send-rp-range layout (objc/sel "glyphRangeForBoundingRect:inTextContainer:")
+                                   (objc/rect (- x ox) (- y oy) vw vh)
+                                   (objc/send tv (objc/sel "textContainer")))
+        chars (objc/send-rangep-range layout (objc/sel "characterRangeForGlyphRange:actualGlyphRange:")
+                                      {:location (ffi/field glyphs objc/ns-range :location)
+                                       :length (ffi/field glyphs objc/ns-range :length)}
+                                      (ffi/null))]
+    [(ffi/field chars objc/ns-range :location) (ffi/field chars objc/ns-range :length)]))
+
+(defmethod ui/backend-code-visible-lines [(b cocoa-backend) w]
+  (if @in-storage-edit
+    (or (:visible-lines (parts w)) [0 0])
+    (let [buffer (:buffer w)
+          [location len] (visible-character-range w)
+          lines [(ui/position-line buffer (from-u16 w location))
+                 (ui/position-line buffer (from-u16 w (+ location len)))]]
+      (swap! code-parts assoc-in [(ffi/address (view w)) :visible-lines] lines)
+      lines)))
+
+(defn- default-line-height [w]
+  (objc/send-p-double (:layout (parts w)) (objc/sel "defaultLineHeightForFont:") (ns-font (:font w))))
+
+(defn- line-fragment
+  "[x y width height], in the text view, of the line fragment holding the UTF-16 offset
+units."
+  [w units]
+  (let [layout (:layout (parts w))
+        length (storage-length (objc/send (code-text-view w) (objc/sel "textStorage")))
+        [ox oy] (container-origin w)
+        glyph-rect (fn [u] (objc/rect-vec
+                            (objc/send-lp-rect layout (objc/sel "lineFragmentRectForGlyphAtIndex:effectiveRange:")
+                                               (objc/send-l-long layout (objc/sel "glyphIndexForCharacterAtIndex:") u)
+                                               (ffi/null))))
+        [x y fw fh] (if (>= units length)
+                      (do (when (pos? length)
+                            (objc/send-range-void layout (objc/sel "ensureLayoutForCharacterRange:")
+                                                  {:location (dec length) :length 1}))
+                          (let [[ex ey ew eh] (objc/rect-vec (objc/send-rect layout (objc/sel "extraLineFragmentRect")))]
+                            (if (or (pos? eh) (zero? length))
+                              [ex ey ew (if (pos? eh) eh (default-line-height w))]
+                              (glyph-rect (dec length)))))
+                      (glyph-rect units))]
+    [(+ x ox) (+ y oy) fw fh]))
+
+(defmethod ui/backend-code-position-at-point [(b cocoa-backend) w x y]
+  (from-u16 w (objc/send-point-long (code-text-view w) (objc/sel "characterIndexForInsertionAtPoint:")
+                                    {:x (f64 x) :y (f64 y)})))
+
+(defmethod ui/backend-code-point-at-position [(b cocoa-backend) w position]
+  (let [units (u16 w position)
+        tv (code-text-view w)
+        layout (:layout (parts w))
+        container (objc/send tv (objc/sel "textContainer"))
+        length (storage-length (objc/send tv (objc/sel "textStorage")))
+        [fx fy _ fh] (line-fragment w units)
+        [ox _] (container-origin w)
+        glyph-x (fn [u] (objc/rect-vec
+                         (objc/send-rangep-rect layout (objc/sel "boundingRectForGlyphRange:inTextContainer:")
+                                                {:location (objc/send-l-long layout (objc/sel "glyphIndexForCharacterAtIndex:") u)
+                                                 :length 1}
+                                                container)))
+        text (ui/code-text w)
+        x (cond (< units length) (+ ox (first (glyph-x units)))
+                (or (zero? length) (= \newline (last text)))
+                (+ fx (objc/send-double container (objc/sel "lineFragmentPadding")))
+                :else (let [[bx _ bw _] (glyph-x (dec length))] (+ ox bx bw)))]
+    [x fy fh]))
+
+(defmethod ui/backend-code-scroll-to-position [(b cocoa-backend) w position]
+  (defer-native!
+   (fn []
+     (when-not (:destroyed w)
+       (objc/send-range-void (code-text-view w) (objc/sel "scrollRangeToVisible:")
+                             {:location (u16 w (min position (ui/text-length w))) :length 0})))))
+
+(defmethod ui/backend-code-gutter-width [(b cocoa-backend) w]
+  (int (gutter-thickness w)))
+
+(defmethod native-draw [(w ui/code-view-widget)]
+  ;; The gutter: line numbers beside the lines that show, the caret's line in full color.
+  (let [{:keys [gutter inner]} (parts w)
+        [_ gy gw gh] (objc/rect-vec (objc/send-rect gutter (objc/sel "bounds")))
+        gc (make cocoa-context :cg (current-cg) :width gw :height gh :widget w)
+        buffer (:buffer w)
+        f (:font w)
+        current (ui/position-line buffer (:cursor w))
+        [location len] (visible-character-range w)]
+    (ui/fill-rectangle! gc 0 gy gw gh {:color (ui/widget-color w :gutter-background)})
+    (ui/fill-rectangle! gc (- gw 1) gy 1 gh {:color (ui/widget-color w :separator)})
+    (doseq [line (range (ui/position-line buffer (from-u16 w location))
+                        (inc (ui/position-line buffer (from-u16 w (+ location len)))))]
+      (let [[_ fy] (line-fragment w (u16 w (ui/line-start buffer line)))
+            p (objc/send-point-p gutter (objc/sel "convertPoint:fromView:") {:x 0.0 :y (f64 fy)} inner)
+            label (str (inc line))]
+        (ui/draw-text! gc label (- gw 10) (ffi/field p objc/ns-point :y)
+                       {:font f :align :right
+                        :color (ui/widget-color w (if (= line current) :text :gutter-text))})))))
+
+;;; Runs
+
+(def ^:private run-dictionaries
+  "[color background underline] -> a retained NSDictionary of temporary attributes."
+  (atom {}))
+
+(defn- run-dictionary [attrs]
+  (let [k [(:color attrs) (:background attrs) (boolean (:underline attrs))]]
+    (or (get @run-dictionaries k)
+        (let [d (objc/retain (objc/send (objc/cls "NSMutableDictionary") (objc/sel "dictionary")))]
+          (when-let [c (first k)]
+            (objc/send-pp-void d (objc/sel "setObject:forKey:") (ns-color c) (objc/ns-string "NSColor")))
+          (when-let [c (second k)]
+            (objc/send-pp-void d (objc/sel "setObject:forKey:") (ns-color c)
+                               (objc/ns-string "NSBackgroundColor")))
+          (when (nth k 2)
+            (objc/send-pp-void d (objc/sel "setObject:forKey:")
+                               (objc/send-l (objc/cls "NSNumber") (objc/sel "numberWithInteger:") 1)
+                               (objc/ns-string "NSUnderline")))
+          (swap! run-dictionaries assoc k d)
+          d))))
+
+(defmethod ui/backend-code-apply-runs [(b cocoa-backend) w start end runs]
+  (defer-native!
+   (fn []
+     (when-not (:destroyed w)
+       (let [layout (:layout (parts w))
+             n (ui/text-length w)
+             start (min start n)
+             end (min end n)
+             s16 (u16 w start)
+             whole {:location s16 :length (- (u16 w end) s16)}
+             fonts (or (:font-runs (parts w))
+                       (some (fn [[_ _ a]] (or (:bold a) (:italic a))) runs))]
+         (doseq [name ["NSColor" "NSBackgroundColor" "NSUnderline"]]
+           (objc/send-prange-void layout (objc/sel "removeTemporaryAttribute:forCharacterRange:")
+                                  (objc/ns-string name) whole))
+         (doseq [[rs re a] runs]
+           (when (or (:color a) (:background a) (:underline a))
+             (let [x (u16 w (min rs n))]
+               (objc/send-prange-void layout (objc/sel "addTemporaryAttributes:forCharacterRange:")
+                                      (run-dictionary a)
+                                      {:location x :length (- (u16 w (min re n)) x)}))))
+         ;; Bold and italic: fonts in the shared storage.
+         (when fonts
+           (swap! code-parts assoc-in [(ffi/address (view w)) :font-runs] true)
+           (let [storage (objc/send (code-text-view w) (objc/sel "textStorage"))]
+             (pushing!
+              (fn []
+                (objc/send-void storage (objc/sel "beginEditing"))
+                (objc/send-pprange-void storage (objc/sel "addAttribute:value:range:")
+                                        (objc/ns-string "NSFont") (ns-font (:font w)) whole)
+                (doseq [[rs re a] runs]
+                  (when (or (:bold a) (:italic a))
+                    (let [x (u16 w (min rs n))]
+                      (objc/send-pprange-void storage (objc/sel "addAttribute:value:range:")
+                                              (objc/ns-string "NSFont")
+                                              (ns-font (merge (:font w)
+                                                              {:weight (if (:bold a) :bold :regular)
+                                                               :italic (boolean (:italic a))}))
+                                              {:location x :length (- (u16 w (min re n)) x)}))))
+                (objc/send-void storage (objc/sel "endEditing")))))))))))
+
+;;; The pointer over the text, and the placeholder
+
+(defn- code-mouse! [w selector e]
+  (when (:enabled w)
+    (let [[x y] (event-point (code-text-view w) e)
+          signal (cond (= selector "mouseMoved:") :mouse-move
+                       (= selector "mouseEntered:") :mouse-enter
+                       :else :mouse-leave)]
+      (ui/emit! w (ui/event-for w signal :x x :y y :modifiers (event-modifiers e))))))
+
+(defn- placeholder-label [w]
+  (or (:placeholder (parts w))
+      (let [label (objc/send (objc/alloc "SkeinPassiveLabel") (objc/sel "init"))]
+        (objc/send-b-void label (objc/sel "setBezeled:") false)
+        (objc/send-b-void label (objc/sel "setDrawsBackground:") false)
+        (objc/send-b-void label (objc/sel "setEditable:") false)
+        (objc/send-b-void label (objc/sel "setSelectable:") false)
+        (objc/send-p-void label (objc/sel "setTextColor:")
+                          (objc/send (objc/cls "NSColor") (objc/sel "placeholderTextColor")))
+        (objc/send-p-void (code-text-view w) (objc/sel "addSubview:") label)
+        (objc/release label)
+        (swap! code-parts assoc-in [(ffi/address (view w)) :placeholder] label)
+        label)))
+
+(defn- update-placeholder! [w]
+  (when-let [tv (code-text-view w)]
+    (let [text (:placeholder w)
+          shown (and (seq (str (or text "")))
+                     (zero? (storage-length (objc/send tv (objc/sel "textStorage")))))]
+      (when (or shown (:placeholder (parts w)))
+        (let [label (placeholder-label w)]
+          (objc/send-b-void label (objc/sel "setHidden:") (not shown))
+          (when shown
+            (objc/send-p-void label (objc/sel "setFont:") (ns-font (:font w)))
+            (objc/send-p-void label (objc/sel "setStringValue:") (objc/ns-string text))
+            (let [[ox oy] (container-origin w)
+                  padding (objc/send-double (objc/send tv (objc/sel "textContainer"))
+                                            (objc/sel "lineFragmentPadding"))
+                  [_ _ bw _] (objc/rect-vec (objc/send-rect tv (objc/sel "bounds")))
+                  [_ lh] (objc/size-vec (objc/send-size label (objc/sel "fittingSize")))
+                  x (+ ox padding)]
+              (objc/send-r-void label (objc/sel "setFrame:")
+                                (objc/rect x oy (max 0 (- bw x ox padding)) lh)))))))))
+
+(defn native-code-text
+  "The text of the code view's NSTextView."
+  [w]
+  (objc/string-of (objc/send (code-text-view w) (objc/sel "string"))))
+
+(defn type-into-code-view!
+  "Type s into the code view's NSTextView as the keyboard does (insertText:), at its
+selection."
+  [w s]
+  ;; NSNotFound: at the selection
+  (objc/send-prange-void (code-text-view w) (objc/sel "insertText:replacementRange:")
+                         (objc/ns-string s) {:location 9223372036854775807 :length 0})
+  (flush-deferred!))
+
+(defn native-code-selection
+  "The code view's NSTextView selection, [location length] in UTF-16 units."
+  [w]
+  (let [r (objc/send-range (code-text-view w) (objc/sel "selectedRange"))]
+    [(ffi/field r objc/ns-range :location) (ffi/field r objc/ns-range :length)]))
+
+(defn code-placeholder-shown?
+  "True if the code view shows its placeholder."
+  [w]
+  (boolean (when-let [l (:placeholder (parts w))] (not (objc/send-bool l (objc/sel "isHidden"))))))

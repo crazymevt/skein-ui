@@ -192,6 +192,19 @@ and all of them run on the main thread, which no fiber waits to share."
   [self ptr, sel ptr, r ns-range, p ptr])
 (ffi/defcfun ^:blocking send-r-rect "objc_msgSend" ns-rect [self ptr, sel ptr, r ns-rect])
 (ffi/defcfun ^:blocking send-rp-rect "objc_msgSend" ns-rect [self ptr, sel ptr, r ns-rect, p ptr])
+(ffi/defcfun ^:blocking send-rp "objc_msgSend" ptr [self ptr, sel ptr, r ns-rect, p ptr])
+(ffi/defcfun ^:blocking send-range-lb-void "objc_msgSend" void
+  [self ptr, sel ptr, r ns-range, n u64, b bool])
+(ffi/defcfun ^:blocking send-rp-range "objc_msgSend" ns-range [self ptr, sel ptr, r ns-rect, p ptr])
+(ffi/defcfun ^:blocking send-rangep-range "objc_msgSend" ns-range
+  [self ptr, sel ptr, r ns-range, p ptr])
+(ffi/defcfun ^:blocking send-lp-rect "objc_msgSend" ns-rect [self ptr, sel ptr, n u64, p ptr])
+(ffi/defcfun ^:blocking send-p-double "objc_msgSend" f64 [self ptr, sel ptr, p ptr])
+(ffi/defcfun ^:blocking send-point-long "objc_msgSend" i64 [self ptr, sel ptr, p ns-point])
+(ffi/defcfun ^:blocking send-prange-void "objc_msgSend" void [self ptr, sel ptr, p ptr, r ns-range])
+(ffi/defcfun ^:blocking send-pprange-void "objc_msgSend" void
+  [self ptr, sel ptr, p ptr, q ptr, r ns-range])
+(ffi/defcfun ^:blocking send-range-p "objc_msgSend" ptr [self ptr, sel ptr, r ns-range])
 
 ;;; Blocks: a global block whose invoke function is a Skein callback, for the AppKit
 ;;; methods that take one (Apple's block ABI).

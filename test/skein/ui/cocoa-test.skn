@@ -440,3 +440,45 @@
         (ui/close-surface! c)
         (is (not (cocoa/native-surface-shown? c)))))
     (ui/close! w)))
+
+(deftest code-views
+  (let [b (ui/make-text-buffer {:text "(defn f [x]\n  x)"})
+        v (ui/code-view {:buffer b})
+        v2 (ui/code-view {:buffer b :line-numbers false})
+        empty (ui/code-view {:placeholder "Type here"})
+        w (ui/window {:title "Code" :width 500 :height 400} (ui/vbox {} v v2 empty))]
+    (ui/show! w)
+    (cocoa/run-for! 0.05)
+    (is (= "(defn f [x]\n  x)" (cocoa/native-code-text v)))
+    (testing "the core's edits reach the text view, and both views share the text"
+      (ui/insert-into-buffer! b 0 ";; ")
+      (is (= ";; (defn f [x]\n  x)" (cocoa/native-code-text v)))
+      (is (= ";; (defn f [x]\n  x)" (cocoa/native-code-text v2))))
+    (testing "typing in the text view changes the buffer"
+      (ui/focus! v)
+      (ui/set-cursor! v 3)
+      (cocoa/run-for! 0.05)
+      (is (= [3 0] (cocoa/native-code-selection v)))
+      (cocoa/type-into-code-view! v "x")
+      (is (= ";; x(defn f [x]\n  x)" (ui/buffer-text b)))
+      (is (= 4 (:cursor v)))
+      (is (= ";; x(defn f [x]\n  x)" (cocoa/native-code-text v2)))
+      (ui/undo! v)
+      (is (= ";; (defn f [x]\n  x)" (cocoa/native-code-text v))))
+    (testing "geometry"
+      (let [[x0 y0 h] (ui/point-at-position v 0)
+            [_ y1 _] (ui/point-at-position v (ui/line-start b 1))]
+        (is (< 0 h 30))
+        (is (< y0 y1) "the second line is lower")
+        (is (= (ui/line-start b 1) (ui/position-at-point v (+ x0 1) (+ y1 2)))))
+      (is (< 20 (ui/gutter-width v) 80))
+      (is (= [0 1] (ui/visible-lines v))))
+    (testing "runs and a bold one"
+      (ui/set-text-runs! v [[4 8 {:color :purple :bold true}]])
+      (cocoa/run-for! 0.05)
+      (is (= [[4 8 {:color :purple :bold true}]] (ui/text-runs v))))
+    (testing "the placeholder shows while empty"
+      (is (cocoa/code-placeholder-shown? empty))
+      (ui/set-code-text! empty "x")
+      (is (not (cocoa/code-placeholder-shown? empty))))
+    (ui/close! w)))
