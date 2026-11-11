@@ -1,0 +1,169 @@
+(ns examples.examples-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]
+            [skein.string :as string]
+            [skein.system :as system]
+            [examples.registry :as registry]
+            [examples.launcher]
+            [examples.code-editor]))
+
+;; Every example builds and shows its windows on the headless backend, and a few act as a
+;; user would on them.
+
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)
+                      (doseq [w (ui/windows)] (ui/close! w true))))
+
+(defn- run [name]
+  ((:run (registry/find-example name))))
+
+(deftest every-example-shows-its-windows
+  (doseq [e @registry/examples]
+    (testing (str (:name e))
+      (let [before (count (ui/windows))
+            w ((:run e))]
+        (is (instance? ui/window-widget w) "it returns its main window")
+        (is (< before (count (ui/windows))) "it shows a window")
+        (doseq [w (ui/windows)] (ui/close! w true))))))
+
+(deftest hello
+  (let [w (run :hello)]
+    (headless/type-text! (ui/find-widget w :name) "Ada")
+    (headless/click! (ui/find-widget w :greet))
+    (is (= "Nice to meet you, Ada." (:text (ui/find-widget w :answer))))))
+
+(deftest counter
+  (run :counter)
+  (let [[small big] (ui/windows)
+        plus (fn [w] (first (filter (fn [b] (= "+" (:label b))) (ui/widgets-of-type w ui/button-widget))))]
+    (headless/click! (plus small))
+    (headless/click! (plus big))
+    (is (= 1 (:current small)))
+    (is (= 10 (:current big)))))
+
+(deftest form
+  (let [w (run :form)
+        f (fn [k] (ui/find-widget w k))]
+    (is (not (:enabled (f :submit))))
+    (headless/type-text! (f :full-name) "Ada Lovelace")
+    (headless/type-text! (f :email) "ada@example.com")
+    (headless/type-text! (f :password) "analytical")
+    (is (:enabled (f :submit)))
+    (is (= "Ready." (:text (f :hint))))
+    (headless/toggle! (f :team))
+    (is (:enabled (f :seats)) "seats are for teams")
+    (headless/answer! "OK")
+    (headless/click! (f :submit))
+    (is (string/includes? (:message (last (headless/dialogs))) "Welcome, Ada Lovelace!"))))
+
+(deftest todo
+  (let [w (run :todo)
+        list (ui/find-widget w :list)]
+    (is (= "1 of 3 done" (:text (ui/find-widget w :count))))
+    (headless/type-text! (ui/find-widget w :new) "Ship it")
+    (headless/click! (ui/find-widget w :add))
+    (is (= 4 (count (:items list))))
+    (headless/select-rows! list [1])
+    (headless/click! (ui/find-widget w :done))
+    (is (= "2 of 4 done" (:text (ui/find-widget w :count))))
+    (headless/click! (ui/find-widget w :remove))
+    (is (= ["Read the skein-ui manual" "Write a program" "Ship it"] (mapv :title (:items list))))))
+
+(deftest calculator
+  (let [w (run :calculator)
+        press (fn [label] (headless/click! (ui/find-widget w (keyword (str "key-" label)))))]
+    (doseq [k ["1" "2" "+" "3" "0" "=" ]] (press k))
+    (is (= "42" (:text (ui/find-widget w :screen))))
+    (doseq [k ["÷" "8" "="]] (press k))
+    (is (= "5.25" (:text (ui/find-widget w :screen))))
+    (doseq [k ["÷" "0" "="]] (press k))
+    (is (= "Error" (:text (ui/find-widget w :screen))))))
+
+(deftest clock
+  (let [w (run :clock)
+        c (ui/find-widget w :clock)]
+    (is (seq (headless/draw! c)) "it draws")
+    (headless/toggle! (ui/find-widget w :seconds))
+    (is (not (:show-seconds c)))
+    (ui/close! w true)
+    (is (not (ui/timer-running? (:timer c))) "its timer stops with it")))
+
+(deftest stopwatch
+  (let [w (run :stopwatch)]
+    (headless/click! (ui/find-widget w :start))
+    (headless/click! (ui/find-widget w :lap))
+    (headless/click! (ui/find-widget w :start))
+    (is (= 1 (count (:items (ui/find-widget w :laps)))))
+    (is (= "Start" (:label (ui/find-widget w :start))))))
+
+(deftest dialogs
+  (let [w (run :dialogs)
+        result (fn [] (:text (ui/find-widget w :result)))]
+    (headless/answer! "Delete")
+    (headless/click! (ui/find-widget w (keyword "Yes or No")))
+    (is (= "Answered yes." (result)))
+    (headless/answer! "Grace")
+    (headless/click! (ui/find-widget w (keyword "Prompt")))
+    (is (= "Typed \"Grace\"." (result)))))
+
+(deftest files
+  (let [w (run :files)
+        tree (ui/find-widget w :tree)]
+    (is (= [(system/home-dir)] (:roots tree)))
+    (is (string/includes? (:text (ui/find-widget w :status)) "file"))))
+
+(deftest paint
+  (let [w (run :paint)
+        c (ui/find-widget w :canvas)]
+    (headless/mouse! c :mouse-down 10 10 {:button :left})
+    (headless/mouse! c :mouse-drag 50 40 {:button :left})
+    (headless/mouse! c :mouse-up 50 40 {:button :left})
+    (is (= [[10 10] [50 40]] (:points (first (:strokes c)))))
+    (headless/toggle! (ui/find-widget w :rectangle))
+    (is (= :rectangle (:tool c)))
+    (headless/click! (ui/find-widget w :undo))
+    (is (empty? (:strokes c)))))
+
+(deftest appearance
+  (let [w (run :appearance)]
+    (headless/choose! (ui/find-widget w :choice) 2)
+    (is (= :dark (ui/effective-appearance w)))
+    (is (string/includes? (:text (ui/find-widget w :status)) "Effective: dark"))
+    (headless/click! (ui/find-widget w :custom))
+    (is (= :dark (:appearance (ui/find-widget w :card))))))
+
+(deftest web-view
+  (let [w (run :web-view)
+        v (ui/find-widget w :view)]
+    (is (= :url (first (headless/web-load v))))
+    (ui/web-load-finished! v (:local-document v))
+    (ui/web-message-received! v "{\"ready\":true}" (:local-document v))
+    (is (= "Page → Skein: {\"ready\":true}" (:text (ui/find-widget w :status))))
+    (headless/click! (ui/find-widget w :send))
+    (is (string/includes? (second (last (headless/web-scripts v))) "Hello from Skein"))))
+
+(deftest code-editor
+  (let [w (run :code-editor)
+        top (ui/find-widget w :top)
+        bottom (ui/find-widget w :bottom)
+        b (:buffer top)]
+    (is (string/starts-with? (ui/code-text top) "(ns examples.code-editor"))
+    (is (some (fn [[_ _ a]] (= :definer (:style a))) (ui/text-runs top)) "colored")
+    (testing "typing in one view shows in the other, and is colored there"
+      (ui/set-cursor! top 0)
+      (ui/type-text! top ";; hi\n")
+      (is (string/starts-with? (ui/code-text bottom) ";; hi\n(ns"))
+      (is (= [0 5 {:style :comment}] (first (ui/text-runs bottom)))))
+    (testing "Return keeps the indentation"
+      (let [p (ui/line-end b 3)]
+        (ui/set-cursor! top p)
+        (headless/key-down! top "Return")
+        (is (= (str "\n" (apply str (take-while (fn [c] (= c \space)) (ui/line-text b 3))))
+               (ui/buffer-text b p (:cursor top))))))
+    (is (string/starts-with? (:text (ui/find-widget w :status)) "Line "))))
+
+(deftest tokenizer
+  (is (= [[1 5 {:style :definer}] [6 9 {:style :keyword}] [10 12 {:style :number}]
+          [13 17 {:style :string}] [18 22 {:style :comment}]]
+         (examples.code-editor/line-runs "(defn :ok 42 \"hi\" ; no" 0)
+         )))

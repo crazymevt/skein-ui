@@ -1,0 +1,119 @@
+(ns examples.files
+  "A file browser: a lazy folder tree beside a sortable table."
+  (:require [skein.ui :as ui]
+            [skein.io :as io]
+            [skein.string :as string]
+            [skein.system :as system]
+            [skein.time :as time]
+            [examples.registry :refer [define-example]]))
+
+(defn- hidden? [name] (string/starts-with? name "."))
+
+(defn subdirectories
+  "The folders in dir, but hidden ones, sorted without regard to case."
+  [dir]
+  (try
+    (->> (io/list-dir dir)
+         (remove hidden?)
+         (map (fn [n] (io/path dir n)))
+         (filter io/directory?)
+         (sort-by string/lower-case)
+         vec)
+    (catch error e [])))
+
+(defn- file-entry [path]
+  {:name (io/file-name path)
+   :size (try (io/file-size path) (catch error e nil))
+   :modified (try (io/modified-time path) (catch error e nil))
+   :kind (if-let [x (io/extension path)] (string/upper-case x) "—")
+   :path path})
+
+(defn files-in
+  "The files (not folders, not hidden) in dir, as entries."
+  [dir]
+  (try
+    (->> (io/list-dir dir)
+         (remove hidden?)
+         (map (fn [n] (io/path dir n)))
+         (remove io/directory?)
+         (mapv file-entry))
+    (catch error e [])))
+
+(defn format-size [bytes]
+  (cond (nil? bytes) "—"
+        (< bytes 1024) (str bytes " B")
+        (< bytes (* 1024 1024)) (format "%.1f KB" (/ bytes 1024.0))
+        :else (format "%.1f MB" (/ bytes 1048576.0))))
+
+(defn format-date [millis]
+  (if millis
+    (let [{:keys [year month day hour minute]} (time/local-time millis)]
+      (format "%d-%02d-%02d %02d:%02d" year month day hour minute))
+    "—"))
+
+(defn- folder-name [dir]
+  (or (io/file-name dir) dir))
+
+(define-example files
+  {:title "File Browser"
+   :description "Browse folders. The tree asks for a folder's subfolders only when you open it,
+through its :children-fn. Selecting a folder fills the table, whose columns sort by name,
+size or date. Double-click a file to open it with its application, or choose another
+folder to start from. Refresh asks for the folders again, keeping the open ones open."
+   :topics [:tree-view :children-fn :item-label :icon-fn :table-view :column :paned
+            :choose-directory :open-url! :expand! :refresh-tree! :system-image]}
+  (let [folder-icon (or (ui/system-image "folder") (ui/glyph-image "▣" {:size 16}))
+        file-icon (or (ui/system-image "doc") (ui/system-image "text-x-generic")
+                      (ui/glyph-image "≡" {:size 16}))
+        root (or (system/home-dir) ".")
+        w (ui/window
+           {:title "Files" :width 760 :height 480}
+           (ui/vbox {:spacing 0}
+                    (ui/hbox {:spacing 8 :padding 10}
+                             (ui/label {:name :where :valign :center :hexpand true
+                                        :font {:weight :semibold}})
+                             (ui/button {:name :refresh :label "Refresh"})
+                             (ui/button {:name :choose :label "Choose Folder…"}))
+                    (ui/separator {})
+                    (ui/paned {:position 240 :vexpand true}
+                              (ui/tree-view {:name :tree :roots [root] :children-fn subdirectories
+                                             :item-label folder-name
+                                             :icon-fn (fn [_] folder-icon)})
+                              (ui/table-view {:name :table
+                                              :columns [(ui/column "Name" :name {:width 260
+                                                                                 :icon-fn (fn [_] file-icon)})
+                                                        (ui/column "Size" :size {:width 80 :alignment :right
+                                                                                 :format format-size})
+                                                        (ui/column "Kind" :kind {:width 70})
+                                                        (ui/column "Modified" :modified {:format format-date})]}))
+                    (ui/separator {})
+                    (ui/hbox {:padding 6}
+                             (ui/label {:name :status :text-color :secondary-text :font {:size 11}}))))
+        field (fn [k] (ui/find-widget w k))
+        tree (field :tree)
+        table (field :table)
+        show-directory! (fn [dir]
+                          (let [entries (vec (sort-by (fn [e] (string/lower-case (:name e))) (files-in dir)))]
+                            (set-slot! table :items entries)
+                            (set-slot! (field :where) :text dir)
+                            (set-slot! (field :status) :text
+                                       (str (count entries) (if (= 1 (count entries)) " file, " " files, ")
+                                            (format-size (reduce + 0 (keep :size entries)))))))
+        set-root! (fn [dir]
+                    (set-slot! tree :roots [dir])
+                    (ui/expand! tree dir)
+                    (set-slot! tree :selection [dir])
+                    (show-directory! dir))]
+    (ui/on tree :selection-changed (fn [e] (when (:value e) (show-directory! (:value e)))))
+    (ui/on table :row-activated (fn [e] (ui/open-url! (ui/file-url (:path (:item e))))))
+    (ui/on (field :refresh) :clicked
+           (fn [_]
+             (ui/refresh-tree! tree)
+             (show-directory! (or (first (:selection tree)) (first (:roots tree))))))
+    (ui/on (field :choose) :clicked
+           (fn [_]
+             (when-let [dir (ui/choose-directory {:title "Choose a folder to browse" :parent w})]
+               (set-root! dir))))
+    (ui/show! w)
+    (set-root! root)
+    w))

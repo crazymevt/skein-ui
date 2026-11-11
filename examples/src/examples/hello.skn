@@ -1,0 +1,27 @@
+(ns examples.hello
+  "The smallest skein-ui program."
+  (:require [skein.ui :as ui]
+            [skein.string :as string]
+            [examples.registry :refer [define-example]]))
+
+(define-example hello
+  {:title "Hello"
+   :description "A window with a label, a text field and a button. Type your name and press
+Return or click Greet. Shows building a window from constructors, finding widgets by name,
+and handlers."
+   :topics [:window :vbox :hbox :label :entry :button :on :find-widget :show!]}
+  (let [w (ui/window {:title "Hello"}
+                     (ui/vbox {:spacing 12 :padding 20}
+                              (ui/label {:text "Hello, skein-ui!" :font {:size 22 :weight :bold}})
+                              (ui/label {:text "What should I call you?" :text-color :secondary-text})
+                              (ui/hbox {:spacing 8}
+                                       (ui/entry {:name :name :placeholder "Your name" :hexpand true})
+                                       (ui/button {:name :greet :label "Greet" :default true}))
+                              (ui/label {:name :answer :text " "})))
+        greet (fn [_]
+                (let [n (string/trim (:text (ui/find-widget w :name)))]
+                  (set-slot! (ui/find-widget w :answer) :text
+                             (if (= n "") "Type a name first." (str "Nice to meet you, " n ".")))))]
+    (ui/on (ui/find-widget w :greet) :clicked greet)
+    (ui/on (ui/find-widget w :name) :activate greet)
+    (ui/show! w)))

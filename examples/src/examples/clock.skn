@@ -1,0 +1,93 @@
+(ns examples.clock
+  "A custom widget: a class of its own with its own size, drawing and signal."
+  (:require [skein.ui :as ui]
+            [skein.math :as math]
+            [skein.time :as time]
+            [examples.registry :refer [define-example]]))
+
+;; clock-face is a canvas that draws an analog clock, has a natural size, and emits :hour
+;; when the hour changes.
+
+(defclass clock-face [ui/canvas-widget]
+  "An analog clock."
+  (show-seconds :cell :atom :init true :doc "Whether to draw the second hand.")
+  (timer :cell :atom :init nil)
+  (last-hour :cell :atom :init nil)
+  (focusable :cell :atom :init false))
+
+(ui/declare-widget! clock-face {:signals {:hour ui/value-event}})
+
+(defmethod ui/measure [(c clock-face)]
+  [220 220])
+
+(defn- tick! [c]
+  (let [hour (:hour (time/local-time))]
+    (when (not= hour (:last-hour c))
+      (set-slot! c :last-hour hour)
+      (ui/emit! c (ui/event-for c :hour :value hour))))
+  (ui/redraw! c))
+
+(defmethod initialize :after [(c clock-face)]
+  (set-slot! c :timer (ui/every 0.25 (fn [] (when-not (:destroyed c) (tick! c)))))
+  (add-watch (cell c :show-seconds) ::redraw (fn [_ _ _ _] (ui/redraw! c))))
+
+(defmethod ui/destroy! :before [(c clock-face)]
+  (ui/stop-timer! (:timer c)))
+
+(defn- hand! [gc cx cy angle length width color]
+  (ui/draw-line! gc cx cy (+ cx (* length (math/sin angle))) (- cy (* length (math/cos angle)))
+                 {:color color :line-width width}))
+
+(defmethod ui/handle-event :after [(c clock-face) (e ui/draw-event)]
+  (let [gc (:context e)
+        w (:width e)
+        h (:height e)
+        cx (/ w 2)
+        cy (/ h 2)
+        r (- (/ (min w h) 2) 8)
+        {:keys [hour minute second]} (time/local-time)
+        pi math/pi]
+    (ui/set-line-style! gc {:cap :round})
+    ;; the face
+    (ui/fill-circle! gc cx cy r {:color :control-background})
+    (ui/stroke-circle! gc cx cy r {:color :separator :line-width 2})
+    ;; marks and numbers
+    (dotimes [i 60]
+      (let [a (* i (/ pi 30))
+            major (zero? (mod i 5))
+            inner (- r (if major 12 6))
+            outer (- r 3)]
+        (ui/draw-line! gc (+ cx (* inner (math/sin a))) (- cy (* inner (math/cos a)))
+                       (+ cx (* outer (math/sin a))) (- cy (* outer (math/cos a)))
+                       {:color (if major :text :secondary-text) :line-width (if major 2.5 1)})))
+    (doseq [n (range 1 13)]
+      (let [a (* n (/ pi 6))]
+        (ui/draw-text! gc (str n) (+ cx (* (- r 26) (math/sin a))) (- cy (* (- r 26) (math/cos a)))
+                       {:align :center :valign :center :color :text
+                        :font {:size (max 9 (int (/ r 9))) :weight :medium}})))
+    ;; the hands
+    (hand! gc cx cy (* (+ (mod hour 12) (/ minute 60)) (/ pi 6)) (* r 0.5) 6 :text)
+    (hand! gc cx cy (* (+ minute (/ second 60)) (/ pi 30)) (* r 0.75) 4 :text)
+    (when (:show-seconds c)
+      (hand! gc cx cy (* second (/ pi 30)) (* r 0.85) 1.5 :red)
+      (ui/fill-circle! gc cx cy 4 {:color :red}))
+    (ui/fill-circle! gc cx cy 2 {:color :control-background})))
+
+(define-example clock
+  {:title "Clock"
+   :description "A custom widget: clock-face is a subclass of canvas with its own natural size
+(a measure method), drawing (a handle-event method), a timer, and a signal of its own,
+:hour. It draws with system colors, so it follows light and dark mode. Resize the window
+and the clock scales."
+   :topics [:canvas-widget :measure :handle-event :draw-event :emit! :every :draw-line!
+            :fill-circle! :stroke-circle! :draw-text! :declare-widget!]}
+  (let [clock (ui/build clock-face {:name :clock
+                                    :on-hour (fn [e] (println "Hour" (:value e)))}
+                        nil)
+        w (ui/window {:title "Clock"}
+                     (ui/vbox {:spacing 8 :padding 12}
+                              clock
+                              (ui/check-box {:name :seconds :label "Second hand" :checked true
+                                             :halign :center
+                                             :on-toggled (fn [e] (set-slot! clock :show-seconds (:value e)))})))]
+    (ui/show! w)))

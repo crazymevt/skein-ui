@@ -1,0 +1,79 @@
+(ns examples.form
+  "A form laid out on a grid, read back when submitted."
+  (:require [skein.ui :as ui]
+            [skein.string :as string]
+            [skein.time :as time]
+            [examples.registry :refer [define-example]]))
+
+(defn- field-label [text]
+  (ui/label {:text text :halign :end :valign :center}))
+
+(define-example form
+  {:title "Sign Up Form"
+   :description "A form on a grid with :columns 2, so widgets fill it in reading order.
+Labels align right, fields stretch. The Sign Up button stays disabled until the required
+fields are filled, and submitting reads every field back and shows a summary."
+   :topics [:grid :entry :password-entry :combo-box :radio-button :check-box :date-picker
+            :spin-button :separator :message-box :enabled]}
+  (let [w (ui/window
+           {:title "Create an Account"}
+           (ui/vbox {:spacing 14 :padding 20}
+                    (ui/label {:text "Create your account" :font {:size 18 :weight :semibold}})
+                    (ui/grid {:columns 2 :column-spacing 10 :row-spacing 10}
+                             (field-label "Full name:")
+                             (ui/entry {:name :full-name :placeholder "Required" :hexpand true})
+                             (field-label "Email:")
+                             (ui/entry {:name :email :placeholder "name@example.com"})
+                             (field-label "Password:")
+                             (ui/password-entry {:name :password :placeholder "At least 8 characters"})
+                             (field-label "Country:")
+                             (ui/combo-box {:name :country :halign :start :selected-index 0
+                                            :items ["Canada" "France" "Germany" "Japan" "United Kingdom"
+                                                    "United States"]})
+                             (field-label "Born:")
+                             (ui/date-picker {:name :born :halign :start})
+                             (field-label "Plan:")
+                             (ui/hbox {:spacing 12}
+                                      (ui/radio-button {:name :free :label "Free" :checked true})
+                                      (ui/radio-button {:name :pro :label "Pro"})
+                                      (ui/radio-button {:name :team :label "Team"}))
+                             (field-label "Seats:")
+                             (ui/spin-button {:name :seats :value 1 :min 1 :max 500 :halign :start
+                                              :enabled false})
+                             (ui/label {:text ""})
+                             (ui/check-box {:name :news :label "Send me the newsletter"}))
+                    (ui/separator {})
+                    (ui/hbox {:spacing 8}
+                             (ui/label {:name :hint :text "Fill in your name, email and password."
+                                        :text-color :secondary-text :valign :center :hexpand true})
+                             (ui/button {:name :cancel :label "Cancel" :cancel true})
+                             (ui/button {:name :submit :label "Sign Up" :default true :enabled false}))))
+        field (fn [k] (ui/find-widget w k))
+        problem (fn []
+                  (cond (= "" (:text (field :full-name))) "Fill in your name, email and password."
+                        (not (string/includes? (:text (field :email)) "@")) "The email needs an @."
+                        (< (count (:text (field :password))) 8) "The password needs 8 characters or more."
+                        :else nil))
+        validate (fn [_]
+                   (let [p (problem)]
+                     (set-slot! (field :submit) :enabled (nil? p))
+                     (set-slot! (field :hint) :text (or p "Ready."))))]
+    (doseq [k [:full-name :email :password]] (ui/on (field k) :changed validate))
+    (doseq [k [:free :pro :team]]
+      (ui/on (field k) :toggled (fn [_] (set-slot! (field :seats) :enabled (:checked (field :team))))))
+    (ui/on (field :cancel) :clicked (fn [_] (ui/close! w)))
+    (ui/on (field :submit) :clicked
+           (fn [_]
+             (let [{:keys [year month day]} (time/local-time (:date (field :born)))
+                   team (:checked (field :team))]
+               (ui/message-box (str "Welcome, " (:text (field :full-name)) "!")
+                               {:detail (str "Email: " (:text (field :email))
+                                             "\nCountry: " (ui/selected-item (field :country))
+                                             "\nBorn: " (format "%d-%02d-%02d" year month day)
+                                             "\nPlan: " (:label (ui/radio-selection (field :free)))
+                                             (if team (str " (" (int (:value (field :seats))) " seats)") "")
+                                             "\nNewsletter: " (if (:checked (field :news)) "yes" "no"))
+                                :parent w}))))
+    (ui/show! w)
+    (ui/focus! (field :full-name))
+    w))

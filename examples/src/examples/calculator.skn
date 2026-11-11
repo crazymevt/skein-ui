@@ -1,0 +1,88 @@
+(ns examples.calculator
+  "A grid of buttons, with menu shortcuts for the keyboard."
+  (:require [skein.ui :as ui]
+            [skein.math :as math]
+            [skein.string :as string]
+            [examples.registry :refer [define-example]]))
+
+(defn format-number
+  "x as the calculator shows it: whole numbers without a point, others with up to ten
+places and no trailing zeros."
+  [x]
+  (cond (not (number? x)) "Error"
+        (and (== x (math/floor x)) (< (abs x) 1e15)) (str (int x))
+        :else (let [s (format "%.10f" (* 1.0 x))
+                    s (apply str (reverse (drop-while (fn [c] (= c \0)) (reverse s))))]
+                (if (string/ends-with? s ".") (subs s 0 (dec (count s))) s))))
+
+(defn- apply-op [op a b]
+  (case op
+    :add (+ a b) :subtract (- a b) :multiply (* a b)
+    :divide (if (zero? b) :error (/ a b))))
+
+(defgeneric press [calc key]
+  "The calculator's next state, {:display :accumulator :pending :fresh}, after key: a
+digit character, \\. or an operation keyword.")
+
+(defmethod press [calc (key char)]
+  (let [d (:display calc)]
+    (cond (:fresh calc) (assoc calc :display (if (= key \.) "0." (str key)) :fresh false)
+          (and (= key \.) (string/includes? d ".")) calc
+          (= d "0") (assoc calc :display (if (= key \.) "0." (str key)))
+          :else (assoc calc :display (str d key)))))
+
+(defmethod press [calc (op keyword)]
+  (let [x (or (parse-double (:display calc)) 0.0)]
+    (case op
+      :clear {:display "0" :accumulator nil :pending nil :fresh true}
+      :negate (assoc calc :display (format-number (- x)))
+      :percent (assoc calc :display (format-number (/ x 100)) :fresh true)
+      :backspace (if (:fresh calc)
+                   calc
+                   (let [d (:display calc)]
+                     (assoc calc :display (if (> (count d) 1) (subs d 0 (dec (count d))) "0"))))
+      (let [result (if (and (:pending calc) (:accumulator calc) (not (:fresh calc)))
+                     (apply-op (:pending calc) (:accumulator calc) x)
+                     x)]
+        {:display (if (= result :error) "Error" (format-number result))
+         :accumulator (when-not (= result :error) result)
+         :pending (when-not (= op :equals) op)
+         :fresh true}))))
+
+(def keys-spec
+  "The keypad: label, key, keyboard shortcut and column span."
+  [["C" :clear "Escape"] ["±" :negate nil] ["%" :percent "Shift+5"] ["÷" :divide "/"]
+   ["7" \7 "7"] ["8" \8 "8"] ["9" \9 "9"] ["×" :multiply "Shift+8"]
+   ["4" \4 "4"] ["5" \5 "5"] ["6" \6 "6"] ["−" :subtract "-"]
+   ["1" \1 "1"] ["2" \2 "2"] ["3" \3 "3"] ["+" :add "Shift+="]
+   ["0" \0 "0" 2] ["." \. "."] ["=" :equals "Return"]])
+
+(define-example calculator
+  {:title "Calculator"
+   :description "A four-function calculator: a grid of buttons with :columns 4, where the zero
+spans two columns. Its logic is a generic function, press, with methods on characters and
+keywords, giving each state from the last. Its Keys menu gives every button a keyboard
+shortcut, so you can type sums."
+   :topics [:grid :button :menu-item :shortcut :label :font :defgeneric]}
+  (let [calc (atom {:display "0" :accumulator nil :pending nil :fresh true})
+        screen (ui/label {:name :screen :text "0" :alignment :right :hexpand true
+                          :font {:size 36 :weight :light}})
+        pad (ui/grid {:columns 4 :column-spacing 6 :row-spacing 6 :column-homogeneous true
+                      :row-homogeneous true})
+        keys-menu (ui/menu {:title "Keys"})
+        do-press (fn [key]
+                   (swap! calc press key)
+                   (set-slot! screen :text (:display @calc)))]
+    (doseq [[label key shortcut span] keys-spec]
+      (ui/add! pad (ui/button {:name (keyword (str "key-" label)) :label label :height 34
+                               :default (= key :equals) :font {:size 16}
+                               :column-span (or span 1)
+                               :on-clicked (fn [_] (do-press key))}))
+      (when shortcut
+        (ui/add! keys-menu (ui/menu-item {:label label :shortcut shortcut
+                                          :on-activate (fn [_] (do-press key))}))))
+    (ui/add! keys-menu (ui/menu-item {:label "Delete" :shortcut "Backspace"
+                                      :on-activate (fn [_] (do-press :backspace))}))
+    (let [w (ui/window {:title "Calculator" :resizable false :menu-bar (ui/menu-bar {} keys-menu)}
+                       (ui/vbox {:spacing 10 :padding 14 :width 260} screen pad))]
+      (ui/show! w))))

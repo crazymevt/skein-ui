@@ -1,0 +1,103 @@
+(ns examples.paint
+  "Drawing with the mouse on a canvas."
+  (:require [skein.ui :as ui]
+            [examples.registry :refer [define-example]]))
+
+(defclass paint-canvas [ui/canvas-widget]
+  "A canvas that keeps the strokes drawn on it, and draws them all again."
+  (strokes :cell :atom :init [] :doc "The strokes, oldest first: {:tool :color :width :points}.")
+  (drawing :cell :atom :init false :doc "Whether a stroke is being drawn.")
+  (tool :cell :atom :init :pen)
+  (brush-color :cell :atom :init (ui/rgb255 38 110 220))
+  (brush-width :cell :atom :init 4)
+  (background :cell :atom :init :white)
+  (width :cell :atom :init 520)
+  (height :cell :atom :init 360))
+
+(defn- update-last [v f] (conj (pop v) (f (peek v))))
+
+;; Input arrives as events: a subclass handles them in methods on handle-event instead of
+;; connecting handlers.
+
+(defmethod ui/handle-event :after [(c paint-canvas) (e ui/mouse-event)]
+  (let [p [(:x e) (:y e)]]
+    (case (:signal e)
+      :mouse-down
+      (do (update-slot! c :strokes conj {:tool (if (ui/modifier-down? e :shift) :line (:tool c))
+                                         :color (:brush-color c) :width (:brush-width c)
+                                         :points [p]})
+          (set-slot! c :drawing true)
+          (ui/redraw! c))
+      :mouse-drag
+      (when (:drawing c)
+        (update-slot! c :strokes update-last
+                      (fn [s] (if (= :pen (:tool s))
+                                (update s :points conj p)
+                                (assoc s :points [(first (:points s)) p]))))
+        (ui/redraw! c))
+      :mouse-up (set-slot! c :drawing false)
+      nil)))
+
+(defn- draw-stroke! [gc s]
+  (let [points (:points s)
+        [ax ay] (first points)
+        [bx by] (peek points)
+        opts {:color (:color s) :line-width (:width s)}]
+    (ui/set-line-style! gc {:cap :round :join :round})
+    (case (:tool s)
+      (:pen :line) (if (next points)
+                     (ui/draw-polyline! gc points opts)
+                     (ui/fill-circle! gc ax ay (/ (:width s) 2) opts))
+      :rectangle (ui/stroke-rectangle! gc (min ax bx) (min ay by) (abs (- bx ax)) (abs (- by ay)) opts)
+      :ellipse (ui/stroke-ellipse! gc (min ax bx) (min ay by) (abs (- bx ax)) (abs (- by ay)) opts))))
+
+(defmethod ui/handle-event :after [(c paint-canvas) (e ui/draw-event)]
+  (let [gc (:context e)]
+    (doseq [s (:strokes c)] (draw-stroke! gc s))
+    (when (empty? (:strokes c))
+      (ui/draw-text! gc "Drag to draw. Hold Shift for a straight line."
+                     (/ (:width e) 2) (/ (:height e) 2)
+                     {:align :center :valign :center :color :gray :font {:size 15}}))))
+
+(define-example paint
+  {:title "Paint"
+   :description "Draw with the mouse. The canvas is a subclass of canvas that keeps its strokes
+and handles mouse and draw events in methods on handle-event. A tool bar of radio buttons,
+a color button and a slider sets the brush; Undo and Clear change the drawing, and the
+context menu offers the same."
+   :topics [:canvas-widget :handle-event :mouse-event :draw-event :redraw! :draw-polyline!
+            :stroke-rectangle! :stroke-ellipse! :set-line-style! :draw-text! :color-button
+            :slider :context-menu :modifier-down?]}
+  (let [canvas (ui/build paint-canvas {:name :canvas} nil)
+        width-label (ui/label {:text "4 px" :width 40 :valign :center})
+        undo! (fn [] (update-slot! canvas :strokes (fn [s] (if (seq s) (pop s) s))) (ui/redraw! canvas))
+        clear! (fn [] (set-slot! canvas :strokes []) (ui/redraw! canvas))
+        tool-button (fn [label tool checked]
+                      (ui/radio-button {:name tool :label label :checked checked :group :tool
+                                        :on-toggled (fn [e] (when (:value e) (set-slot! canvas :tool tool)))}))]
+    (set-slot! canvas :context-menu
+               (ui/menu {}
+                        (ui/menu-item {:label "Undo" :on-activate (fn [_] (undo!))})
+                        (ui/menu-item {:label "Clear" :on-activate (fn [_] (clear!))})))
+    (let [w (ui/window
+             {:title "Paint"}
+             (ui/vbox {:spacing 0}
+                      (ui/hbox {:spacing 12 :padding 10}
+                               (tool-button "Pen" :pen true)
+                               (tool-button "Line" :line false)
+                               (tool-button "Rectangle" :rectangle false)
+                               (tool-button "Ellipse" :ellipse false)
+                               (ui/separator {:orientation :vertical})
+                               (ui/color-button {:color (:brush-color canvas) :valign :center
+                                                 :on-changed (fn [e] (set-slot! canvas :brush-color (:value e)))})
+                               (ui/slider {:min 1 :max 30 :value 4 :width 110 :valign :center
+                                           :on-changed (fn [e]
+                                                         (set-slot! canvas :brush-width (int (+ 0.5 (:value e))))
+                                                         (set-slot! width-label :text (str (int (+ 0.5 (:value e))) " px")))})
+                               width-label
+                               (ui/spacer {})
+                               (ui/button {:name :undo :label "Undo" :on-clicked (fn [_] (undo!))})
+                               (ui/button {:name :clear :label "Clear" :on-clicked (fn [_] (clear!))}))
+                      (ui/separator {})
+                      canvas))]
+      (ui/show! w))))

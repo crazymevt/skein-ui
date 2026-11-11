@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-skein-demo'">
+<title>skein-ui Web View</title>
+<style>
+:root { color-scheme: light dark; font: 16px system-ui; }
+body { margin: 0; padding: 36px; background: light-dark(#f4f6fa,#18212d); }
+h1 { font-size: 32px; margin: 0 0 10px; } p { line-height: 1.6; }
+.card { padding: 24px; border: 1px solid #7b8ca050; border-radius: 14px; background: light-dark(white,#223043); }
+button { font: inherit; border: 0; padding: 10px 18px; border-radius: 8px; background: #3768df; color: white; cursor: pointer; }
+#messages { margin: 20px 0; padding-left: 20px; } a { color: light-dark(#2558ce,#a5c3ff); }
+</style></head><body>
+<h1>Web content, native window</h1>
+<p>A local page with an engine-independent message bridge.</p>
+<div class="card"><button id="send">Send to Skein</button>
+<ul id="messages"><li>Waiting for a message from Skein.</li></ul>
+<p>Select this text and use the native Copy menu.</p>
+<a href="https://github.com/crazymevt/skein">Open Skein in your browser ↗</a></div>
+<script nonce="skein-demo">
+document.getElementById('send').addEventListener('click', () => window.skein.postMessage({text:'Hello from the page'}));
+window.addEventListener('message', e => {
+  if (e.origin !== 'skein') return;
+  const item = document.createElement('li');
+  item.textContent = e.data.text;
+  document.getElementById('messages').appendChild(item);
+  window.skein.postMessage({received:e.data});
+});
+window.skein.postMessage({ready:true});
+</script></body></html>

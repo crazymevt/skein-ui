@@ -1,0 +1,67 @@
+(ns examples.dialogs
+  "The standard dialogs, and a dialog of the program's own that checks its input."
+  (:require [skein.ui :as ui]
+            [skein.string :as string]
+            [examples.registry :refer [define-example]]))
+
+(defn rename-dialog
+  "Ask for a new name in a dialog of our own; its Rename button is refused (by vetoing
+:response) while the name is empty or unchanged. Returns the new name, or nil."
+  [old-name]
+  (let [field (ui/entry {:text old-name :width-chars 28})
+        problem (ui/label {:text " " :text-color :red :font {:size 11}})
+        d (ui/dialog {:title "Rename" :buttons [:cancel ["Rename" :ok]]}
+                     (ui/label {:text "New name:" :font {:weight :bold}})
+                     field
+                     problem)]
+    (ui/on d :response
+           (fn [e]
+             (when (= :ok (:value e))
+               (let [n (string/trim (:text field))]
+                 (cond (= n "") (do (set-slot! problem :text "The name can't be empty.") (ui/veto e))
+                       (= n old-name) (do (set-slot! problem :text "That's the same name.") (ui/veto e))
+                       :else nil)))))
+    (ui/focus! field)
+    (when (= :ok (ui/run-dialog d))
+      (string/trim (:text field)))))
+
+(define-example dialogs
+  {:title "Dialogs"
+   :description "Each button opens one of the platform's standard dialogs: alerts of each type,
+a yes/no question, a text prompt, the file and folder choosers, and the About box. Rename
+opens a dialog of the program's own that refuses invalid input by vetoing its :response."
+   :topics [:message-box :confirm :prompt-text :choose-file :choose-directory :show-about
+            :dialog :run-dialog :respond! :veto]}
+  (let [result (ui/label {:name :result :text "Results appear here." :text-color :secondary-text
+                          :wrap true :width 360})
+        window (atom nil)
+        show-result! (fn [& parts] (set-slot! result :text (apply str parts)))
+        row (fn [title & buttons]
+              (apply ui/hbox {:spacing 8}
+                     (ui/label {:text title :width 90 :valign :center :halign :end :alignment :right})
+                     buttons))
+        b (fn [label f] (ui/button {:name (keyword label) :label label :on-clicked (fn [_] (f))}))
+        w (ui/window
+           {:title "Dialogs"}
+           (ui/vbox {:spacing 10 :padding 18}
+                    (row "Alerts:"
+                         (b "Info" (fn [] (show-result! "Clicked " (pr-str (ui/message-box "The file was saved." {:detail "Everything went fine." :parent @window})) ".")))
+                         (b "Warning" (fn [] (show-result! "Clicked " (pr-str (ui/message-box "The disk is nearly full." {:type :warning :buttons :ok-cancel :parent @window})) ".")))
+                         (b "Error" (fn [] (show-result! "Clicked " (pr-str (ui/message-box "The file couldn't be read." {:detail "It may have been moved." :type :error :parent @window})) "."))))
+                    (row "Questions:"
+                         (b "Yes or No" (fn [] (show-result! "Answered " (if (ui/confirm "Delete this item?" {:detail "You can't undo this." :yes "Delete" :no "Keep" :parent @window}) "yes" "no") ".")))
+                         (b "Save Changes" (fn [] (show-result! "Clicked " (pr-str (ui/message-box "Save changes to “Notes”?" {:type :warning :buttons :save-discard-cancel :parent @window})) ".")))
+                         (b "Prompt" (fn [] (show-result! "Typed " (pr-str (ui/prompt-text "What's your name?" {:default "Ada" :parent @window})) "."))))
+                    (row "Files:"
+                         (b "Open…" (fn [] (show-result! "Chose " (pr-str (ui/choose-file {:parent @window :multiple true :filters [["Skein" "skn"]]})) ".")))
+                         (b "Save…" (fn [] (show-result! "Chose " (pr-str (ui/choose-file {:mode :save :name "Untitled.txt" :parent @window})) ".")))
+                         (b "Folder…" (fn [] (show-result! "Chose " (pr-str (ui/choose-directory {:parent @window})) "."))))
+                    (row "Custom:"
+                         (b "Rename…" (fn [] (show-result! "New name: " (pr-str (rename-dialog "Report.txt")) ".")))
+                         (b "About" (fn [] (ui/show-about {:name "skein-ui Dialogs" :version "1.0"
+                                                          :copyright "A skein-ui example."
+                                                          :comments "Native dialogs from Skein."}))))
+                    (ui/separator {})
+                    result))]
+    (reset! window w)
+    (ui/show! w)))

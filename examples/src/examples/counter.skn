@@ -1,0 +1,62 @@
+(ns examples.counter
+  "Windows as classes, reacting to changes of their own state."
+  (:require [skein.ui :as ui]
+            [examples.registry :refer [define-example]]))
+
+;; A window subclass keeps its state in a slot and builds its contents when made. Its
+;; buttons call generic functions on it, so a subclass can change what they do.
+
+(defclass counter-window [ui/window-widget]
+  "A window that counts."
+  (current :cell :atom :init 0 :doc "The count.")
+  (display :cell :atom :init nil)
+  (title :cell :atom :init "Counter")
+  (resizable :cell :atom :init false))
+
+(defgeneric step-counter! [w delta]
+  "Count delta more.")
+
+(defmethod step-counter! [(w counter-window) delta]
+  (update-slot! w :current + delta))
+
+(defgeneric reset-counter! [w]
+  "Count from 0 again.")
+
+(defmethod reset-counter! [(w counter-window)]
+  (set-slot! w :current 0))
+
+(defmethod initialize :after [(w counter-window)]
+  (let [display (ui/label {:text "0" :alignment :center :halign :center
+                           :font {:family :monospace :size 48 :weight :light}})]
+    (set-slot! w :display display)
+    (ui/set-content! w (ui/vbox {:spacing 16 :padding 24}
+                                display
+                                (ui/hbox {:spacing 8 :homogeneous true}
+                                         (ui/button {:label "−" :on-clicked (fn [_] (step-counter! w -1))})
+                                         (ui/button {:label "Reset" :on-clicked (fn [_] (reset-counter! w))})
+                                         (ui/button {:label "+" :default true
+                                                     :on-clicked (fn [_] (step-counter! w 1))}))))
+    ;; Whatever changes the count, the display follows.
+    (add-watch (cell w :current) ::display
+               (fn [_ _ _ value]
+                 (set-slot! display :text (str value))
+                 (set-slot! display :text-color (when (neg? value) :red))))))
+
+;; A subclass that counts in tens, by a method on the same generic function.
+(defclass big-counter-window [counter-window]
+  "A counter that counts in tens."
+  (title :cell :atom :init "Big Counter"))
+
+(defmethod step-counter! [(w big-counter-window) delta]
+  (update-slot! w :current + (* 10 delta)))
+
+(define-example counter
+  {:title "Counter"
+   :description "Two windows defined as classes. The counter keeps its count in a cell slot,
+and a watch on it updates the display; a subclass counts in tens by specializing one generic
+function."
+   :topics [:window-widget :set-content! :label :button :text-color :defclass :defgeneric]}
+  (let [a (ui/build counter-window {:position [320 240]} nil)
+        b (ui/build big-counter-window {:position [600 240]} nil)]
+    (ui/show! b)
+    (ui/show! a)))

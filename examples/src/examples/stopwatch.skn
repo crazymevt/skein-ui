@@ -1,0 +1,101 @@
+(ns examples.stopwatch
+  "Timers, laps, and work on another fiber."
+  (:require [skein.ui :as ui]
+            [skein.math :as math]
+            [skein.time :as time]
+            [examples.registry :refer [define-example]]))
+
+(defn format-time
+  "seconds as minutes and seconds to the hundredth: 01:02.35."
+  [seconds]
+  (let [m (int (/ seconds 60))
+        s (- seconds (* 60 m))]
+    (format "%02d:%05.2f" m (* 1.0 s))))
+
+(defn count-primes
+  "How many primes are below limit (a sieve), calling (progress fraction) as it goes."
+  [limit progress]
+  (let [sieve (make-array u8 limit)]
+    (loop [i 2 n 0]
+      (if (>= i limit)
+        n
+        (do (when (zero? (mod i 100000)) (progress (/ i limit)))
+            (if (zero? (aget sieve i))
+              (do (loop [j (* i i)] (when (< j limit) (aset! sieve j 1) (recur (+ j i))))
+                  (recur (inc i) (inc n)))
+              (recur (inc i) n)))))))
+
+(define-example stopwatch
+  {:title "Stopwatch"
+   :description "A stopwatch driven by a timer ticking 30 times a second, with laps in a table.
+The Count Primes button runs a long computation on another fiber, which changes the
+progress bar as it goes: skein-ui hands those changes to the UI thread, so the window
+stays responsive."
+   :topics [:every :stop-timer! :start-timer! :table-view :column :progress-bar :future]}
+  (let [elapsed (atom 0.0)
+        started (atom nil)
+        laps (atom [])
+        display (ui/label {:name :display :text (format-time 0) :halign :center
+                           :font {:family :monospace :size 44 :weight :light}})
+        w (ui/window {:title "Stopwatch" :width 360}
+                     (ui/vbox {:spacing 12 :padding 16}
+                              display
+                              (ui/hbox {:spacing 8 :homogeneous true}
+                                       (ui/button {:name :start :label "Start" :default true})
+                                       (ui/button {:name :lap :label "Lap" :enabled false})
+                                       (ui/button {:name :reset :label "Reset"}))
+                              (ui/table-view {:name :laps :height 150 :sortable false
+                                              :columns [(ui/column "Lap" :lap {:width 50})
+                                                        (ui/column "Time" :time {:alignment :right
+                                                                                 :format format-time})
+                                                        (ui/column "Total" :total {:alignment :right
+                                                                                   :format format-time})]})
+                              (ui/separator {})
+                              (ui/hbox {:spacing 8}
+                                       (ui/button {:name :primes :label "Count Primes"})
+                                       (ui/progress-bar {:name :progress :hexpand true :valign :center}))
+                              (ui/label {:name :primes-result
+                                         :text "Counts the primes below 3,000,000 on another fiber."
+                                         :text-color :secondary-text})))
+        field (fn [k] (ui/find-widget w k))
+        current (fn [] (+ @elapsed (if @started (- (time/now) @started) 0)))
+        timer (ui/every (/ 1 30) (fn [] (set-slot! display :text (format-time (current)))))]
+    (ui/stop-timer! timer)
+    (ui/on (field :start) :clicked
+           (fn [_]
+             (if @started
+               (do (reset! elapsed (current))
+                   (reset! started nil)
+                   (ui/stop-timer! timer)
+                   (set-slot! (field :start) :label "Start")
+                   (set-slot! (field :lap) :enabled false))
+               (do (reset! started (time/now))
+                   (ui/start-timer! timer)
+                   (set-slot! (field :start) :label "Stop")
+                   (set-slot! (field :lap) :enabled true)))))
+    (ui/on (field :lap) :clicked
+           (fn [_]
+             (let [total (current)
+                   previous (if (seq @laps) (:total (first @laps)) 0)]
+               (swap! laps (fn [ls] (into [{:lap (inc (count ls)) :time (- total previous) :total total}] ls)))
+               (set-slot! (field :laps) :items @laps))))
+    (ui/on (field :reset) :clicked
+           (fn [_]
+             (reset! elapsed 0.0)
+             (reset! laps [])
+             (set-slot! (field :laps) :items [])
+             (set-slot! display :text (format-time 0))
+             (when @started (reset! started (time/now)))))
+    (ui/on w :closed (fn [_] (ui/stop-timer! timer)))
+    ;; Work on another fiber: its changes to widgets are handed to the UI thread.
+    (ui/on (field :primes) :clicked
+           (fn [_]
+             (set-slot! (field :primes) :enabled false)
+             (set-slot! (field :primes-result) :text "Counting…")
+             (future
+               (let [limit 3000000
+                     n (count-primes limit (fn [f] (set-slot! (field :progress) :value f)))]
+                 (set-slot! (field :progress) :value 1)
+                 (set-slot! (field :primes-result) :text (format "There are %,d primes below %,d." n limit))
+                 (set-slot! (field :primes) :enabled true)))))
+    (ui/show! w)))

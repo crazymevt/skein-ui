@@ -1,0 +1,40 @@
+(ns examples.registry
+  "The examples: each is a function that makes and shows its windows and returns the main
+one. define-example registers one; the launcher lists them; run-example runs one alone."
+  (:require [skein.ui :as ui]))
+
+(def examples
+  "The examples, in the order they were defined: {:name :title :description :topics :run}."
+  (atom []))
+
+(defn register-example!
+  "Add the example, replacing one of the same name. Returns its name."
+  [example]
+  (swap! examples (fn [es] (conj (filterv (fn [e] (not= (:name e) (:name example))) es) example)))
+  (:name example))
+
+(defmacro define-example
+  "Define the example name: main, a function in the current namespace, runs body, which
+makes and shows the example's windows and returns the main one. info is a map of :title,
+:description and :topics (the skein-ui functions it shows)."
+  [example-name info & body]
+  `(do (defn ~'main
+         ~(str "Run the " example-name " example: make and show its windows.")
+         [] ~@body)
+       (register-example! (assoc ~info :name ~(keyword (str example-name)) :run ~'main))))
+
+(defn find-example
+  "The example called name (a keyword or string), or nil."
+  [name]
+  (first (filter (fn [e] (= (str (:name e)) (str (keyword name)))) @examples)))
+
+(defn run-example
+  "Run the example called name until its windows close."
+  [name]
+  (let [e (or (find-example name)
+              (error (str "no example " (pr-str name) "; the examples are: "
+                          (apply str (interpose ", " (map (fn [e] (subs (str (:name e)) 1))
+                                                          @examples))))))]
+    (set-slot! ui/app :name (:title e))
+    ((:run e))
+    (ui/run!)))

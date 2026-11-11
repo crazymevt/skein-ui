@@ -1,0 +1,79 @@
+(ns examples.todo
+  "A to-do list: a list box of values, kept in step with a model."
+  (:require [skein.ui :as ui]
+            [skein.string :as string]
+            [examples.registry :refer [define-example]]))
+
+(defn- task-label [task]
+  (str (if (:done task) "✓" "○") "  " (:title task)))
+
+(define-example todo
+  {:title "To-Do List"
+   :description "A to-do list. The list box shows task maps, with :item-label for their text.
+Add tasks with the entry, double-click one (or click Done) to mark it, and remove the
+selected ones. Buttons enable and disable themselves as the selection changes, and the
+Tasks menu has keyboard shortcuts."
+   :topics [:list-box :items :selected-items :selection-mode :entry :button :enabled
+            :menu-bar :menu-item]}
+  (let [next-id (atom 3)
+        tasks (atom [{:id 0 :title "Read the skein-ui manual" :done true}
+                     {:id 1 :title "Try the examples" :done false}
+                     {:id 2 :title "Write a program" :done false}])
+        w (ui/window {:title "To-Do" :width 380 :height 360}
+                     (ui/vbox {:spacing 10 :padding 14}
+                              (ui/hbox {:spacing 8}
+                                       (ui/entry {:name :new :placeholder "What needs doing?" :hexpand true})
+                                       (ui/button {:name :add :label "Add" :default true :enabled false}))
+                              (ui/list-box {:name :list :selection-mode :multiple :item-label task-label})
+                              (ui/hbox {:spacing 8}
+                                       (ui/label {:name :count :valign :center :text-color :secondary-text
+                                                  :hexpand true})
+                                       (ui/button {:name :done :label "Done" :enabled false})
+                                       (ui/button {:name :remove :label "Remove" :enabled false}))))
+        field (fn [k] (ui/find-widget w k))
+        list (field :list)
+        update-buttons (fn [_]
+                         (let [any (seq (:selected-indices list))]
+                           (set-slot! (field :done) :enabled (boolean any))
+                           (set-slot! (field :remove) :enabled (boolean any))))
+        refresh! (fn [selected]
+                   (set-slot! list :items @tasks)
+                   (set-slot! list :selected-indices selected)
+                   (update-buttons nil)
+                   (set-slot! (field :count) :text
+                              (format "%d of %d done" (count (filter :done @tasks)) (count @tasks))))
+        add-task (fn [_]
+                   (let [title (string/trim (:text (field :new)))]
+                     (when (pos? (count title))
+                       (swap! tasks conj {:id (swap! next-id inc) :title title :done false})
+                       (set-slot! (field :new) :text "")
+                       (set-slot! (field :add) :enabled false)
+                       (refresh! [(dec (count @tasks))]))))
+        toggle (fn [ids]
+                 (let [keep (:selected-indices list)]
+                   (swap! tasks (fn [ts] (mapv (fn [t] (if (contains? ids (:id t)) (update t :done not) t)) ts)))
+                   (refresh! keep)))
+        selected-ids (fn [] (set (map :id (ui/selected-items list))))
+        remove-selected (fn [_]
+                          (let [gone (selected-ids)]
+                            (swap! tasks (fn [ts] (filterv (fn [t] (not (contains? gone (:id t)))) ts)))
+                            (refresh! [])))]
+    (ui/on (field :new) :changed
+           (fn [e] (set-slot! (field :add) :enabled (pos? (count (string/trim (:value e)))))))
+    (ui/on (field :new) :activate add-task)
+    (ui/on (field :add) :clicked add-task)
+    (ui/on list :selection-changed update-buttons)
+    (ui/on list :row-activated (fn [e] (toggle #{(:id (:item e))})))
+    (ui/on (field :done) :clicked (fn [_] (toggle (selected-ids))))
+    (ui/on (field :remove) :clicked remove-selected)
+    (set-slot! w :menu-bar
+               (ui/menu-bar {}
+                            (ui/menu {:title "Tasks"}
+                                     (ui/menu-item {:label "Mark Done" :shortcut "Primary+D"
+                                                    :on-activate (fn [_] (toggle (selected-ids)))})
+                                     (ui/menu-item {:label "Remove" :shortcut "Primary+Backspace"
+                                                    :on-activate remove-selected}))))
+    (refresh! [])
+    (ui/show! w)
+    (ui/focus! (field :new))
+    w))

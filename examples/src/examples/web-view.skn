@@ -1,0 +1,35 @@
+(ns examples.web-view
+  "A local web page with a trusted message bridge."
+  (:require [skein.ui :as ui]
+            [skein.io :as io]
+            [examples.registry :refer [define-example]]))
+
+(define-example web-view
+  {:title "Web View"
+   :description "A local HTML page exchanges messages with Skein. Links open in the system
+browser. The platform's engine loads the first time a web view is made."
+   :topics [:web-view :run-script! :post-message! :web-engine :local-messages
+            :web-navigation-event]}
+  (let [view (ui/web-view {:name :view :url (io/absolute-path "assets/web-view.html")
+                           :local-messages true :custom-context-menu true})
+        status (ui/label {:name :status :text "Loading local HTML…"})
+        send (ui/button {:name :send :label "Send from Skein"})
+        w (ui/window {:title "Web View" :width 760 :height 540}
+                     (ui/vbox {:padding 12 :spacing 10}
+                              (ui/hbox {} status (ui/spacer {:hexpand true}) send)
+                              view))]
+    (ui/on view :loaded (fn [_] (set-slot! status :text (str (name (ui/web-engine view)) " engine · ready"))))
+    (ui/on view :message (fn [e] (set-slot! status :text (str "Page → Skein: " (:value e)))))
+    (ui/on view :load-error (fn [e] (set-slot! status :text (str (:value e)))))
+    (ui/on view :navigation-request
+           (fn [e]
+             (when (and (= :link (:kind e)) (ui/web-origin (:url e)))
+               (ui/veto e)
+               (ui/open-url! (:url e)))))
+    (set-slot! view :context-menu
+               (ui/menu {}
+                        (ui/menu-item {:label "Copy" :role :copy})
+                        (ui/menu-item {:label "Select All" :role :select-all})))
+    (ui/on send :clicked (fn [_] (when (ui/web-view-ready? view)
+                                   (ui/post-message! view "{\"text\":\"Hello from Skein\"}"))))
+    (ui/show! w)))

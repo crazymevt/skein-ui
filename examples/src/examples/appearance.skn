@@ -1,0 +1,110 @@
+(ns examples.appearance
+  "Native surfaces, local color overrides and live appearances."
+  (:require [skein.ui :as ui]
+            [skein.string :as string]
+            [examples.registry :refer [define-example]]))
+
+(def ^:private icons
+  "The system images the example's windows share, by name."
+  (atom {}))
+
+(defn- icon [name]
+  (or (get @icons name)
+      (let [i (or (ui/system-image name) (ui/glyph-image "•" {:size 16}))]
+        (swap! icons assoc name i)
+        i)))
+
+(defclass semantic-swatch [ui/canvas-widget]
+  "A canvas drawn with semantic colors, which follow its appearance."
+  (height :cell :atom :init 90)
+  (background :cell :atom :init :content-background))
+
+(defmethod ui/handle-event :after [(v semantic-swatch) (e ui/draw-event)]
+  (let [gc (:context e)]
+    (ui/draw-text! gc (str "Custom drawing · " (name (ui/effective-appearance v)) " appearance")
+                   12 12 {:color :text})
+    (doseq [[i color] (map-indexed vector [:accent :text :secondary-text :separator])]
+      (ui/fill-rectangle! gc (+ 12 (* i 54)) 42 42 20 {:color color :radius 4}))))
+
+(defn make-appearance-window
+  "A window to try appearances and surfaces in, :system, :light or :dark."
+  ([] (make-appearance-window :system))
+  ([appearance]
+   (let [w (ui/window {:title "Appearance and Surfaces" :appearance appearance :width 860 :height 560})
+         card (ui/vbox {:name :card :surface :content :spacing 10 :padding 16}
+                       (ui/label {:text "Native surface or custom color" :font {:weight :bold}})
+                       (ui/label {:text "This card starts with a native content material. A color override can be cleared to restore it."
+                                  :wrap true :width 350})
+                       (ui/entry {:placeholder "Native input · small control size" :control-size :small})
+                       (ui/hbox {:spacing 8}
+                                (ui/button {:label "Regular"})
+                                (ui/button {:label "Small" :control-size :small})
+                                (ui/button {:label "Mini" :control-size :mini})))
+         status (ui/label {:name :status :text "" :text-color :secondary-text :control-size :small})
+         choices [:system :light :dark]
+         choice (ui/combo-box {:name :choice :items choices
+                               :item-label (fn [a] (string/capitalize (name a)))
+                               :selected-index (index-of choices appearance) :control-size :small
+                               :on-changed (fn [e] (set-slot! w :appearance (:value e)))})
+         rail (ui/vbox {:surface :activity :width 48 :spacing 10 :padding 6})
+         sidebar (ui/vbox {:surface :sidebar :width 176 :spacing 10 :padding 12}
+                          (ui/label {:text "Workspace" :font {:weight :bold}})
+                          (ui/search-entry {:placeholder "Search" :width-chars 12 :control-size :small})
+                          (ui/button {:label "Overview" :style :flat})
+                          (ui/button {:label "Documents" :style :flat})
+                          (ui/button {:label "Settings" :style :flat})
+                          (ui/spacer {})
+                          (ui/label {:text "Native sidebar material" :text-color :secondary-text
+                                     :wrap true :width 140}))
+         report! (fn []
+                   (set-slot! status :text
+                              (str "Requested: " (name (:appearance w))
+                                   " · Effective: " (name (ui/effective-appearance w))
+                                   " · Background overrides stay explicit")))]
+     (doseq [[label symbol] [["Browse" "folder"] ["Search" "magnifyingglass"] ["Settings" "gearshape"]]]
+       (ui/add! rail (ui/button {:label label :image (icon symbol) :style :icon :tooltip label
+                                 :width 28 :height 28})))
+     (ui/add! rail (ui/spacer {}))
+     (ui/set-content!
+      w (ui/vbox {}
+                 (ui/hbox {:surface :toolbar :spacing 10 :padding [8 12]}
+                          (ui/label {:text "Native appearance" :font {:weight :bold}})
+                          (ui/spacer {})
+                          (ui/label {:text "Window:"})
+                          choice
+                          (ui/button {:name :second :label "Second window" :control-size :small
+                                      :on-clicked (fn [_] (make-appearance-window
+                                                           (if (ui/dark-mode? w) :light :dark)))}))
+                 (ui/hbox {:vexpand true}
+                          rail (ui/separator {:orientation :vertical})
+                          sidebar (ui/separator {:orientation :vertical})
+                          (ui/vbox {:surface :content :padding 18 :spacing 14 :hexpand true}
+                                   (ui/label {:text "Native controls on native surfaces"
+                                              :font {:size 18 :weight :bold}})
+                                   card
+                                   (ui/hbox {:spacing 8}
+                                            (ui/button {:name :custom :label "Use custom color" :control-size :small
+                                                        :on-clicked (fn [_]
+                                                                      (set-slot! card :background "#40305e")
+                                                                      (set-slot! card :appearance :dark))})
+                                            (ui/button {:name :restore :label "Restore native surface"
+                                                        :control-size :small
+                                                        :on-clicked (fn [_]
+                                                                      (set-slot! card :background nil)
+                                                                      (set-slot! card :appearance :inherit))}))
+                                   (ui/build semantic-swatch {:vexpand true} nil)))
+                 (ui/hbox {:surface :status :padding [6 12]} status)))
+     (ui/on w :appearance-changed (fn [_] (report!)))
+     (ui/show! w)
+     (report!)
+     w)))
+
+(define-example appearance
+  {:title "Appearance and Surfaces"
+   :description "Native sidebar, toolbar, activity and status surfaces. Switch a window between
+system, light and dark appearance, open another with an appearance of its own, override a
+container's color and clear it to restore the native surface. Compact and icon-only
+controls keep their behavior; custom drawing uses its view's colors."
+   :topics [:appearance :effective-appearance :surface :background :control-size :system-color
+            :dark-mode? :button :canvas-widget]}
+  (make-appearance-window))

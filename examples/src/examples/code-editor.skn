@@ -1,0 +1,173 @@
+(ns examples.code-editor
+  "A small Skein editor: syntax colors, line numbers, completion, two views of one buffer."
+  (:require [skein.ui :as ui]
+            [skein.io :as io]
+            [skein.string :as string]
+            [examples.registry :refer [define-example]]))
+
+;; A simple tokenizer, a line at a time: comments, strings, numbers, keywords, and the name
+;; after an open parenthesis, colored as a definer for the usual defining forms. A string
+;; running over several lines isn't followed.
+
+(def definers
+  "The forms whose names are colored as definers."
+  #{"ns" "def" "defn" "defn-" "defmacro" "defclass" "defmethod" "defgeneric" "define-example"
+    "let" "fn" "if" "when" "when-let" "if-let" "when-not" "cond" "case" "loop" "recur" "doseq"
+    "dotimes" "do" "try" "catch" "finally" "binding" "for"})
+
+(defn- symbol-char? [c]
+  (not (contains? #{\space \tab \( \) \[ \] \{ \} \" \; \' \` \,} c)))
+
+(defn- digit? [c] (<= 48 (int c) 57))
+
+(defn line-runs
+  "The styled runs of text, a line starting at offset in the buffer."
+  [text offset]
+  (let [cs (vec text)
+        n (count cs)
+        word-end (fn [i] (loop [j i] (if (and (< j n) (symbol-char? (cs j))) (recur (inc j)) j)))]
+    (loop [i 0 after-paren false runs []]
+      (if (>= i n)
+        runs
+        (let [c (cs i)
+              run (fn [s e style] [(+ offset s) (+ offset e) {:style style}])]
+          (cond
+            (= c \\) (recur (min n (+ i 2)) false runs)     ; a character, such as \( or \"
+            (= c \;) (conj runs (run i n :comment))
+            (= c \") (let [e (loop [j (inc i)]
+                               (cond (>= j n) n
+                                     (= (cs j) \\) (recur (+ j 2))
+                                     (= (cs j) \") (inc j)
+                                     :else (recur (inc j))))]
+                       (recur e false (conj runs (run i e :string))))
+            (contains? #{\( \[ \{} c) (recur (inc i) (= c \() runs)
+            (symbol-char? c)
+            (let [e (word-end i)
+                  word (apply str (subvec cs i e))
+                  runs (cond (= c \:) (conj runs (run i e :keyword))
+                             (and (every? (fn [ch] (or (digit? ch) (contains? #{\. \- \/} ch))) word)
+                                  (some digit? word))
+                             (conj runs (run i e :number))
+                             (and after-paren (contains? definers word)) (conj runs (run i e :definer))
+                             :else runs)]
+              (recur e false runs))
+            :else (recur (inc i) false runs)))))))
+
+(defn lines-runs
+  "The runs of the buffer's lines first to last."
+  [buffer first-line last-line]
+  (vec (mapcat (fn [l] (line-runs (ui/line-text buffer l) (ui/line-start buffer l)))
+               (range first-line (inc last-line)))))
+
+(def styles
+  "What each token looks like. A theme would change only this."
+  {:comment {:color :secondary-text :italic true}
+   :string {:color "#c2410c"}
+   :keyword {:color "#0e8a8a"}
+   :number {:color "#2563eb"}
+   :definer {:color "#a03ad6" :bold true}})
+
+;; The editor's view: Return keeps the indentation of the line above.
+
+(defclass skein-view [ui/code-view-widget]
+  "A code view for Skein: styled, with completion, keeping indentation on Return."
+  (completion :cell :atom :init nil)
+  (text-styles :cell :atom :init styles)
+  (font :cell :atom :init {:family :monospace :size 13 :weight :regular :italic false}))
+
+(defmethod ui/handle-event [(v skein-view) (e ui/key-event)]
+  (when-let [p (:completion v)] (ui/handle-completion-key p e))
+  (when (and (= :key-down (:signal e)) (= :return (:key e)) (not (ui/consumed? e))
+             (empty? (:modifiers e)))
+    (let [b (:buffer v)
+          line (ui/line-text b (ui/position-line b (:cursor v)))
+          indent (apply str (take-while (fn [c] (= c \space)) line))]
+      (ui/replace-selection! v (str "\n" indent))
+      (ui/consume! e)))
+  (call-next-method))
+
+(defn- completion-start [v]
+  (let [s (ui/code-text v)]
+    (loop [start (:cursor v)]
+      (if (and (pos? start) (symbol-char? (nth s (dec start)))) (recur (dec start)) start))))
+
+(defn- install-completion! [v w]
+  (let [popup (ui/completion-popup {:max-visible-rows 8 :item-detail (fn [_] "Skein")})
+        pending (atom nil)
+        accepting (atom false)
+        refresh! (fn []
+                   (reset! pending nil)
+                   (when (and (not (:destroyed v)) (identical? v (ui/focused-widget)))
+                     (let [start (completion-start v)
+                           prefix (subs (ui/code-text v) start (:cursor v))
+                           matches (when (>= (count prefix) 2)
+                                     (vec (sort (filter (fn [word] (and (> (count word) (count prefix))
+                                                                        (string/starts-with? word prefix)))
+                                                        definers))))]
+                       (ui/show-completion-popup! popup v {:items (or matches [])}))))]
+    (set-slot! v :completion popup)
+    ;; :changed comes during the edit, before the caret moves: look again on the next turn.
+    (ui/on v :changed (fn [_]
+                        (when-not @accepting
+                          (when-let [t @pending] (ui/stop-timer! t))
+                          (reset! pending (ui/after 0 refresh!)))))
+    (ui/on popup :accept (fn [e]
+                           (reset! accepting true)
+                           (try (ui/set-selection! v (completion-start v) (:cursor v))
+                                (ui/replace-selection! v (:value e))
+                                (finally (reset! accepting false)))))
+    (ui/on w :closed (fn [_]
+                       (when-let [t @pending] (ui/stop-timer! t))
+                       (ui/destroy! popup)))))
+
+(defn- recolor! [buffer views first-line last-line]
+  (let [runs (lines-runs buffer first-line last-line)
+        start (ui/line-start buffer first-line)
+        end (ui/line-end buffer last-line)]
+    (doseq [v views] (ui/replace-text-runs! v start end runs))))
+
+(define-example code-editor
+  {:title "Code Editor"
+   :description "A small Skein editor showing this example's own source. Two views, one above
+the other, show one buffer: edit in either, and each keeps its own caret, selection and
+scroll position. Completion suggestions appear after two letters; Up and Down and Return
+or Tab accept one, Escape dismisses them. A tokenizer colors the code, Return keeps the
+indentation, and the line numbers can be hidden."
+   :topics [:code-view :make-text-buffer :set-text-runs! :replace-text-runs! :text-styles
+            :line-numbers :position-line :line-text :handle-event :consume! :completion-popup
+            :show-completion-popup! :handle-completion-key]}
+  (let [buffer (ui/make-text-buffer {:text (io/read-file "src/examples/code-editor.skn")})
+        top (ui/build skein-view {:name :top :buffer buffer} nil)
+        bottom (ui/build skein-view {:name :bottom :buffer buffer} nil)
+        status (ui/label {:name :status :text "" :text-color :secondary-text})
+        w (ui/window {:title "Code Editor" :width 760 :height 620}
+                     (ui/vbox {}
+                              (ui/paned {:orientation :vertical :position 330 :vexpand true} top bottom)
+                              (ui/hbox {:padding [4 10] :spacing 12}
+                                       status (ui/spacer {})
+                                       (ui/check-box {:name :numbers :label "Line numbers" :checked true}))))
+        show-status! (fn [v]
+                       (let [p (:cursor v)
+                             line (ui/position-line buffer p)
+                             n (abs (- (:anchor v) p))]
+                         (set-slot! status :text
+                                    (str "Line " (inc line) ", column " (inc (ui/position-column buffer p))
+                                         " — " (ui/buffer-line-count buffer) " lines"
+                                         (if (pos? n) (str ", " n " selected") "")))))]
+    (doseq [v [top bottom]]
+      (install-completion! v w)
+      (ui/set-text-runs! v (lines-runs buffer 0 (dec (ui/buffer-line-count buffer))))
+      (ui/on v :selection-changed (fn [e] (show-status! (:source e)))))
+    ;; Color again the lines a change touched, in both views.
+    (ui/on buffer :changed
+           (fn [e]
+             (recolor! buffer [top bottom] (ui/position-line buffer (:start e))
+                       (ui/position-line buffer (:new-end e)))
+             (show-status! top)))
+    (ui/on (ui/find-widget w :numbers) :toggled
+           (fn [e] (doseq [v [top bottom]] (set-slot! v :line-numbers (:value e)))))
+    (ui/show! w)
+    (ui/scroll-to-position! bottom (ui/line-start buffer (min 60 (dec (ui/buffer-line-count buffer)))))
+    (ui/focus! top)
+    (show-status! top)
+    w))

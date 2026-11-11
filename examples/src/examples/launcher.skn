@@ -1,0 +1,63 @@
+(ns examples.launcher
+  "A window listing the examples, to run any of them; -main runs it, or one example by name."
+  (:require [skein.ui :as ui]
+            [skein.ui.cocoa :as cocoa]
+            [skein.ui.gtk :as gtk]
+            [skein.system :as system]
+            [skein.string :as string]
+            [examples.registry :as registry :refer [define-example]]
+            [examples.hello]
+            [examples.counter]
+            [examples.form]
+            [examples.todo]
+            [examples.calculator]
+            [examples.clock]
+            [examples.stopwatch]
+            [examples.dialogs]
+            [examples.files]
+            [examples.paint]
+            [examples.appearance]
+            [examples.web-view]
+            [examples.code-editor]))
+
+(define-example launcher
+  {:title "skein-ui Examples"
+   :description "Lists the examples. Select one to read about it, and double-click it or
+click Run to open it. The examples run in the same event loop as the launcher."
+   :topics [:list-box :item-label :paned :label :wrap]}
+  (let [examples (filterv (fn [e] (not= :launcher (:name e))) @registry/examples)
+        w (ui/window {:title "skein-ui Examples" :width 620 :height 380}
+                     (ui/paned {:position 200}
+                               (ui/list-box {:name :list :items examples :item-label :title
+                                             :selected-indices [0]})
+                               (ui/vbox {:spacing 10 :padding 18}
+                                        (ui/label {:name :title :font {:size 20 :weight :bold}})
+                                        (ui/label {:name :description :wrap true :width 340
+                                                   :valign :start})
+                                        (ui/spacer {})
+                                        (ui/hbox {:halign :end}
+                                                 (ui/button {:name :run :label "Run" :default true})))))
+        list (ui/find-widget w :list)
+        selected (fn [] (first (ui/selected-items list)))
+        describe (fn [_]
+                   (let [e (selected)]
+                     (set-slot! (ui/find-widget w :title) :text (if e (:title e) ""))
+                     (set-slot! (ui/find-widget w :description) :text
+                                (if e (string/replace (:description e) "\n" " ") ""))
+                     (set-slot! (ui/find-widget w :run) :enabled (some? e))))
+        run-selected (fn [_] (when-let [e (selected)] ((:run e))))]
+    (ui/on list :selection-changed describe)
+    (ui/on list :row-activated run-selected)
+    (ui/on (ui/find-widget w :run) :clicked run-selected)
+    (describe nil)
+    (ui/on w :closed (fn [_] (ui/quit!)))
+    (ui/show! w)))
+
+(defn -main
+  "Run the launcher, or the example named by the first argument (\"hello\", \"editor\"),
+with the platform's backend: Cocoa on macOS (GTK with --gtk), GTK elsewhere."
+  [& args]
+  (let [gtk? (or (some (fn [a] (= a "--gtk")) args) (not= :macos (system/os)))
+        names (remove (fn [a] (string/starts-with? a "--")) args)]
+    (ui/use-backend! (if gtk? (gtk/backend) (cocoa/backend)))
+    (registry/run-example (or (first names) "launcher"))))

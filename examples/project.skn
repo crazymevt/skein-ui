@@ -1,0 +1,9 @@
+;; skein-ui's examples, ports of LGT's: a program that uses skein-ui as any other would,
+;; from this checkout. From this folder: ../../skein/skein run src/examples/launcher.skn
+;; (the launcher), or with an example's name to run it alone.
+{:name "skein-ui-examples"
+ :version "0.1.0"
+ :main examples.launcher/-main
+ :paths ["src"]
+ :test-paths ["test"]
+ :deps {skein/ui {:local ".."}}}
