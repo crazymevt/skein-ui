@@ -3797,6 +3797,490 @@ returns true."
         true))))
 
 ;;; ------------------------------------------------------------------------------------
+;;; Surfaces: popovers and completion popups, shown beside a widget outside any window's
+;;; layout. A popover is the platform's (NSPopover, GtkPopover) and takes the keyboard
+;;; while it is open; a completion popup never does: the widget it is shown for keeps the
+;;; focus and hands it the keys it needs.
+
+(def ^:private open-surfaces
+  "The surfaces that are shown, the most recently shown first."
+  (atom []))
+
+(defclass surface-widget [bin-widget]
+  "A bin shown beside a widget, outside any window's layout: the superclass of popovers and
+completion popups. Its natural size is its content's plus :padding, and at least its :width
+and :height. close-surface! closes it; it can be shown again. It emits :closed (a
+value-event) with why: :accepted when a completion was accepted, :cancelled for Escape,
+:dismissed when the user clicked or went elsewhere, :closed when the program closed it."
+  (size :cell :atom :init nil :doc "Its content area's [width height], from its last layout.")
+  (padding :cell :atom :init 0
+           :doc "Space between its edge and its content: as a margin, a number, [vertical
+horizontal] or [top right bottom left].")
+  (owner :cell :atom :init nil :doc "The widget it is shown for, or nil when not shown.")
+  (anchor :cell :atom :init nil
+          :doc "Where in its owner it shows: [x y width height], a character position in a
+text view, or :caret.")
+  (shown :cell :atom :init false :doc "True while it is shown.")
+  (hooks :cell :atom :init [] :doc "[object signal id] of the handlers it connected while shown."))
+
+(declare-widget! surface-widget {:properties [:size] :layout [:padding]
+                                 :signals {:closed value-event}})
+
+(defmethod layout-root? [(s surface-widget)]
+  true)
+
+(defn- surface-natural-size [s]
+  (let [[top right bottom left] (sides (:padding s))
+        [w h] (if-let [c (content s)] (outer-size c) [0 0])]
+    [(max (+ w left right) (or (:width s) 0)) (max (+ h top bottom) (or (:height s) 0))]))
+
+(defmethod update-layout! [(s surface-widget)]
+  (let [[w h] (surface-natural-size s)]
+    (when (not= [w h] (:size s)) (set-slot! s :size [w h]))
+    (when-let [c (content s)]
+      (let [[top right bottom left] (sides (:padding s))]
+        (allocate-in-cell c left top (max 0 (- w left right)) (max 0 (- h top bottom)))))))
+
+(defn holders
+  "w and what holds it, nearest first: its containers, and for a popover or completion
+popup the widget it is shown for and that widget's. Appearances and palettes come down
+this chain."
+  [w]
+  (loop [o w out []]
+    (if (nil? o)
+      out
+      (recur (or (:parent o) (when (instance? surface-widget o) (:owner o))) (conj out o)))))
+
+(defn window-of
+  "The window w is in, through any popovers, or nil."
+  [w]
+  (first (filter (fn [o] (instance? window-widget o)) (holders w))))
+
+(defn- widget-rectangle [w]
+  (let [[_ _ width height] (or (:allocation w) [0 0 0 0])] [0 0 width height]))
+
+(defn- hook!
+  "Connect f to object's signal until the surface closes (first, before the handlers
+already connected, with first)."
+  [s object signal f first]
+  (when (and object (contains? (signals object) signal))
+    (let [id (if first
+               (let [id (swap! handler-ids inc)]
+                 (update-slot! object :handlers update signal
+                               (fn [hs] (into [[id f]] hs)))
+                 id)
+               (on object signal f))]
+      (update-slot! s :hooks conj [object signal id]))))
+
+(defn- surface-opened! [s owner anchor]
+  (set-slot! s :owner owner)
+  (set-slot! s :anchor anchor)
+  (set-slot! s :shown true)
+  (swap! open-surfaces (fn [ss] (into [s] (remove (fn [o] (identical? o s)) ss)))))
+
+(defn surface-closed!
+  "Backends call this when the surface closed by itself (a popover after a click outside
+it): it emits :closed with reason (:dismissed by default), once. True if it was shown."
+  ([s] (surface-closed! s :dismissed))
+  ([s reason]
+   (when (:shown s)
+     (doseq [[object signal id] (:hooks s)] (off object signal id))
+     (set-slot! s :hooks [])
+     (set-slot! s :owner nil)
+     (set-slot! s :shown false)
+     (swap! open-surfaces (fn [ss] (vec (remove (fn [o] (identical? o s)) ss))))
+     (emit! s (event-for s :closed :value reason))
+     true)))
+
+(defgeneric backend-show-popover [backend popover widget rectangle edge]
+  "Show the popover pointing at rectangle, [x y width height] in widget, on its edge
+(:bottom, :top, :left or :right); shown again, it moves.")
+
+(defgeneric backend-close-popover [backend popover]
+  "Close the popover; the core emits :closed.")
+
+(defgeneric backend-show-panel [backend popup widget anchor]
+  "Show the completion popup by widget without taking the focus: below anchor ([x y
+width height] in widget, a character position in a text view, or :caret), or above it when
+there is no room below. Shown again, it moves.")
+
+(defgeneric backend-close-panel [backend popup]
+  "Hide the completion popup; the core emits :closed.")
+
+(defgeneric backend-caret-rectangle [backend view position]
+  "Where the caret at position is in the text view, [x y width height] from its top left,
+its scrolled part taken into account.")
+
+(defgeneric close-natively! [s]
+  "Have the backend close the surface: a popover or a completion popup.")
+
+(defn close-surface!
+  "Close the popover or completion popup if it is shown, and emit :closed with reason
+(:closed if not given). Returns true if it was shown. It can be shown again."
+  ([s] (close-surface! s :closed))
+  ([s reason]
+   (when (:shown s)
+     (let [b (current-backend)]
+       (in-ui (fn [] (close-natively! s))))
+     (surface-closed! s reason))))
+
+(defmethod destroy! :before [(s surface-widget)]
+  (when (and (:shown s) (realized? s))
+    (close-surface! s)))
+
+(defn place-popup
+  "Where a popup of size [width height] goes beside anchor, [x y width height], on screen,
+the usable rectangle of the screen, all from the screen's top left: just below anchor with
+their left edges lined up, or just above when there is no room below, then moved left or
+right to stay on screen. Returns [x y side], side :below or :above. Backends use it to
+place completion popups."
+  ([anchor size screen] (place-popup anchor size screen 2))
+  ([anchor size screen gap]
+   (let [[ax ay _ ah] anchor
+         [w h] size
+         [sx sy sw sh] screen
+         below (+ ay ah gap)
+         above (- ay gap h)
+         side (if (or (<= (+ below h) (+ sy sh)) (< above sy)) :below :above)]
+     [(max sx (min ax (- (+ sx sw) w))) (if (= side :below) below above) side])))
+
+(defn caret-position
+  "Where the caret is in the text view, as a character position."
+  [view]
+  (second (text-selection view)))
+
+(defn caret-rectangle
+  "Where the caret is, or would be at position, in the text view, [x y width height] from
+its top left with its scrolled part taken into account: where to show a completion popup."
+  ([view] (caret-rectangle view (caret-position view)))
+  ([view position]
+   (let [b (current-backend)]
+     (in-ui (fn [] (backend-caret-rectangle b view position))))))
+
+;;; Popovers
+
+(def notify-appearance-changed!
+  "Work out the appearances in a tree again (defined with the appearances, below).")
+
+(defclass popover-widget [surface-widget]
+  "A small panel with an arrow pointing at a widget, holding any widgets, as NSPopover and
+GtkPopover are: a settings form, a color chooser, an item's details. Put a box or grid in
+it, show it with show-popover!, and close it with close-surface!; the user can also close
+it, as :behavior says. It takes the keyboard while open, so its entries and buttons work
+as in a window."
+  (behavior :cell :atom :init :transient
+            :doc "When it closes by itself: :transient on a click anywhere outside it or
+Escape, :semi-transient on a click in its window but not in others, :application-defined
+only when the program calls close-surface!.")
+  (preferred-edge :cell :atom :init :bottom
+                  :doc "The side of its anchor it prefers: :bottom, :top, :left or :right.
+It goes on the other side when there is no room.")
+  (padding :cell :atom :init 12))
+
+(declare-widget! popover-widget {:properties [:behavior]})
+
+(defmethod initialize :after [(p popover-widget)]
+  (when-not (contains? #{:transient :semi-transient :application-defined} (:behavior p))
+    (error "a popover's behavior is :transient, :semi-transient or :application-defined")))
+
+(defn popover
+  "A popover: (popover {:behavior :transient} (vbox {} ...)). Show it with show-popover!."
+  [opts & children]
+  (build popover-widget opts children))
+
+(defn show-popover!
+  "Show the popover pointing at widget, which must be in a window that is shown: at its
+:rectangle ([x y width height] in widget) or all of it, on its :edge (:bottom, :top, :left
+or :right; the popover's :preferred-edge if not given). :focus, a widget in the popover,
+gets the keyboard focus. Shown again, the popover moves. Returns the popover."
+  ([p widget] (show-popover! p widget {}))
+  ([p widget opts]
+   (let [rectangle (or (:rectangle opts) (widget-rectangle widget))
+         edge (or (:edge opts) (:preferred-edge p))]
+     (when-not (contains? #{:bottom :top :left :right} edge)
+       (error "a popover's edge is :bottom, :top, :left or :right"))
+     (when (and (:shown p) (not (identical? widget (:owner p))))
+       (close-surface! p))
+     (flush-layouts!)
+     ;; Its owner, for the appearance and palette, before it is laid out.
+     (set-slot! p :owner widget)
+     (update-layout! p)
+     (let [b (current-backend)]
+       (in-ui (fn [] (backend-show-popover b p widget rectangle edge))))
+     (if (:shown p)
+       (set-slot! p :anchor rectangle)
+       (do (surface-opened! p widget rectangle)
+           (hook! p (window-of widget) :closed (fn [_] (close-surface! p :closed)) false)))
+     (notify-appearance-changed! p)
+     (when-let [f (:focus opts)] (focus! f))
+     p)))
+
+;;; Completion popups
+
+(defclass completion-popup-widget [surface-widget]
+  "A list of completions shown under the caret of a text view (or by any widget), in a
+borderless panel that never takes the keyboard: the view keeps the focus, so typing goes on
+in it and the program narrows the list by setting :items.
+
+While it is shown, its owner's :key-down events go through handle-completion-key first: Up,
+Down, Page Up and Page Down move the highlight, Return or Tab (:accept-keys) accept the
+highlighted item, emitting :accept, and Escape closes it. Clicking an item accepts it;
+clicking elsewhere, leaving the window or scrolling closes it. It emits :accept and
+:selection-changed (selection-events with the item and its index)."
+  (items :cell :atom :init []
+         :doc "The completions, any values. Setting it highlights the first and resizes the
+popup; setting it empty closes it.")
+  (item-label :cell :atom :init str :doc "A function from an item to the text shown for it.")
+  (item-detail :cell :atom :init nil
+               :doc "A function from an item to a short text shown dimmer at the right of
+its row (\"function\", a type), or nil.")
+  (selected-index :cell :atom :init 0 :doc "The highlighted item's index, or nil for none.")
+  (max-visible-rows :cell :atom :init 10 :doc "The most rows shown at once; the rest scroll.")
+  (accept-keys :cell :atom :init [:return :tab] :doc "The keys that accept the highlighted item.")
+  (row-height :cell :atom :init 20)
+  (list-view :cell :atom :init nil))
+
+(declare-widget! completion-popup-widget
+                 {:layout [:items :selected-index :item-label :item-detail :max-visible-rows]
+                  :signals {:accept selection-event :selection-changed selection-event}})
+
+(defclass completion-list-widget [canvas-widget]
+  "The rows of a completion popup, drawn by skein-ui."
+  (popup :init nil)
+  (top :cell :atom :init 0 :doc "The index of the first row shown.")
+  (focusable :cell :atom :init false))
+
+(def ^:private completion-inset
+  "Pixels above the first row and below the last."
+  4)
+
+(defn- completion-font [p] (or (:font p) (font {:size 12})))
+
+(defn- item-detail-text [p item]
+  (if-let [f (:item-detail p)] (str (or (f item) "")) ""))
+
+(defn- visible-rows [p]
+  (min (count (:items p)) (max 1 (:max-visible-rows p))))
+
+(defn- clamp-selection! [p]
+  (let [n (count (:items p))
+        i (:selected-index p)]
+    (set-slot! p :selected-index (when (pos? n) (max 0 (min (or i 0) (dec n)))))))
+
+(defn- scroll-to-selection! [p]
+  (let [l (:list-view p)
+        i (:selected-index p)
+        rows (visible-rows p)
+        n (count (:items p))]
+    (when i
+      (set-slot! l :top (max 0 (min (max 0 (- n rows))
+                                    (cond (< i (:top l)) i
+                                          (>= i (+ (:top l) rows)) (inc (- i rows))
+                                          :else (:top l))))))))
+
+(defmethod initialize :after [(p completion-popup-widget)]
+  (let [l (build completion-list-widget {:popup p} nil)]
+    (set-slot! p :list-view l)
+    (set-slot! p :items (vec (:items p)))
+    (add! p l)
+    (clamp-selection! p)))
+
+(defn completion-popup
+  "A completion popup: (completion-popup {:on-accept (fn [e] (insert! (:value e)))}).
+Show it with show-completion-popup!."
+  ([] (completion-popup {}))
+  ([opts] (build completion-popup-widget opts nil)))
+
+(defmethod close-natively! [(p popover-widget)]
+  (backend-close-popover (current-backend) p))
+
+(defmethod close-natively! [(p completion-popup-widget)]
+  (backend-close-panel (current-backend) p))
+
+(defn dismiss-popups!
+  "For backends: close the completion popups shown for widgets in the window (any window
+if nil) but except, with reason (:dismissed). Call it when the user clicks outside a
+popup, moves or resizes its window, or scrolls with the wheel."
+  ([] (dismiss-popups! nil :dismissed nil))
+  ([window reason except]
+   (doseq [s @open-surfaces]
+     (when (and (instance? completion-popup-widget s) (not (identical? s except))
+                (or (nil? window) (identical? window (window-of (:owner s)))))
+       (close-surface! s reason)))))
+
+(defmethod measure [(l completion-list-widget)]
+  (let [p (:popup l)
+        f (completion-font p)
+        [_ ch] (text-extent "Mg" f)
+        rh (+ 6 (int (math/ceil ch)))
+        widest (reduce max 0 (map (fn [item]
+                                    (+ (first (text-extent (str ((:item-label p) item)) f))
+                                       (let [d (item-detail-text p item)]
+                                         (if (= d "") 0 (+ 24 (first (text-extent d f)))))))
+                                  (:items p)))]
+    (set-slot! p :row-height rh)
+    [(max 160 (min 480 (+ 24 (int (math/ceil widest)))))
+     (+ (* 2 completion-inset) (* (visible-rows p) rh))]))
+
+(defn- row-at [l y]
+  (let [p (:popup l)
+        i (+ (:top l) (int (math/floor (/ (- y completion-inset) (:row-height p)))))]
+    (when (and (>= y completion-inset) (< -1 i (count (:items p)))
+               (< i (+ (:top l) (visible-rows p))))
+      i)))
+
+(defn selected-completion
+  "The item highlighted in the completion popup, or nil."
+  [p]
+  (let [i (:selected-index p)]
+    (when (and i (< -1 i (count (:items p)))) (nth (:items p) i))))
+
+(defn accept-completion!
+  "Accept the highlighted item, as Return does: close the popup, then emit :accept with the
+item. Returns the item, or nil when there is none."
+  [p]
+  (let [item (selected-completion p)
+        i (:selected-index p)]
+    (when (and i (:shown p))
+      (close-surface! p :accepted)
+      (emit! p (event-for p :accept :value item :index i))
+      item)))
+
+(defmethod handle-event :after [(l completion-list-widget) (e draw-event)]
+  (let [p (:popup l)
+        gc (:context e)
+        f (completion-font p)
+        h (:row-height p)
+        w (:width e)
+        items (:items p)]
+    (doseq [row (range (visible-rows p))]
+      (let [i (+ row (:top l))]
+        (when (< i (count items))
+          (let [item (nth items i)
+                y (+ completion-inset (* row h))
+                selected (= i (:selected-index p))
+                color (if selected (rgb 1 1 1) :text)
+                [_ th] (text-size gc "Mg" {:font f})
+                ty (+ y (/ (- h th) 2))]
+            (when selected
+              (fill-rectangle! gc 5 y (- w 10) h {:color :accent :radius 4}))
+            (draw-text! gc (str ((:item-label p) item)) 12 ty {:font f :color color})
+            (let [d (item-detail-text p item)]
+              (when-not (= d "")
+                (draw-text! gc d (- w 12) ty {:font f :align :right
+                                              :color (if selected (rgb 1 1 1 0.8)
+                                                         :secondary-text)})))))))))
+
+(defmethod handle-event :after [(l completion-list-widget) (e mouse-event)]
+  (let [p (:popup l)]
+    (cond
+      (and (= :mouse-down (:signal e)) (= :left (:button e)))
+      (when-let [i (row-at l (:y e))]
+        (set-slot! p :selected-index i)
+        (accept-completion! p))
+      (= :scroll (:signal e))
+      (let [rows (visible-rows p)
+            n (count (:items p))
+            step (if (:precise e) (/ (:delta-y e) (:row-height p)) (:delta-y e))]
+        (set-slot! l :top (max 0 (min (- n rows) (- (:top l) (int (math/round step))))))
+        (redraw! l))
+      :else nil)))
+
+(defmethod property-changed :after [(p completion-popup-widget) property value]
+  (cond
+    (= property :items)
+    (if (vector? value)
+      (do (set-slot! p :selected-index 0)
+          (when-let [l (:list-view p)] (set-slot! l :top 0))
+          (clamp-selection! p)
+          (if (empty? value)
+            (close-surface! p :closed)
+            (when-let [l (:list-view p)]
+              (invalidate-size! l)
+              (when (:shown p) (update-layout! p))
+              (redraw! l))))
+      (set-slot! p :items (vec value)))
+    (contains? #{:item-label :item-detail :max-visible-rows} property)
+    (when-let [l (:list-view p)]
+      (invalidate-size! l)
+      (when (:shown p) (update-layout! p))
+      (redraw! l))
+    (= property :selected-index)
+    (let [n (count (:items p))
+          ok (if (pos? n) (and (integer? value) (< -1 value n)) (nil? value))]
+      (if ok
+        (when-let [l (:list-view p)]
+          (scroll-to-selection! p)
+          (redraw! l))
+        (clamp-selection! p)))
+    :else nil))
+
+(defn- move-completion-selection! [p delta]
+  (let [n (count (:items p))]
+    (when (pos? n)
+      (let [new (max 0 (min (dec n) (+ (or (:selected-index p) 0) delta)))]
+        (when (not= new (:selected-index p))
+          (set-slot! p :selected-index new)
+          (emit! p (event-for p :selection-changed :index new :value (selected-completion p))))))))
+
+(defn handle-completion-key
+  "Act on e, a :key-down of the widget the popup is shown for: Up and Down move the
+highlight a row, Page Up and Page Down a page, a key in :accept-keys accepts the
+highlighted item, and Escape closes the popup. Those keys, with no modifier, are consumed.
+True if the popup acted on e. The popup calls it from its owner's handlers; call it first
+in a handle-event method of your own that would take one of these keys."
+  [p e]
+  (when (and (:shown p) (not (consumed? e)) (= :key-down (:signal e)) (empty? (:modifiers e)))
+    (let [key (:key e)
+          page (visible-rows p)
+          act (cond (= key :up) (fn [] (move-completion-selection! p -1))
+                    (= key :down) (fn [] (move-completion-selection! p 1))
+                    (= key :page-up) (fn [] (move-completion-selection! p (- page)))
+                    (= key :page-down) (fn [] (move-completion-selection! p page))
+                    (= key :escape) (fn [] (close-surface! p :cancelled))
+                    (some (fn [k] (= k key)) (:accept-keys p)) (fn [] (accept-completion! p))
+                    :else nil)]
+      (when act
+        (act)
+        (consume! e)
+        true))))
+
+(defn show-completion-popup!
+  "Show the completion popup for widget without taking the keyboard from it: below
+:rectangle ([x y width height] in widget) or, for a text view, below the caret at
+:position (the caret's own if not given), or above when there is no room below. :items,
+if given, become its items; with none it closes, or isn't shown. Shown again, it moves.
+From then on widget's :key-down events go through handle-completion-key first, and a click
+in widget or leaving its window closes it. Returns the popup, or nil with no items."
+  ([p widget] (show-completion-popup! p widget {}))
+  ([p widget opts]
+   (when (contains? opts :items) (set-slot! p :items (vec (:items opts))))
+   (if (empty? (:items p))
+     (do (close-surface! p :closed) nil)
+     (do
+       (when (and (:shown p) (not (identical? widget (:owner p))))
+         (close-surface! p :closed))
+       (let [anchor (or (:rectangle opts)
+                        (if (instance? text-view-widget widget)
+                          (or (:position opts) :caret)
+                          (widget-rectangle widget)))]
+         (set-slot! p :owner widget)
+         (update-layout! p)
+         (redraw! (:list-view p))
+         (let [b (current-backend)]
+           (in-ui (fn [] (backend-show-panel b p widget anchor))))
+         (if (:shown p)
+           (set-slot! p :anchor anchor)
+           (let [window (window-of widget)]
+             (surface-opened! p widget anchor)
+             (hook! p widget :key-down (fn [e] (handle-completion-key p e)) true)
+             (hook! p widget :mouse-down (fn [_] (close-surface! p :dismissed)) false)
+             (hook! p window :deactivated (fn [_] (close-surface! p :dismissed)) false)
+             (hook! p window :closed (fn [_] (close-surface! p :closed)) false)))
+         (notify-appearance-changed! p)
+         p)))))
+
+;;; ------------------------------------------------------------------------------------
 ;;; Timers, the clipboard and the system
 
 (defgeneric backend-start-timer [backend timer]
@@ -3931,7 +4415,7 @@ coding palette), plus :selection-text, :caret, :gutter-background and :gutter-te
   "The nearest :light or :dark that widget or what holds it asks for, or nil."
   [w]
   (some (fn [o] (let [a (:appearance o)] (when (or (= a :light) (= a :dark)) a)))
-        (take-while some? (iterate :parent w))))
+        (holders w)))
 
 (defmethod backend-widget-appearance [(b backend) w]
   (or (inherited-appearance w) (if (backend-dark-mode? b) :dark :light)))
@@ -3957,12 +4441,12 @@ system's."
 (defn palette-color
   "The color the widget's palette, or the nearest enclosing one, sets for role, or nil."
   [w role]
-  (some (fn [o] (get (:palette o) role)) (take-while some? (iterate :parent w))))
+  (some (fn [o] (get (:palette o) role)) (holders w)))
 
 (defn effective-palette?
   "True if the widget or a container of it has a palette."
   [w]
-  (boolean (some :palette (take-while some? (iterate :parent w)))))
+  (boolean (some :palette (holders w))))
 
 (defn widget-color
   "The color designator as the widget shows it: a semantic color that a palette sets is

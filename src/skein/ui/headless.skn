@@ -775,3 +775,51 @@ emits :key-down. Returns the event, which a handler may have consumed."
   "Right-click the page's tab, as the user would."
   [pane page]
   (ui/tab-context-requested! pane (tab-x pane page) 10 #{}))
+
+;;; ------------------------------------------------------------------------------------
+;;; Popovers and completion popups
+
+(defmethod ui/backend-show-popover [(b headless-backend) p widget rectangle edge]
+  (swap! (:native p) assoc :shown true :shown-for {:widget widget :rectangle rectangle
+                                                   :edge edge}))
+
+(defmethod ui/backend-close-popover [(b headless-backend) p]
+  (swap! (:native p) assoc :shown false))
+
+(defmethod ui/backend-show-panel [(b headless-backend) p widget anchor]
+  (swap! (:native p) assoc :shown true :shown-for {:widget widget :anchor anchor}))
+
+(defmethod ui/backend-close-panel [(b headless-backend) p]
+  (swap! (:native p) assoc :shown false))
+
+(defmethod ui/backend-caret-rectangle [(b headless-backend) view position]
+  ;; Each character char-width wide, each line line-height high.
+  (let [chars (take position (seq (str (:text view))))
+        line (count (filter (fn [c] (= c \newline)) chars))
+        column (count (take-while (fn [c] (not= c \newline)) (reverse chars)))]
+    [(* char-width column) (* line-height line) 1 line-height]))
+
+(defn surface-shown?
+  "True if the popover's or completion popup's native panel is shown."
+  [s]
+  (boolean (:shown @(:native s))))
+
+(defn shown-for
+  "Where the surface was last shown: {:widget :rectangle :edge} for a popover, {:widget
+:anchor} for a completion popup."
+  [s]
+  (:shown-for @(:native s)))
+
+(defn click-outside!
+  "Click outside the shown popover, as the user would: a transient popover closes (the
+platform tells the core, which emits :closed with :dismissed). True if it closed."
+  [p]
+  (when (and (:shown p) (= :transient (:behavior p)))
+    (swap! (:native p) assoc :shown false)
+    (ui/surface-closed! p :dismissed)))
+
+(defn click-completion!
+  "Click the completion popup's row at index (of those shown), as the user would."
+  [p index]
+  (let [l (:list-view p)]
+    (mouse! l :mouse-down 20 (+ 4 (* (:row-height p) index) 2) {:button :left})))
