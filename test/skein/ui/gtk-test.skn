@@ -210,3 +210,26 @@
       (gtk/select-rows-natively! tree [3])
       (is (= ["main.skn"] (:selection tree))))
     (ui/close! w)))
+
+(deftest canvases-draw-and-get-the-mouse
+  (let [clicks (atom [])
+        c (ui/canvas {:width 200 :height 100 :background :white
+                      :on-draw (fn [e]
+                                 (let [gc (:context e)]
+                                   (ui/fill-rectangle! gc 0 0 100 100 {:color "#ff0000"})
+                                   (ui/fill-circle! gc 150 50 20 {:color "#0000ff"})
+                                   (ui/draw-line! gc 110 90 190 90 {:color :black :line-width 2})
+                                   (ui/draw-text! gc "Hi" 110 5 {:color :black})))
+                      :on-mouse-down (fn [e] (swap! clicks conj [(:x e) (:y e) (:button e)]))})
+        w (ui/window {} c)]
+    (ui/show! w)
+    (gtk/settle!)
+    (is (= (ui/rgb 1 0 0) (gtk/draw-into-image! c 50 50)) "the red square")
+    (is (= (ui/rgb 0 0 1) (gtk/draw-into-image! c 150 50)) "the blue circle")
+    (is (= (ui/rgb 1 1 1) (gtk/draw-into-image! c 195 5)) "the white background")
+    (let [[tw th] (ui/text-extent "abcdefghij" {:size 12})]
+      (is (< 40 tw 120))
+      (is (< 10 th 25)))
+    (gtk/press-mouse! c 30 40)
+    (is (= [[30.0 40.0 :left]] @clicks))
+    (ui/close! w)))

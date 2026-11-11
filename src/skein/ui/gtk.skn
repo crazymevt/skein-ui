@@ -53,6 +53,13 @@ split pane's divider).")
 (defgeneric children-model [w item]
   "The GListModel of the children of a tree's item (a GtkStringObject), or null.")
 
+(defgeneric native-draw [w cr width height]
+  "w's drawing area draws with the Cairo context cr: emit :draw.")
+
+(defgeneric native-input [w kind controller args]
+  "One of w's event controllers reported kind (:pressed, :motion, :key-pressed, ...)
+with args, a map.")
+
 (defgeneric native-natural-size [w]
   "w's natural [width height]: by default its GTK widget's natural size.")
 
@@ -73,7 +80,8 @@ split pane's divider).")
 
 (def ^:private signal-kinds
   [:clicked :activate :changed :toggled :value-changed :resized :selected :switch-page
-   :close-request :position :sort :items-changed])
+   :close-request :position :sort :items-changed :pressed :released :motion :enter :leave
+   :scroll :key-pressed :key-released])
 
 (defn- kind-of [data] (nth signal-kinds (ffi/address data)))
 
@@ -140,6 +148,32 @@ this namespace's), reporting it as kind. Returns o."
                                          data ptr]
   (when-let [w (lib/object-for model)]
     (native-signal w :items-changed model nil)))
+
+(ffi/defcallback draw-imp void [area ptr, cr ptr, width i32, height i32, data ptr]
+  (when-let [w (lib/object-for area)]
+    (native-draw w cr width height)))
+
+(ffi/defcallback press-imp void [gesture ptr, n i32, x f64, y f64, data ptr]
+  (when-let [w (lib/object-for gesture)]
+    (native-input w (kind-of data) gesture {:n n :x x :y y})))
+
+(ffi/defcallback motion-imp void [controller ptr, x f64, y f64, data ptr]
+  (when-let [w (lib/object-for controller)]
+    (native-input w (kind-of data) controller {:x x :y y})))
+
+(ffi/defcallback leave-imp void [controller ptr, data ptr]
+  (when-let [w (lib/object-for controller)]
+    (native-input w :leave controller {})))
+
+(ffi/defcallback scroll-imp bool [controller ptr, dx f64, dy f64, data ptr]
+  (when-let [w (lib/object-for controller)]
+    (native-input w :scroll controller {:dx dx :dy dy}))
+  true)
+
+(ffi/defcallback key-imp bool [controller ptr, keyval u32, keycode u32, state u32, data ptr]
+  (boolean
+   (when-let [w (lib/object-for controller)]
+     (native-input w (kind-of data) controller {:keyval keyval :state state}))))
 
 (def ^:private pulsing
   "progress bar id -> the indeterminate progress bar it pulses."
@@ -1340,6 +1374,249 @@ inside it that holds its children."
   (ui/tree-item-activated-by-user! t (first (row-items t [row]))))
 
 ;;; ------------------------------------------------------------------------------------
+;;; Canvases: a GtkDrawingArea drawn with Cairo (text with Pango), with event controllers
+
+(def ^:private click-gestures
+  "A canvas's drawing area address -> its click gesture."
+  (atom {}))
+
+(def ^:private pressed-buttons
+  "canvas widget (by identity) -> the mouse button held down, for :mouse-drag."
+  (atom {}))
+
+(defn- add-controller! [w n controller signals]
+  (lib/register! controller w)
+  (doseq [[signal kind handler] signals]
+    (connect! controller signal kind handler))
+  (lib/widget-add-controller n controller))
+
+(defmethod make-native [(c ui/canvas-widget)]
+  (let [n (owned (lib/drawing-area-new))
+        click (lib/gesture-click-new)]
+    (lib/drawing-area-set-draw-func n draw-imp (ffi/null) (ffi/null))
+    (lib/gesture-single-set-button click 0)   ; every button
+    (swap! click-gestures assoc (ffi/address n) click)
+    (add-controller! c n click [["pressed" :pressed press-imp] ["released" :released press-imp]])
+    (add-controller! c n (lib/motion-controller-new)
+                     [["motion" :motion motion-imp] ["enter" :enter motion-imp]
+                      ["leave" :leave leave-imp]])
+    (add-controller! c n (lib/scroll-controller-new 3) [["scroll" :scroll scroll-imp]])
+    (add-controller! c n (lib/key-controller-new)
+                     [["key-pressed" :key-pressed key-imp] ["key-released" :key-released key-imp]])
+    n))
+
+(defmethod set-native [(c ui/canvas-widget) (p (= :focusable)) v]
+  (lib/widget-set-focusable (native c) (boolean v)))
+
+(defmethod native-natural-size [(c ui/canvas-widget)] [100 100])
+
+(defmethod ui/backend-redraw [(b gtk-backend) c rect]
+  (lib/widget-queue-draw (native c)))
+
+(defn- pango-font
+  "A Pango font description string for a font map (nil for the default)."
+  [font]
+  (let [f (or font (ui/font))]
+    (string/join " " (remove nil? [(case (:family f) :system "Sans" :monospace "Monospace"
+                                         (:family f))
+                                   (when (:italic f) "Italic")
+                                   (case (:weight f) :light "Light" :medium "Medium"
+                                         :semibold "Semi-Bold" :bold "Bold" nil)
+                                   (str (or (:size f) 10))]))))
+
+(defn- text-layout
+  "A Pango layout of s in font on the Cairo context cr; free it with g-object-unref."
+  [cr s font]
+  (let [layout (lib/pango-cairo-create-layout cr)
+        desc (lib/pango-font-from-string (pango-font font))]
+    (lib/pango-layout-set-text layout s -1)
+    (lib/pango-layout-set-font layout desc)
+    (lib/pango-font-free desc)
+    layout))
+
+(defn- layout-size [layout]
+  (ffi/with-foreign [w (ffi/alloc i32 1)]
+    (ffi/with-foreign [h (ffi/alloc i32 1)]
+      (lib/pango-layout-get-pixel-size layout w h)
+      [(ffi/get w i32) (ffi/get h i32)])))
+
+(defn- measure-text [s font]
+  (let [surface (lib/cairo-image-surface-create 0 1 1)
+        cr (lib/cairo-create surface)
+        layout (text-layout cr s font)
+        size (layout-size layout)]
+    (lib/g-object-unref layout)
+    (lib/cairo-destroy cr)
+    (lib/cairo-surface-destroy surface)
+    size))
+
+(defmethod ui/backend-text-size [(b gtk-backend) s font]
+  (measure-text s font))
+
+(defclass gtk-context [ui/graphics-context]
+  "A graphics context drawing with Cairo. Cairo has one source color, so the fill and
+stroke colors are set as each shape is drawn."
+  (cr :init nil :doc "The cairo_t."))
+
+(defn- source! [gc color]
+  (let [[r g b a] (rgba-of color)]
+    (lib/cairo-set-source-rgba (:cr gc) r g b a)))
+
+(defmethod ui/gc-set-fill-color [(gc gtk-context) c] nil)
+(defmethod ui/gc-set-stroke-color [(gc gtk-context) c] nil)
+(defmethod ui/gc-set-line-width [(gc gtk-context) w] (lib/cairo-set-line-width (:cr gc) w))
+
+(defmethod ui/gc-set-line-style [(gc gtk-context) cap join dash]
+  (lib/cairo-set-line-cap (:cr gc) (case cap :round 1 :square 2 0))
+  (lib/cairo-set-line-join (:cr gc) (case join :round 1 :bevel 2 0))
+  (if (seq dash)
+    (ffi/with-foreign [lengths (ffi/alloc f64 (count dash))]
+      (doseq [[i x] (map-indexed vector dash)] (ffi/put! lengths f64 (f64 x) i))
+      (lib/cairo-set-dash (:cr gc) lengths (count dash) 0.0))
+    (lib/cairo-set-dash (:cr gc) (ffi/null) 0 0.0)))
+
+(defmethod ui/gc-save [(gc gtk-context)] (lib/cairo-save (:cr gc)))
+(defmethod ui/gc-restore [(gc gtk-context)] (lib/cairo-restore (:cr gc)))
+(defmethod ui/gc-translate [(gc gtk-context) dx dy] (lib/cairo-translate (:cr gc) dx dy))
+(defmethod ui/gc-scale [(gc gtk-context) sx sy] (lib/cairo-scale (:cr gc) sx sy))
+(defmethod ui/gc-rotate [(gc gtk-context) r] (lib/cairo-rotate (:cr gc) r))
+
+(defmethod ui/gc-clip-rectangle [(gc gtk-context) x y w h]
+  (lib/cairo-rectangle (:cr gc) x y w h)
+  (lib/cairo-clip (:cr gc)))
+
+(defn- finish-shape! [gc mode]
+  (let [cr (:cr gc)]
+    (case mode
+      :fill (do (source! gc (:fill-color gc)) (lib/cairo-fill cr))
+      :stroke (do (source! gc (:stroke-color gc)) (lib/cairo-stroke cr))
+      :fill-and-stroke (do (source! gc (:fill-color gc)) (lib/cairo-fill-preserve cr)
+                           (source! gc (:stroke-color gc)) (lib/cairo-stroke cr)))))
+
+(defmethod ui/gc-rectangle [(gc gtk-context) x y w h mode]
+  (lib/cairo-new-path (:cr gc))
+  (lib/cairo-rectangle (:cr gc) x y w h)
+  (finish-shape! gc mode))
+
+(defmethod ui/gc-ellipse [(gc gtk-context) x y w h mode]
+  (let [cr (:cr gc)]
+    (lib/cairo-new-path cr)
+    (lib/cairo-save cr)
+    (lib/cairo-translate cr (+ x (/ w 2)) (+ y (/ h 2)))
+    (lib/cairo-scale cr (max (/ w 2) 1.0e-9) (max (/ h 2) 1.0e-9))
+    (lib/cairo-arc cr 0.0 0.0 1.0 0.0 (* 2 math/pi))
+    ;; Restore before stroking, so the line isn't scaled with the ellipse.
+    (lib/cairo-restore cr)
+    (finish-shape! gc mode)))
+
+(defmethod ui/gc-begin-path [(gc gtk-context)] (lib/cairo-new-path (:cr gc)))
+(defmethod ui/gc-move-to [(gc gtk-context) x y] (lib/cairo-move-to (:cr gc) x y))
+(defmethod ui/gc-line-to [(gc gtk-context) x y] (lib/cairo-line-to (:cr gc) x y))
+(defmethod ui/gc-curve-to [(gc gtk-context) x1 y1 x2 y2 x y]
+  (lib/cairo-curve-to (:cr gc) x1 y1 x2 y2 x y))
+(defmethod ui/gc-arc [(gc gtk-context) cx cy r start end]
+  ;; Cairo's angles turn clockwise on the screen, as skein.ui's do.
+  (lib/cairo-arc (:cr gc) cx cy r start end))
+(defmethod ui/gc-close-path [(gc gtk-context)] (lib/cairo-close-path (:cr gc)))
+(defmethod ui/gc-draw-path [(gc gtk-context) mode] (finish-shape! gc mode))
+
+(defmethod ui/gc-text [(gc gtk-context) s x y font color]
+  (let [cr (:cr gc)
+        layout (text-layout cr s font)]
+    (source! gc color)
+    (lib/cairo-move-to cr x y)
+    (lib/pango-cairo-show-layout cr layout)
+    (lib/g-object-unref layout)))
+
+(defmethod ui/gc-text-size [(gc gtk-context) s font]
+  (let [layout (text-layout (:cr gc) s font)
+        size (layout-size layout)]
+    (lib/g-object-unref layout)
+    size))
+
+(def ^:private image-surfaces
+  "image (by identity) -> a Cairo image surface of it."
+  (atom {}))
+
+(defn- image-surface [image]
+  (or (get @image-surfaces image)
+      (let [t (texture image)
+            w (lib/texture-get-width t)
+            h (lib/texture-get-height t)
+            surface (lib/cairo-image-surface-create 0 w h)]   ; CAIRO_FORMAT_ARGB32
+        (lib/cairo-surface-flush surface)
+        ;; GdkTexture's default format is Cairo's ARGB32, premultiplied.
+        (lib/texture-download t (lib/cairo-image-surface-get-data surface)
+                              (lib/cairo-image-surface-get-stride surface))
+        (lib/cairo-surface-mark-dirty surface)
+        (swap! image-surfaces assoc image surface)
+        surface)))
+
+(defmethod ui/gc-image [(gc gtk-context) image x y w h]
+  (let [cr (:cr gc)]
+    (lib/cairo-save cr)
+    (lib/cairo-translate cr x y)
+    (lib/cairo-scale cr (/ w (max 1 (:width image))) (/ h (max 1 (:height image))))
+    (lib/cairo-set-source-surface cr (image-surface image) 0.0 0.0)
+    (lib/cairo-paint cr)
+    (lib/cairo-restore cr)))
+
+(defn- draw-canvas! [c cr width height]
+  (let [gc (make gtk-context :cr cr :width width :height height)]
+    (when (:background c)
+      (ui/paint! gc (:background c)))
+    (ui/emit! c (ui/event-for c :draw :context gc :width width :height height))))
+
+(defmethod native-draw [(c ui/canvas-widget) cr width height]
+  (draw-canvas! c cr width height))
+
+(def ^:private named-keys
+  {0xff0d :return 0xff8d :return 0xff1b :escape 0xff09 :tab 0xff08 :backspace 0xffff :delete
+   0xff51 :left 0xff52 :up 0xff53 :right 0xff54 :down 0xff50 :home 0xff57 :end
+   0xff55 :page-up 0xff56 :page-down 0x20 :space 0xffbe :f1 0xffbf :f2 0xffc0 :f3
+   0xffc1 :f4 0xffc2 :f5 0xffc3 :f6 0xffc4 :f7 0xffc5 :f8 0xffc6 :f9 0xffc7 :f10
+   0xffc8 :f11 0xffc9 :f12})
+
+(defn- modifiers-of
+  "The set of modifier keys in a GdkModifierType."
+  [state]
+  (set (keep (fn [[bit m]] (when (pos? (bit-and state bit)) m))
+             [[1 :shift] [4 :control] [8 :alt] [0x4000000 :command] [0x10000000 :command]])))
+
+(defmethod native-input [(c ui/canvas-widget) kind controller args]
+  (let [mods (modifiers-of (lib/controller-current-state controller))
+        button (fn [] (case (lib/gesture-single-get-current-button controller)
+                        2 :middle 3 :right :left))]
+    (case kind
+      :pressed (let [b (button)]
+                 (swap! pressed-buttons assoc c b)
+                 (when (:focusable c) (lib/widget-grab-focus (native c)))
+                 (ui/emit! c (ui/event-for c :mouse-down :x (:x args) :y (:y args) :button b
+                                           :click-count (:n args) :modifiers mods)))
+      :released (let [b (button)]
+                  (swap! pressed-buttons dissoc c)
+                  (ui/emit! c (ui/event-for c :mouse-up :x (:x args) :y (:y args) :button b
+                                            :click-count (:n args) :modifiers mods)))
+      :motion (let [b (get @pressed-buttons c)]
+                (ui/emit! c (ui/event-for c (if b :mouse-drag :mouse-move) :x (:x args)
+                                          :y (:y args) :button b :modifiers mods)))
+      :enter (ui/emit! c (ui/event-for c :mouse-enter :x (:x args) :y (:y args) :modifiers mods))
+      :leave (ui/emit! c (ui/event-for c :mouse-leave :modifiers mods))
+      :scroll (ui/emit! c (ui/event-for c :scroll :delta-x (:dx args) :delta-y (:dy args)
+                                        :modifiers mods))
+      (:key-pressed :key-released)
+      (let [keyval (:keyval args)
+            lower (lib/keyval-to-lower keyval)
+            code (lib/keyval-to-unicode keyval)
+            key (or (get named-keys lower)
+                    (when (pos? (lib/keyval-to-unicode lower)) (char (lib/keyval-to-unicode lower))))
+            e (ui/event-for c (if (= kind :key-pressed) :key-down :key-up) :key key
+                            :modifiers (modifiers-of (:state args))
+                            :text (if (pos? code) (str (char code)) ""))]
+        (ui/emit! c e)
+        (ui/consumed? e)))))
+
+;;; ------------------------------------------------------------------------------------
 ;;; For tests: the real widgets, read and acted on
 
 (defn native-frame
@@ -1489,3 +1766,27 @@ inside it that holds its children."
       (let [row (tree-row t r)]
         (lib/tree-row-set-expanded row true)
         (lib/g-object-unref row)))))
+
+(defn draw-into-image!
+  "Draw the canvas into a Cairo image, as GTK draws it, and return the image's color at
+x, y."
+  [c x y]
+  (let [[_ _ w h] (or (:allocation c) (into [0 0] (ui/preferred-size c)))
+        surface (lib/cairo-image-surface-create 0 w h)
+        cr (lib/cairo-create surface)]
+    (draw-canvas! c cr w h)
+    (lib/cairo-surface-flush surface)
+    (let [data (lib/cairo-image-surface-get-data surface)
+          stride (lib/cairo-image-surface-get-stride surface)
+          at (+ (* y stride) (* 4 x))
+          ;; ARGB32 is a native-endian 32-bit word: blue, green, red, alpha in memory.
+          [b g r a] (mapv (fn [i] (ffi/get data u8 (+ at i))) (range 4))]
+      (lib/cairo-destroy cr)
+      (lib/cairo-surface-destroy surface)
+      (ui/rgb255 r g b a))))
+
+(defn press-mouse!
+  "Press the mouse button at x, y in the canvas, as GTK's click gesture reports it."
+  [c x y]
+  (lib/g-signal-emit-press (get @click-gestures (ffi/address (native c))) "pressed" 1 (f64 x)
+                           (f64 y) (ffi/null)))

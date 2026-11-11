@@ -418,6 +418,82 @@ hasn't placed it."
     (doseq [s strings] (string-list-append l s))
     l))
 
+;;; Canvases: a drawing area, event controllers, Cairo and Pango
+
+(ffi/defcfun ^:blocking drawing-area-new "gtk_drawing_area_new" ptr [])
+(ffi/defcfun ^:blocking drawing-area-set-draw-func "gtk_drawing_area_set_draw_func" void
+  [a ptr, f ptr, data ptr, destroy ptr])
+(ffi/defcfun ^:blocking widget-set-focusable "gtk_widget_set_focusable" void [w ptr, v bool])
+(ffi/defcfun ^:blocking gesture-click-new "gtk_gesture_click_new" ptr [])
+(ffi/defcfun ^:blocking gesture-single-set-button "gtk_gesture_single_set_button" void
+  [g ptr, button u32])
+(ffi/defcfun ^:blocking gesture-single-get-current-button
+  "gtk_gesture_single_get_current_button" u32 [g ptr])
+(ffi/defcfun ^:blocking motion-controller-new "gtk_event_controller_motion_new" ptr [])
+(ffi/defcfun ^:blocking scroll-controller-new "gtk_event_controller_scroll_new" ptr [flags i32])
+(ffi/defcfun ^:blocking key-controller-new "gtk_event_controller_key_new" ptr [])
+(ffi/defcfun ^:blocking controller-current-state "gtk_event_controller_get_current_event_state"
+  u32 [c ptr])
+(ffi/defcfun ^:blocking keyval-to-unicode "gdk_keyval_to_unicode" u32 [keyval u32])
+(ffi/defcfun ^:blocking keyval-to-lower "gdk_keyval_to_lower" u32 [keyval u32])
+(ffi/defcfun ^:blocking g-signal-emit-press "g_signal_emit_by_name" void
+  [instance ptr, signal c-string & n i32, x f64, y f64, end ptr])
+
+(ffi/defcfun ^:blocking cairo-set-source-rgba "cairo_set_source_rgba" void
+  [cr ptr, r f64, g f64, b f64, a f64])
+(ffi/defcfun ^:blocking cairo-set-line-width "cairo_set_line_width" void [cr ptr, w f64])
+(ffi/defcfun ^:blocking cairo-set-line-cap "cairo_set_line_cap" void [cr ptr, cap i32])
+(ffi/defcfun ^:blocking cairo-set-line-join "cairo_set_line_join" void [cr ptr, join i32])
+(ffi/defcfun ^:blocking cairo-set-dash "cairo_set_dash" void
+  [cr ptr, dashes ptr, n i32, offset f64])
+(ffi/defcfun ^:blocking cairo-save "cairo_save" void [cr ptr])
+(ffi/defcfun ^:blocking cairo-restore "cairo_restore" void [cr ptr])
+(ffi/defcfun ^:blocking cairo-translate "cairo_translate" void [cr ptr, x f64, y f64])
+(ffi/defcfun ^:blocking cairo-scale "cairo_scale" void [cr ptr, x f64, y f64])
+(ffi/defcfun ^:blocking cairo-rotate "cairo_rotate" void [cr ptr, a f64])
+(ffi/defcfun ^:blocking cairo-rectangle "cairo_rectangle" void
+  [cr ptr, x f64, y f64, w f64, h f64])
+(ffi/defcfun ^:blocking cairo-clip "cairo_clip" void [cr ptr])
+(ffi/defcfun ^:blocking cairo-fill "cairo_fill" void [cr ptr])
+(ffi/defcfun ^:blocking cairo-fill-preserve "cairo_fill_preserve" void [cr ptr])
+(ffi/defcfun ^:blocking cairo-stroke "cairo_stroke" void [cr ptr])
+(ffi/defcfun ^:blocking cairo-new-path "cairo_new_path" void [cr ptr])
+(ffi/defcfun ^:blocking cairo-move-to "cairo_move_to" void [cr ptr, x f64, y f64])
+(ffi/defcfun ^:blocking cairo-line-to "cairo_line_to" void [cr ptr, x f64, y f64])
+(ffi/defcfun ^:blocking cairo-curve-to "cairo_curve_to" void
+  [cr ptr, x1 f64, y1 f64, x2 f64, y2 f64, x f64, y f64])
+(ffi/defcfun ^:blocking cairo-arc "cairo_arc" void
+  [cr ptr, x f64, y f64, r f64, a1 f64, a2 f64])
+(ffi/defcfun ^:blocking cairo-close-path "cairo_close_path" void [cr ptr])
+(ffi/defcfun ^:blocking cairo-paint "cairo_paint" void [cr ptr])
+(ffi/defcfun ^:blocking cairo-set-source-surface "cairo_set_source_surface" void
+  [cr ptr, s ptr, x f64, y f64])
+(ffi/defcfun ^:blocking cairo-image-surface-create "cairo_image_surface_create" ptr
+  [format i32, w i32, h i32])
+(ffi/defcfun ^:blocking cairo-image-surface-get-data "cairo_image_surface_get_data" ptr [s ptr])
+(ffi/defcfun ^:blocking cairo-image-surface-get-stride "cairo_image_surface_get_stride" i32
+  [s ptr])
+(ffi/defcfun ^:blocking cairo-surface-flush "cairo_surface_flush" void [s ptr])
+(ffi/defcfun ^:blocking cairo-surface-mark-dirty "cairo_surface_mark_dirty" void [s ptr])
+(ffi/defcfun ^:blocking cairo-surface-destroy "cairo_surface_destroy" void [s ptr])
+(ffi/defcfun ^:blocking cairo-create "cairo_create" ptr [s ptr])
+(ffi/defcfun ^:blocking cairo-destroy "cairo_destroy" void [cr ptr])
+(ffi/defcfun ^:blocking texture-download "gdk_texture_download" void
+  [t ptr, data ptr, stride u64])
+
+(ffi/defcfun ^:blocking pango-cairo-create-layout "pango_cairo_create_layout" ptr [cr ptr])
+(ffi/defcfun ^:blocking pango-cairo-show-layout "pango_cairo_show_layout" void
+  [cr ptr, layout ptr])
+(ffi/defcfun ^:blocking pango-layout-set-text "pango_layout_set_text" void
+  [l ptr, text c-string, n i32])
+(ffi/defcfun ^:blocking pango-layout-set-font "pango_layout_set_font_description" void
+  [l ptr, desc ptr])
+(ffi/defcfun ^:blocking pango-layout-get-pixel-size "pango_layout_get_pixel_size" void
+  [l ptr, w ptr, h ptr])
+(ffi/defcfun ^:blocking pango-font-from-string "pango_font_description_from_string" ptr
+  [s c-string])
+(ffi/defcfun ^:blocking pango-font-free "pango_font_description_free" void [d ptr])
+
 ;;; ------------------------------------------------------------------------------------
 ;;; From GTK objects to Skein's
 
