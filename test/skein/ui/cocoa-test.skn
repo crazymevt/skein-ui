@@ -1,0 +1,85 @@
+(ns skein.ui.cocoa-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.cocoa :as cocoa]
+            [skein.system :as system]))
+
+;; The Cocoa backend (step 4 of M2.14, D-097), on macOS only: the widgets as AppKit
+;; controls, read back from AppKit and acted on as the user would.
+
+(def mac? (= :macos (system/os)))
+
+(def backend (when mac? (delay (cocoa/backend))))
+
+(use-fixtures :each (fn [t] (when mac? (ui/use-backend! @backend) (t))))
+
+(deftest windows-and-labels
+  (let [l (ui/label {:text "Hello" :tooltip "greeting"})
+        w (ui/window {:title "Cocoa" :width 300 :height 200} (ui/vbox {:padding 10} l))]
+    (is (= "Cocoa" (cocoa/native-string w)))
+    (is (= "Hello" (cocoa/native-string l)))
+    (set-slot! l :text "Goodbye")
+    (is (= "Goodbye" (cocoa/native-string l)))
+    (ui/show! w)
+    (let [[x y width height] (cocoa/native-frame l)]
+      (is (= [10 10] [x y]) "flipped: placed from the top left")
+      (is (= 280 width))
+      (is (< 10 height 30)))
+    (set-slot! l :visible false)
+    (is (cocoa/native-bool l "isHidden"))
+    (ui/close! w)))
+
+(deftest buttons-and-entries
+  (let [clicks (atom 0)
+        typed (atom [])
+        b (ui/button {:label "Go" :on-clicked (fn [e] (swap! clicks inc))})
+        e (ui/entry {:placeholder "Name" :on-changed (fn [ev] (swap! typed conj (:value ev)))
+                     :on-activate (fn [ev] (swap! typed conj :return))})
+        w (ui/window {} (ui/hbox {:spacing 8} e b))]
+    (is (= "Go" (cocoa/native-string b)))
+    (cocoa/click! b)
+    (is (= 1 @clicks))
+    (cocoa/type-text! e "Ada")
+    (is (= "Ada" (:text e)))
+    (cocoa/press-return! e)
+    (is (= ["Ada" :return] @typed))
+    (set-slot! e :text "Grace")
+    (is (= "Grace" (cocoa/native-string e)))
+    (testing "layout uses AppKit's natural sizes"
+      (ui/show! w)
+      (let [[ex _ ew _] (cocoa/native-frame e)
+            [bx _ bw _] (cocoa/native-frame b)]
+        (is (= 0 ex))
+        (is (= 150 ew) "20 characters of about 7 pixels")
+        (is (= (+ ew 8) bx))
+        (is (< 30 bw 120))))
+    (ui/close! w)))
+
+(deftest closing-asks-the-handlers
+  (let [w (ui/window {:title "Close me"} (ui/label {:text "x"}))
+        veto? (atom true)]
+    (ui/on w :close-request (fn [e] (when @veto? (ui/veto e))))
+    (ui/show! w)
+    (is (not (ui/close! w)))
+    (is (cocoa/native-bool w "isVisible"))
+    (reset! veto? false)
+    (is (ui/close! w))))
+
+(deftest calls-from-other-fibers
+  (let [l (ui/label {:text "before"})]
+    @(future (set-slot! l :text "from a fiber"))
+    (is (= "from a fiber" (cocoa/native-string l)))))
+
+(deftest the-event-loop-runs-other-fibers-calls
+  (let [l (ui/label {:text "waiting"})
+        w (ui/window {:title "Loop"} l)
+        seen (atom nil)]
+    (ui/show! w)
+    (future
+      (sleep 0.2)
+      (set-slot! l :text "changed during the loop")
+      (reset! seen (cocoa/native-string l))
+      (ui/quit!))
+    (ui/run!)
+    (is (= "changed during the loop" @seen))
+    (ui/close! w)))

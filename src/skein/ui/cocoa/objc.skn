@@ -1,0 +1,210 @@
+(ns skein.ui.cocoa.objc
+  "The Objective-C runtime from Skein, for the Cocoa backend (Skein's M2.14, D-097):
+classes and selectors by name, objc_msgSend in each shape of call the backend makes,
+NSStrings, autorelease pools, classes defined at run time whose methods are Skein
+callbacks, and a registry from native objects back to Skein's.
+
+Every call here must run on the main thread, as AppKit requires; the backend sees to it.
+The sends are marked ^:blocking since some of them run the event loop or a modal dialog,
+and all of them run on the main thread, which no fiber waits to share."
+  (:require [skein.ffi :as ffi]))
+
+;;; ------------------------------------------------------------------------------------
+;;; Libraries
+
+(def ^:private loaded (atom false))
+
+(defn load-frameworks!
+  "Load libobjc, Foundation and AppKit, once. Only on macOS: other systems never call it."
+  []
+  (when-not @loaded
+    (ffi/load-library {:macos "/usr/lib/libobjc.A.dylib"})
+    (ffi/load-library {:macos "/System/Library/Frameworks/Foundation.framework/Foundation"})
+    (ffi/load-library {:macos "/System/Library/Frameworks/AppKit.framework/AppKit"})
+    (reset! loaded true))
+  nil)
+
+;;; ------------------------------------------------------------------------------------
+;;; Geometry
+
+(ffi/defcstruct ns-rect
+  (x f64) (y f64) (width f64) (height f64))
+
+(ffi/defcstruct ns-size
+  (width f64) (height f64))
+
+(ffi/defcstruct ns-point
+  (x f64) (y f64))
+
+(defn rect
+  "An NSRect argument: a map of :x, :y, :width and :height."
+  [x y width height]
+  {:x (f64 x) :y (f64 y) :width (f64 width) :height (f64 height)})
+
+(defn rect-vec
+  "An NSRect result as [x y width height]."
+  [r]
+  [(ffi/field r ns-rect :x) (ffi/field r ns-rect :y)
+   (ffi/field r ns-rect :width) (ffi/field r ns-rect :height)])
+
+(defn size-vec
+  "An NSSize result as [width height]."
+  [s]
+  [(ffi/field s ns-size :width) (ffi/field s ns-size :height)])
+
+;;; ------------------------------------------------------------------------------------
+;;; The runtime
+
+(ffi/defcfun %get-class "objc_getClass" ptr [name c-string])
+(ffi/defcfun %sel "sel_registerName" ptr [name c-string])
+(ffi/defcfun %allocate-class "objc_allocateClassPair" ptr [super ptr, name c-string, extra u64])
+(ffi/defcfun %register-class "objc_registerClassPair" void [cls ptr])
+(ffi/defcfun %add-method "class_addMethod" bool [cls ptr, sel ptr, imp ptr, types c-string])
+(ffi/defcfun %pool-push "objc_autoreleasePoolPush" ptr [])
+(ffi/defcfun %pool-pop "objc_autoreleasePoolPop" void [pool ptr])
+(ffi/defcfun main-thread-np "pthread_main_np" i32 [])
+
+(defn main-thread?
+  "True on the process's main thread, where AppKit runs."
+  []
+  (= 1 (main-thread-np)))
+
+(def ^:private classes (atom {}))
+(def ^:private selectors (atom {}))
+
+(defn cls
+  "The Objective-C class named name."
+  [name]
+  (or (get @classes name)
+      (let [c (%get-class name)]
+        (when (ffi/null? c) (error "no Objective-C class named" name))
+        (swap! classes assoc name c)
+        c)))
+
+(defn sel
+  "The selector named name, such as \"setTitle:\"."
+  [name]
+  (or (get @selectors name)
+      (let [s (%sel name)]
+        (swap! selectors assoc name s)
+        s)))
+
+;;; objc_msgSend, once for each shape of call: send-<arguments>[-<result>], where the
+;;; letters are p (an object or pointer), l (an integer), d (a double), b (a BOOL), s (a C
+;;; string), r (an NSRect) and z (an NSSize); with no result named, an object.
+
+(ffi/defcfun ^:blocking send "objc_msgSend" ptr [self ptr, sel ptr])
+(ffi/defcfun ^:blocking send-void "objc_msgSend" void [self ptr, sel ptr])
+(ffi/defcfun ^:blocking send-bool "objc_msgSend" bool [self ptr, sel ptr])
+(ffi/defcfun ^:blocking send-long "objc_msgSend" i64 [self ptr, sel ptr])
+(ffi/defcfun ^:blocking send-double "objc_msgSend" f64 [self ptr, sel ptr])
+(ffi/defcfun ^:blocking send-cstr "objc_msgSend" c-string [self ptr, sel ptr])
+(ffi/defcfun ^:blocking send-rect "objc_msgSend" ns-rect [self ptr, sel ptr])
+(ffi/defcfun ^:blocking send-size "objc_msgSend" ns-size [self ptr, sel ptr])
+(ffi/defcfun ^:blocking send-p "objc_msgSend" ptr [self ptr, sel ptr, a ptr])
+(ffi/defcfun ^:blocking send-p-void "objc_msgSend" void [self ptr, sel ptr, a ptr])
+(ffi/defcfun ^:blocking send-p-bool "objc_msgSend" bool [self ptr, sel ptr, a ptr])
+(ffi/defcfun ^:blocking send-pp "objc_msgSend" ptr [self ptr, sel ptr, a ptr, b ptr])
+(ffi/defcfun ^:blocking send-pp-void "objc_msgSend" void [self ptr, sel ptr, a ptr, b ptr])
+(ffi/defcfun ^:blocking send-ppbp-void "objc_msgSend" void
+  [self ptr, sel ptr, a ptr, b ptr, c bool, d ptr])
+(ffi/defcfun ^:blocking send-l "objc_msgSend" ptr [self ptr, sel ptr, n i64])
+(ffi/defcfun ^:blocking send-l-void "objc_msgSend" void [self ptr, sel ptr, n i64])
+(ffi/defcfun ^:blocking send-d "objc_msgSend" ptr [self ptr, sel ptr, d f64])
+(ffi/defcfun ^:blocking send-d-void "objc_msgSend" void [self ptr, sel ptr, d f64])
+(ffi/defcfun ^:blocking send-b-void "objc_msgSend" void [self ptr, sel ptr, b bool])
+(ffi/defcfun ^:blocking send-s "objc_msgSend" ptr [self ptr, sel ptr, s c-string])
+(ffi/defcfun ^:blocking send-r "objc_msgSend" ptr [self ptr, sel ptr, r ns-rect])
+(ffi/defcfun ^:blocking send-r-void "objc_msgSend" void [self ptr, sel ptr, r ns-rect])
+(ffi/defcfun ^:blocking send-z-void "objc_msgSend" void [self ptr, sel ptr, z ns-size])
+(ffi/defcfun ^:blocking send-rllb "objc_msgSend" ptr
+  [self ptr, sel ptr, r ns-rect, style u64, backing u64, defer bool])
+(ffi/defcfun ^:blocking send-event "objc_msgSend" ptr
+  [self ptr, sel ptr, type u64, location ns-point, flags u64, time f64, window i64,
+   context ptr, subtype i16, data1 i64, data2 i64])
+(ffi/defcfun ^:blocking send-pb-void "objc_msgSend" void [self ptr, sel ptr, a ptr, b bool])
+
+(defn new-object
+  "A new instance of the class named class-name: [[class alloc] init], owned (+1)."
+  [class-name]
+  (send (send (cls class-name) (sel "alloc")) (sel "init")))
+
+(defn alloc
+  "[class alloc], for an init method that takes arguments."
+  [class-name]
+  (send (cls class-name) (sel "alloc")))
+
+(defn retain [o] (send o (sel "retain")))
+(defn release [o] (send-void o (sel "release")))
+
+(defn responds?
+  "True if the object answers the selector named name."
+  [o name]
+  (send-p-bool o (sel "respondsToSelector:") (sel name)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Strings
+
+(defn ns-string
+  "An autoreleased NSString of the Skein string s (nil for nil)."
+  [s]
+  (if (nil? s)
+    (ffi/null)
+    (send-s (cls "NSString") (sel "stringWithUTF8String:") (str s))))
+
+(defn string-of
+  "The Skein string of an NSString, or nil for a null one."
+  [o]
+  (when-not (ffi/null? o)
+    (send-cstr o (sel "UTF8String"))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Autorelease pools
+
+(defn call-with-pool
+  "f's value, called inside an autorelease pool."
+  [f]
+  (let [pool (%pool-push)]
+    (try (f)
+         (finally (%pool-pop pool)))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Classes defined at run time, whose methods are Skein callbacks
+
+(defn define-class!
+  "Define the Objective-C class class-name, a subclass of the class super-name, with
+methods [[selector-name imp type-encoding] ...]; imp is an ffi/defcallback. Returns the
+class, or the existing one if it was defined already (by this program, earlier)."
+  [class-name super-name methods]
+  (let [existing (%get-class class-name)]
+    (if-not (ffi/null? existing)
+      existing
+      (let [c (%allocate-class (cls super-name) class-name 0)]
+        (doseq [[sel-name imp types] methods]
+          (%add-method c (sel sel-name) imp types))
+        (%register-class c)
+        (swap! classes assoc class-name c)
+        c))))
+
+;;; ------------------------------------------------------------------------------------
+;;; From native objects to Skein's
+
+(def ^:private registry (atom {}))
+
+(defn register!
+  "Remember that the native object o stands for the Skein object x. Returns o."
+  [o x]
+  (swap! registry assoc (ffi/address o) x)
+  o)
+
+(defn unregister!
+  "Forget the native object o."
+  [o]
+  (swap! registry dissoc (ffi/address o))
+  nil)
+
+(defn object-for
+  "The Skein object the native object o stands for, or nil."
+  [o]
+  (when-not (ffi/null? o)
+    (get @registry (ffi/address o))))

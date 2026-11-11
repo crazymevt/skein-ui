@@ -1,0 +1,440 @@
+(ns skein.ui.cocoa
+  "The Cocoa backend (Skein's M2.14, D-097): skein.ui's widgets as AppKit's own controls,
+on macOS, through the Objective-C runtime (skein.ui.cocoa.objc).
+
+  (ui/use-backend! (cocoa/backend))
+
+AppKit runs on the main thread: -main runs there, and ui/run! runs the event loop there.
+A call from another fiber is queued for the main thread, which the backend wakes from
+the event loop to run it, while the fiber waits for its result.
+
+Containers are flipped views, so layout's coordinates (from the top left) are AppKit's
+too. For tests, click!, type-text!, press-return!, native-string and native-frame act on
+and read the real controls."
+  (:require [skein.ui :as ui]
+            [skein.ui.cocoa.objc :as objc]
+            [skein.ffi :as ffi]
+            [skein.math :as math]
+            [skein.system :as system]))
+
+;;; ------------------------------------------------------------------------------------
+;;; What each widget class implements here
+
+(defgeneric make-native [w]
+  "Make w's AppKit object, owned (+1), without its properties: the core sets them next.")
+
+(defgeneric set-native [w property value]
+  "Show value, w's new property, in its AppKit object. The default ignores the property.")
+
+(defmethod set-native [w property value]
+  nil)
+
+(defgeneric native-action [w sender]
+  "w's AppKit control sent its action (a click, Return): emit what the user did.")
+
+(defmethod native-action [w sender]
+  nil)
+
+(defgeneric native-text-changed [w field]
+  "The user edited the text of w's AppKit field.")
+
+(defmethod native-text-changed [w field]
+  nil)
+
+(defgeneric native-natural-size [w]
+  "w's natural [width height]: by default its AppKit view's fitting size.")
+
+(defgeneric container-view [o]
+  "The NSView that o's children go in: by default its own.")
+
+(defmethod container-view [o]
+  (:native o))
+
+(defn- view [o] (:native o))
+
+;;; ------------------------------------------------------------------------------------
+;;; Callbacks: the methods of our Objective-C classes
+
+(ffi/defcallback drain-imp void [self ptr, cmd ptr, arg ptr]
+  (drain-main-thread!))
+
+(ffi/defcallback action-imp void [self ptr, cmd ptr, sender ptr]
+  (when-let [w (objc/object-for sender)]
+    (native-action w sender)))
+
+(ffi/defcallback should-close-imp bool [self ptr, cmd ptr, window ptr]
+  (when-let [w (objc/object-for window)]
+    (ui/close! w))
+  false)
+
+(ffi/defcallback did-resize-imp void [self ptr, cmd ptr, note ptr]
+  (let [window (objc/send note (objc/sel "object"))]
+    (when-let [w (objc/object-for window)]
+      (let [[_ _ width height] (objc/rect-vec
+                                (objc/send-rect (objc/send window (objc/sel "contentView"))
+                                                (objc/sel "frame")))
+            width (int (math/round width))
+            height (int (math/round height))]
+        (when (not= [width height] [(:width w) (:height w)])
+          (ui/resized-by-user! w width height))))))
+
+(ffi/defcallback text-changed-imp void [self ptr, cmd ptr, note ptr]
+  (let [field (objc/send note (objc/sel "object"))]
+    (when-let [w (objc/object-for field)]
+      (native-text-changed w field))))
+
+(ffi/defcallback yes-imp bool [self ptr, cmd ptr]
+  true)
+
+;;; ------------------------------------------------------------------------------------
+;;; The backend, and running on the main thread
+
+(defclass cocoa-backend [ui/backend]
+  "The Cocoa backend."
+  (app :init nil :doc "The NSApplication.")
+  (waker :init nil :doc "The object whose drain: runs the main thread's queued work.")
+  (target :init nil :doc "The target of every control's action.")
+  (window-delegate :init nil)
+  (text-delegate :init nil)
+  (modes :init nil :doc "An NSArray of the run loop modes AppKit runs in."))
+
+(defn- define-classes! []
+  (objc/define-class! "SkeinWaker" "NSObject" [["drain:" drain-imp "v@:@"]])
+  (objc/define-class! "SkeinTarget" "NSObject" [["action:" action-imp "v@:@"]])
+  (objc/define-class! "SkeinWindowDelegate" "NSObject"
+                      [["windowShouldClose:" should-close-imp "B@:@"]
+                       ["windowDidResize:" did-resize-imp "v@:@"]])
+  (objc/define-class! "SkeinTextDelegate" "NSObject"
+                      [["controlTextDidChange:" text-changed-imp "v@:@"]])
+  (objc/define-class! "SkeinFlippedView" "NSView" [["isFlipped" yes-imp "B@:"]]))
+
+(defn backend
+  "A new Cocoa backend. Make it on the main thread (in -main, or a test)."
+  []
+  (when-not (= :macos (system/os))
+    (error "the Cocoa backend runs only on macOS"))
+  (objc/load-frameworks!)
+  (objc/call-with-pool
+   (fn []
+     (let [app (objc/send (objc/cls "NSApplication") (objc/sel "sharedApplication"))
+           ;; The modes by name: CoreFoundation knows kCFRunLoopCommonModes only as its own
+           ;; constant (by address), so a string of that name would be a mode of its own.
+           modes (reduce (fn [a mode]
+                           (objc/send-p a (objc/sel "arrayByAddingObject:") (objc/ns-string mode)))
+                         (objc/send (objc/cls "NSArray") (objc/sel "array"))
+                         ["kCFRunLoopDefaultMode" "NSModalPanelRunLoopMode"
+                          "NSEventTrackingRunLoopMode"])]
+       (objc/send-l-void app (objc/sel "setActivationPolicy:") 0)
+       (define-classes!)
+       (make cocoa-backend :app app :modes (objc/retain modes)
+             :waker (objc/new-object "SkeinWaker")
+             :target (objc/new-object "SkeinTarget")
+             :window-delegate (objc/new-object "SkeinWindowDelegate")
+             :text-delegate (objc/new-object "SkeinTextDelegate"))))))
+
+(defn- wake-main-thread!
+  "Make the event loop run the work queued for the main thread soon, also while a menu is
+open, a modal dialog runs or the user drags."
+  [b]
+  (objc/send-ppbp-void (:waker b)
+                       (objc/sel "performSelectorOnMainThread:withObject:waitUntilDone:modes:")
+                       (objc/sel "drain:") (ffi/null) false (:modes b)))
+
+(defmethod ui/backend-in-ui-thread [(b cocoa-backend) f]
+  (if (objc/main-thread?)
+    (objc/call-with-pool f)
+    (let [t (spawn-pinned :main (objc/call-with-pool f))]
+      (wake-main-thread! b)
+      @t)))
+
+(defmethod ui/backend-call-later [(b cocoa-backend) f]
+  (spawn-pinned :main (objc/call-with-pool f))
+  (wake-main-thread! b)
+  nil)
+
+(defmethod ui/backend-run-loop [(b cocoa-backend)]
+  (objc/call-with-pool
+   (fn []
+     (objc/send-b-void (:app b) (objc/sel "activateIgnoringOtherApps:") true)
+     (objc/send-void (:app b) (objc/sel "run")))))
+
+(defmethod ui/backend-quit-loop [(b cocoa-backend)]
+  (ui/backend-in-ui-thread
+   b
+   (fn []
+     (objc/send-p-void (:app b) (objc/sel "stop:") (ffi/null))
+     ;; stop: takes effect after the next event, so post one.
+     (let [e (objc/send-event
+              (objc/cls "NSEvent")
+              (objc/sel (str "otherEventWithType:location:modifierFlags:timestamp:"
+                             "windowNumber:context:subtype:data1:data2:"))
+              15 {:x 0.0 :y 0.0} 0 0.0 0 (ffi/null) 0 0 0)]
+       (objc/send-pb-void (:app b) (objc/sel "postEvent:atStart:") e true)))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Objects, properties and layout
+
+(defmethod ui/backend-realize [(b cocoa-backend) o]
+  (objc/register! (make-native o) o))
+
+(defmethod ui/backend-destroy [(b cocoa-backend) o]
+  (let [n (view o)]
+    (cond (instance? ui/window-widget o) (objc/send-void n (objc/sel "close"))
+          (instance? ui/widget o) (objc/send-void n (objc/sel "removeFromSuperview")))
+    (objc/unregister! n)
+    (objc/release n)))
+
+(defmethod ui/backend-set-property [(b cocoa-backend) o property value]
+  (set-native o property value))
+
+(defmethod ui/backend-get-property [(b cocoa-backend) o property]
+  (slot o property))
+
+(defmethod ui/backend-add-child [(b cocoa-backend) parent child]
+  (objc/send-p-void (container-view parent) (objc/sel "addSubview:") (view child)))
+
+(defmethod ui/backend-remove-child [(b cocoa-backend) parent child]
+  (objc/send-void (view child) (objc/sel "removeFromSuperview")))
+
+(defmethod native-natural-size [w]
+  (let [[width height] (objc/size-vec (objc/send-size (view w) (objc/sel "fittingSize")))]
+    [(int (math/ceil width)) (int (math/ceil height))]))
+
+(defmethod ui/backend-natural-size [(b cocoa-backend) w]
+  (native-natural-size w))
+
+(defmethod ui/backend-set-bounds [(b cocoa-backend) w x y width height]
+  (objc/send-r-void (view w) (objc/sel "setFrame:") (objc/rect x y width height)))
+
+(defn- flipped-view []
+  (objc/send-r (objc/alloc "SkeinFlippedView") (objc/sel "initWithFrame:") (objc/rect 0 0 0 0)))
+
+(defn- set-string! [o selector s]
+  (objc/send-p-void (view o) (objc/sel selector) (objc/ns-string (str (or s "")))))
+
+(defn- set-bool! [o selector v]
+  (objc/send-b-void (view o) (objc/sel selector) (boolean v)))
+
+(defn- set-long! [o selector v]
+  (objc/send-l-void (view o) (objc/sel selector) v))
+
+(defn- connect-action!
+  "Make the control send its action to the backend's target. Returns it."
+  [n]
+  (objc/send-p-void n (objc/sel "setTarget:") (:target (ui/current-backend)))
+  (objc/send-p-void n (objc/sel "setAction:") (objc/sel "action:"))
+  n)
+
+(defn- init-frame
+  "[[class-name alloc] initWithFrame:NSZeroRect]."
+  [class-name]
+  (objc/send-r (objc/alloc class-name) (objc/sel "initWithFrame:") (objc/rect 0 0 0 0)))
+
+(defmethod set-native [(w ui/widget) (p (= :visible)) v]
+  (set-bool! w "setHidden:" (not v)))
+
+(defmethod set-native [(w ui/widget) (p (= :enabled)) v]
+  (when (objc/responds? (view w) "setEnabled:")
+    (set-bool! w "setEnabled:" v)))
+
+(defmethod set-native [(w ui/widget) (p (= :tooltip)) v]
+  (objc/send-p-void (view w) (objc/sel "setToolTip:") (objc/ns-string v)))
+
+(defn- text-alignment
+  "AppKit's NSTextAlignment for :left, :center or :right. Apple silicon Macs number them
+as iOS does; Intel Macs put right before center."
+  [a]
+  (let [ios (= :aarch64 (system/arch))]
+    (case a
+      :center (if ios 1 2)
+      :right (if ios 2 1)
+      0)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Windows
+
+(defmethod make-native [(w ui/window-widget)]
+  (let [b (ui/current-backend)
+        win (objc/send-rllb (objc/alloc "NSWindow")
+                            (objc/sel "initWithContentRect:styleMask:backing:defer:")
+                            (objc/rect 0 0 400 300) 15 2 false)
+        content (flipped-view)]
+    (objc/send-b-void win (objc/sel "setReleasedWhenClosed:") false)
+    (objc/send-p-void win (objc/sel "setContentView:") content)
+    (objc/release content)
+    (objc/send-p-void win (objc/sel "setDelegate:") (:window-delegate b))
+    win))
+
+(defmethod container-view [(w ui/window-widget)]
+  (objc/send (view w) (objc/sel "contentView")))
+
+(defmethod set-native [(w ui/window-widget) (p (= :title)) v]
+  (set-string! w "setTitle:" v))
+
+(defn- set-content-size! [w]
+  (when (and (:width w) (:height w))
+    (objc/send-z-void (view w) (objc/sel "setContentSize:")
+                      {:width (f64 (:width w)) :height (f64 (:height w))})))
+
+(defmethod set-native [(w ui/window-widget) (p (= :width)) v]
+  (set-content-size! w))
+
+(defmethod set-native [(w ui/window-widget) (p (= :height)) v]
+  (set-content-size! w))
+
+(defmethod ui/backend-show [(b cocoa-backend) w]
+  (objc/send-void (view w) (objc/sel "center"))
+  (objc/send-p-void (view w) (objc/sel "makeKeyAndOrderFront:") (ffi/null)))
+
+(defmethod ui/backend-close [(b cocoa-backend) w]
+  (objc/send-p-void (view w) (objc/sel "orderOut:") (ffi/null)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Containers: flipped views, so children are placed from the top left
+
+(defmethod make-native [(w ui/box-widget)] (flipped-view))
+(defmethod make-native [(w ui/grid-widget)] (flipped-view))
+(defmethod make-native [(w ui/spacer-widget)] (flipped-view))
+
+(defmethod make-native [(s ui/separator-widget)]
+  (let [n (init-frame "NSBox")]
+    (objc/send-l-void n (objc/sel "setBoxType:") 2)
+    n))
+
+(defmethod native-natural-size [(s ui/separator-widget)]
+  (if (= :vertical (:orientation s)) [1 0] [0 1]))
+
+;;; ------------------------------------------------------------------------------------
+;;; Labels, buttons and entries
+
+(defmethod make-native [(l ui/label-widget)]
+  (objc/retain (objc/send-p (objc/cls "NSTextField") (objc/sel "labelWithString:")
+                            (objc/ns-string ""))))
+
+(defmethod set-native [(l ui/label-widget) (p (= :text)) v]
+  (set-string! l "setStringValue:" v))
+
+(defmethod set-native [(l ui/label-widget) (p (= :alignment)) v]
+  (set-long! l "setAlignment:" (text-alignment v)))
+
+(defmethod set-native [(l ui/label-widget) (p (= :selectable)) v]
+  (set-bool! l "setSelectable:" v))
+
+(defmethod set-native [(l ui/label-widget) (p (= :wrap)) v]
+  ;; NSLineBreakByWordWrapping is 0, NSLineBreakByTruncatingTail 4.
+  (set-long! l "setLineBreakMode:" (if v 0 4))
+  (set-long! l "setMaximumNumberOfLines:" (if v 0 1)))
+
+(defmethod native-natural-size [(l ui/label-widget)]
+  (if (and (:wrap l) (:width l))
+    (do (objc/send-d-void (view l) (objc/sel "setPreferredMaxLayoutWidth:") (f64 (:width l)))
+        (call-next-method))
+    (call-next-method)))
+
+(defmethod make-native [(b ui/button-widget)]
+  (let [n (init-frame "NSButton")]
+    (objc/send-l-void n (objc/sel "setButtonType:") 7)   ; NSButtonTypeMomentaryPushIn
+    (objc/send-l-void n (objc/sel "setBezelStyle:") 1)   ; NSBezelStyleRounded
+    (connect-action! n)))
+
+(defmethod set-native [(b ui/button-widget) (p (= :label)) v]
+  (set-string! b "setTitle:" v))
+
+(defmethod set-native [(b ui/button-widget) (p (= :default)) v]
+  (when (or v (not (:cancel b)))
+    (set-string! b "setKeyEquivalent:" (if v "\r" ""))))
+
+(defmethod set-native [(b ui/button-widget) (p (= :cancel)) v]
+  (when (or v (not (:default b)))
+    (set-string! b "setKeyEquivalent:" (if v "\u001b" ""))))
+
+(defmethod set-native [(b ui/button-widget) (p (= :style)) v]
+  (set-bool! b "setBordered:" (= v :push)))
+
+(defmethod native-action [(b ui/button-widget) sender]
+  (ui/emit! b (ui/event-for b :clicked)))
+
+(defn- make-field [class-name]
+  (let [n (init-frame class-name)]
+    (objc/send-p-void n (objc/sel "setDelegate:") (:text-delegate (ui/current-backend)))
+    (connect-action! n)))
+
+(defmethod make-native [(e ui/entry-widget)] (make-field "NSTextField"))
+(defmethod make-native [(e ui/password-entry-widget)] (make-field "NSSecureTextField"))
+
+(defmethod make-native [(e ui/search-entry-widget)]
+  (let [n (make-field "NSSearchField")]
+    ;; Send the action on Return only, not as the user types.
+    (objc/send-b-void n (objc/sel "setSendsWholeSearchString:") true)
+    n))
+
+(defmethod set-native [(e ui/entry-widget) (p (= :text)) v]
+  (set-string! e "setStringValue:" v))
+
+(defmethod set-native [(e ui/entry-widget) (p (= :placeholder)) v]
+  (objc/send-p-void (view e) (objc/sel "setPlaceholderString:") (objc/ns-string v)))
+
+(defmethod set-native [(e ui/entry-widget) (p (= :editable)) v]
+  (set-bool! e "setEditable:" v))
+
+(defmethod set-native [(e ui/entry-widget) (p (= :alignment)) v]
+  (set-long! e "setAlignment:" (text-alignment v)))
+
+(defmethod native-natural-size [(e ui/entry-widget)]
+  (let [[_ height] (call-next-method)]
+    [(+ 10 (* 7 (:width-chars e))) height]))
+
+(defmethod native-text-changed [(e ui/entry-widget) field]
+  (ui/changed-by-user! e :text (objc/string-of (objc/send field (objc/sel "stringValue")))))
+
+(defmethod native-action [(e ui/entry-widget) sender]
+  (ui/emit! e (ui/event-for e :activate)))
+
+;;; ------------------------------------------------------------------------------------
+;;; For tests: the real controls, read and acted on
+
+(defn native-frame
+  "The AppKit frame of the widget's view, [x y width height] in its container's
+coordinates (from the top left)."
+  [w]
+  (mapv (fn [x] (int (math/round x)))
+        (objc/rect-vec (objc/send-rect (view w) (objc/sel "frame")))))
+
+(defn native-string
+  "The text the widget's control shows: a button's or a window's title, or a field's
+string value."
+  [w]
+  (let [n (view w)]
+    (objc/call-with-pool
+     (fn []
+       (objc/string-of (objc/send n (objc/sel (if (objc/responds? n "title")
+                                                "title"
+                                                "stringValue"))))))))
+
+(defn native-bool
+  "The BOOL the widget's AppKit object answers to the selector named name, such as
+\"isHidden\"."
+  [w name]
+  (objc/send-bool (view w) (objc/sel name)))
+
+(defn click!
+  "Click the button, as AppKit does for a mouse click (performClick:)."
+  [b]
+  (objc/send-p-void (view b) (objc/sel "performClick:") (ffi/null)))
+
+(defn type-text!
+  "Make the field's text s and tell its delegate the text changed, as typing does."
+  [e s]
+  (objc/call-with-pool
+   (fn []
+     (objc/send-p-void (view e) (objc/sel "setStringValue:") (objc/ns-string s))
+     (objc/send-pp-void (objc/send (objc/cls "NSNotificationCenter") (objc/sel "defaultCenter"))
+                        (objc/sel "postNotificationName:object:")
+                        (objc/ns-string "NSControlTextDidChangeNotification") (view e)))))
+
+(defn press-return!
+  "Send the field's action, as pressing Return in it does."
+  [e]
+  (let [n (view e)]
+    (objc/send-pp-void n (objc/sel "sendAction:to:")
+                       (objc/send n (objc/sel "action")) (objc/send n (objc/sel "target")))))
