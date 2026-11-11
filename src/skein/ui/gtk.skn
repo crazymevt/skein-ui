@@ -1075,6 +1075,22 @@ inside it that holds its children."
       (lib/paned-set-start-child n (ffi/null))
       (lib/paned-set-end-child n (ffi/null)))))
 
+(def ^:private divider-thickness
+  "How thick GtkPaned's divider is, measured once on a split pane of two empty panes."
+  (atom nil))
+
+(defmethod ui/backend-decoration-size [(b gtk-backend) (p ui/paned-widget)]
+  ;; Left out, the panes ask for the divider's pixels more than the window has, and GTK
+  ;; widens the window by that on every layout.
+  (let [t (or @divider-thickness
+              (let [probe (owned (lib/paned-new 0))]
+                (lib/paned-set-start-child probe (lib/fixed-new))
+                (lib/paned-set-end-child probe (lib/fixed-new))
+                (let [[w _] (lib/natural-size probe)]
+                  (lib/g-object-unref probe)
+                  (reset! divider-thickness w))))]
+    [t t]))
+
 (defmethod layout-native [(p ui/paned-widget) width height]
   (let [lengths (ui/pane-lengths p (if (= :horizontal (:orientation p)) width height))]
     (when (seq lengths)

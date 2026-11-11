@@ -140,6 +140,8 @@
         w (ui/window {:width 400 :height 600} (ui/vbox {} f nb split scroll tv))]
     (ui/show! w)
     (gtk/settle!)
+    (dotimes [_ 5] (gtk/settle!))
+    (is (= 400 (:width w)) "the split pane's divider is counted: GTK doesn't widen the window")
     (testing "a frame holds its content inside its border"
       (let [[_ _ fw fh] (gtk/native-frame f)
             [lx ly lw lh] (gtk/native-frame l)]
