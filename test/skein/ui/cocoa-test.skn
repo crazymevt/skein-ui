@@ -94,6 +94,8 @@
         p (ui/progress-bar {:value 0.5})
         w (ui/window {} (ui/vbox {} c r1 r2 s n p (ui/spinner {})))]
     (is (= "Wrap" (cocoa/native-string c)))
+    (is (not= 0 (cocoa/native-image-position c)) "the box shows (not NSNoImage)")
+    (is (not= 0 (cocoa/native-image-position r1)))
     (cocoa/click! c)
     (is (= true (:checked c)))
     (cocoa/click! r2)

@@ -770,8 +770,17 @@ keyword gives the platform's own, which follows dark mode."
   (set-long! t "setState:" (if v 1 0)))
 
 (defmethod set-native [(t ui/toggle-button-widget) (p (= :image)) image]
-  (objc/send-p-void (view t) (objc/sel "setImage:") (ns-image image))
-  (set-long! t "setImagePosition:" (cond (nil? image) 0 (= :icon (:style t)) 1 :else 2)))
+  ;; A check box's or radio button's box is its button type's image: no image of the
+  ;; program's leaves it alone.
+  (when-not (and (nil? image)
+                 (or (instance? ui/check-box-widget t) (instance? ui/radio-button-widget t)))
+    (objc/send-p-void (view t) (objc/sel "setImage:") (ns-image image))
+    (set-long! t "setImagePosition:" (cond (nil? image) 0 (= :icon (:style t)) 1 :else 2))))
+
+(defn native-image-position
+  "The NSCellImagePosition of a button or toggle (0 none, 2 left of the title, 7 leading)."
+  [w]
+  (objc/send-long (view w) (objc/sel "imagePosition")))
 
 (defmethod native-action [(t ui/toggle-button-widget) sender]
   (let [on (= 1 (objc/send-long sender (objc/sel "state")))]
