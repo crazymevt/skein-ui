@@ -1,0 +1,188 @@
+(ns skein.ui.gtk.lib
+  "The parts of GTK 4, GObject and GLib that the GTK backend calls (Skein's M2.14, D-097),
+written by hand, and a registry from GTK objects back to Skein's.
+
+Every call here runs on the main thread, where GTK was initialized; the backend sees to
+it. The calls are marked ^:blocking: some run the main loop, and all run on the main
+thread, which no fiber waits to share."
+  (:require [skein.ffi :as ffi]))
+
+;;; ------------------------------------------------------------------------------------
+;;; Loading
+
+(def ^:private loaded (atom nil))
+
+(defn load!
+  "Load GTK 4 once. True if it loaded (false if it isn't installed)."
+  []
+  (when (nil? @loaded)
+    (reset! loaded
+            (try (ffi/load-library {:macos "libgtk-4.1.dylib"
+                                    :linux ["libgtk-4.so.1" "libgtk-4.so"]
+                                    :windows "libgtk-4-1.dll"})
+                 true
+                 (catch error e false))))
+  @loaded)
+
+;;; ------------------------------------------------------------------------------------
+;;; GLib and GObject
+
+(ffi/defcfun ^:blocking g-object-ref-sink "g_object_ref_sink" ptr [o ptr])
+(ffi/defcfun ^:blocking g-object-ref "g_object_ref" ptr [o ptr])
+(ffi/defcfun ^:blocking g-object-unref "g_object_unref" void [o ptr])
+(ffi/defcfun ^:blocking g-free "g_free" void [p ptr])
+(ffi/defcfun ^:blocking g-signal-connect-data "g_signal_connect_data" u64
+  [instance ptr, signal c-string, handler ptr, data ptr, destroy ptr, flags i32])
+(ffi/defcfun ^:blocking g-signal-emit-by-name "g_signal_emit_by_name" void
+  [instance ptr, signal c-string & end ptr])
+(ffi/defcfun ^:blocking g-signal-handlers-block "g_signal_handlers_block_matched" u32
+  [instance ptr, mask i32, id u32, detail u32, closure ptr, func ptr, data ptr])
+(ffi/defcfun g-idle-add "g_idle_add" u32 [f ptr, data ptr])
+(ffi/defcfun g-thread-self "g_thread_self" ptr [])
+(ffi/defcfun ^:blocking g-timeout-add "g_timeout_add" u32 [interval u32, f ptr, data ptr])
+(ffi/defcfun ^:blocking g-source-remove "g_source_remove" bool [id u32])
+(ffi/defcfun ^:blocking g-main-context-iteration "g_main_context_iteration" bool
+  [context ptr, may-block bool])
+(ffi/defcfun ^:blocking g-main-context-pending "g_main_context_pending" bool [context ptr])
+(ffi/defcfun g-main-context-wakeup "g_main_context_wakeup" void [context ptr])
+(ffi/defcfun ^:blocking g-object-set-string "g_object_set" void
+  [o ptr, name c-string & value c-string, end ptr])
+(ffi/defcfun ^:blocking g-object-set-int "g_object_set" void
+  [o ptr, name c-string & value i32, end ptr])
+(ffi/defcfun ^:blocking g-object-set-double "g_object_set" void
+  [o ptr, name c-string & value f64, end ptr])
+
+(defn emit!
+  "Emit the GObject signal named name (one with no arguments) on o, as GTK does when the
+user acts."
+  [o name]
+  (g-signal-emit-by-name o name (ffi/null)))
+
+(defn signal-data
+  "A pointer whose address is the small integer n, for a signal handler's user data."
+  [n]
+  (ffi/ptr+ (ffi/null) n))
+
+;;; ------------------------------------------------------------------------------------
+;;; GTK: start, windows and widgets
+
+(ffi/defcfun ^:blocking gtk-init-check "gtk_init_check" bool [])
+(ffi/defcfun ^:blocking window-new "gtk_window_new" ptr [])
+(ffi/defcfun ^:blocking window-set-title "gtk_window_set_title" void [w ptr, title c-string])
+(ffi/defcfun ^:blocking window-get-title "gtk_window_get_title" c-string [w ptr])
+(ffi/defcfun ^:blocking window-set-child "gtk_window_set_child" void [w ptr, child ptr])
+(ffi/defcfun ^:blocking window-set-default-size "gtk_window_set_default_size" void
+  [w ptr, width i32, height i32])
+(ffi/defcfun ^:blocking window-get-default-size "gtk_window_get_default_size" void
+  [w ptr, width ptr, height ptr])
+(ffi/defcfun ^:blocking window-present "gtk_window_present" void [w ptr])
+(ffi/defcfun ^:blocking window-destroy "gtk_window_destroy" void [w ptr])
+(ffi/defcfun ^:blocking window-close "gtk_window_close" void [w ptr])
+
+(ffi/defcfun ^:blocking fixed-new "gtk_fixed_new" ptr [])
+(ffi/defcfun ^:blocking fixed-put "gtk_fixed_put" void [f ptr, w ptr, x f64, y f64])
+(ffi/defcfun ^:blocking fixed-move "gtk_fixed_move" void [f ptr, w ptr, x f64, y f64])
+(ffi/defcfun ^:blocking fixed-remove "gtk_fixed_remove" void [f ptr, w ptr])
+
+(ffi/defcfun ^:blocking widget-set-size-request "gtk_widget_set_size_request" void
+  [w ptr, width i32, height i32])
+(ffi/defcfun ^:blocking widget-measure "gtk_widget_measure" void
+  [w ptr, orientation i32, for-size i32, min ptr, nat ptr, min-base ptr, nat-base ptr])
+(ffi/defcfun ^:blocking widget-set-visible "gtk_widget_set_visible" void [w ptr, v bool])
+(ffi/defcfun ^:blocking widget-get-visible "gtk_widget_get_visible" bool [w ptr])
+(ffi/defcfun ^:blocking widget-set-sensitive "gtk_widget_set_sensitive" void [w ptr, v bool])
+(ffi/defcfun ^:blocking widget-set-tooltip-text "gtk_widget_set_tooltip_text" void
+  [w ptr, text c-string])
+(ffi/defcfun ^:blocking widget-get-parent "gtk_widget_get_parent" ptr [w ptr])
+(ffi/defcfun ^:blocking widget-unparent "gtk_widget_unparent" void [w ptr])
+(ffi/defcfun ^:blocking widget-get-width "gtk_widget_get_width" i32 [w ptr])
+(ffi/defcfun ^:blocking widget-get-height "gtk_widget_get_height" i32 [w ptr])
+(ffi/defcfun ^:blocking widget-compute-point "gtk_widget_compute_point" bool
+  [w ptr, target ptr, point ptr, out ptr])
+(ffi/defcfun ^:blocking widget-add-controller "gtk_widget_add_controller" void
+  [w ptr, controller ptr])
+(ffi/defcfun ^:blocking widget-queue-draw "gtk_widget_queue_draw" void [w ptr])
+(ffi/defcfun ^:blocking widget-grab-focus "gtk_widget_grab_focus" bool [w ptr])
+
+(ffi/defcstruct graphene-point (x f32) (y f32))
+(ffi/defcstruct graphene-rect (x f32) (y f32) (width f32) (height f32))
+(ffi/defcfun ^:blocking widget-compute-bounds "gtk_widget_compute_bounds" bool
+  [w ptr, target ptr, out ptr])
+
+(defn bounds-in
+  "The GTK widget w's bounds in target's coordinates, [x y width height], or nil if GTK
+hasn't placed it."
+  [w target]
+  (ffi/with-foreign [r (ffi/alloc graphene-rect)]
+    (when (widget-compute-bounds w target r)
+      [(ffi/field r graphene-rect :x) (ffi/field r graphene-rect :y)
+       (ffi/field r graphene-rect :width) (ffi/field r graphene-rect :height)])))
+
+(defn natural-size
+  "The natural [width height] of the GTK widget w, measured without a size request."
+  [w]
+  (ffi/with-foreign [mn (ffi/alloc i32 1)]
+    (ffi/with-foreign [nt (ffi/alloc i32 1)]
+      (widget-set-size-request w -1 -1)
+      (widget-measure w 0 -1 mn nt (ffi/null) (ffi/null))
+      (let [width (ffi/get nt i32)]
+        (widget-measure w 1 width mn nt (ffi/null) (ffi/null))
+        [width (ffi/get nt i32)]))))
+
+(defn position-in
+  "Where the GTK widget w's top left is in target's coordinates, [x y], or nil if GTK
+hasn't placed it."
+  [w target]
+  (ffi/with-foreign [p (ffi/alloc graphene-point)]
+    (ffi/with-foreign [out (ffi/alloc graphene-point)]
+      (when (widget-compute-point w target p out)
+        [(ffi/field out graphene-point :x) (ffi/field out graphene-point :y)]))))
+
+;;; Text and buttons
+
+(ffi/defcfun ^:blocking label-new "gtk_label_new" ptr [text c-string])
+(ffi/defcfun ^:blocking label-set-text "gtk_label_set_text" void [l ptr, text c-string])
+(ffi/defcfun ^:blocking label-get-text "gtk_label_get_text" c-string [l ptr])
+(ffi/defcfun ^:blocking label-set-xalign "gtk_label_set_xalign" void [l ptr, x f32])
+(ffi/defcfun ^:blocking label-set-wrap "gtk_label_set_wrap" void [l ptr, v bool])
+(ffi/defcfun ^:blocking label-set-selectable "gtk_label_set_selectable" void [l ptr, v bool])
+(ffi/defcfun ^:blocking label-set-max-width-chars "gtk_label_set_max_width_chars" void
+  [l ptr, n i32])
+
+(ffi/defcfun ^:blocking button-new "gtk_button_new" ptr [])
+(ffi/defcfun ^:blocking button-set-label "gtk_button_set_label" void [b ptr, text c-string])
+(ffi/defcfun ^:blocking button-get-label "gtk_button_get_label" c-string [b ptr])
+(ffi/defcfun ^:blocking button-set-has-frame "gtk_button_set_has_frame" void [b ptr, v bool])
+
+(ffi/defcfun ^:blocking entry-new "gtk_entry_new" ptr [])
+(ffi/defcfun ^:blocking password-entry-new "gtk_password_entry_new" ptr [])
+(ffi/defcfun ^:blocking search-entry-new "gtk_search_entry_new" ptr [])
+(ffi/defcfun ^:blocking entry-set-placeholder "gtk_entry_set_placeholder_text" void
+  [e ptr, text c-string])
+(ffi/defcfun ^:blocking editable-set-text "gtk_editable_set_text" void [e ptr, text c-string])
+(ffi/defcfun ^:blocking editable-get-text "gtk_editable_get_text" c-string [e ptr])
+(ffi/defcfun ^:blocking editable-set-editable "gtk_editable_set_editable" void [e ptr, v bool])
+(ffi/defcfun ^:blocking editable-set-alignment "gtk_editable_set_alignment" void
+  [e ptr, x f32])
+(ffi/defcfun ^:blocking editable-set-width-chars "gtk_editable_set_width_chars" void
+  [e ptr, n i32])
+
+(ffi/defcfun ^:blocking separator-new "gtk_separator_new" ptr [orientation i32])
+
+;;; ------------------------------------------------------------------------------------
+;;; From GTK objects to Skein's
+
+(def ^:private registry (atom {}))
+
+(defn register!
+  "Remember that the GTK object o stands for the Skein object x. Returns o."
+  [o x]
+  (swap! registry assoc (ffi/address o) x)
+  o)
+
+(defn unregister! [o] (swap! registry dissoc (ffi/address o)) nil)
+
+(defn object-for
+  "The Skein object the GTK object o stands for, or nil."
+  [o]
+  (when-not (ffi/null? o) (get @registry (ffi/address o))))

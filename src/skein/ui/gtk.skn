@@ -1,0 +1,370 @@
+(ns skein.ui.gtk
+  "The GTK 4 backend (Skein's M2.14, D-097): skein.ui's widgets as GTK's own, on Linux
+(and on macOS, with Homebrew's GTK), through skein.ui.gtk.lib.
+
+  (ui/use-backend! (gtk/backend))
+
+GTK runs on the main thread, where it was initialized: -main runs there, and ui/run!
+runs the main loop there. A call from another fiber is queued for the main thread, which
+an idle source wakes the main loop to run, while the fiber waits for its result.
+
+Every container is a GtkFixed in which layout places each child and sets its size
+request. For tests, click!, type-text!, press-return!, native-string and native-frame
+act on and read the real widgets."
+  (:require [skein.ui :as ui]
+            [skein.ui.gtk.lib :as lib]
+            [skein.ffi :as ffi]
+            [skein.math :as math]
+            [skein.string :as string]))
+
+;;; ------------------------------------------------------------------------------------
+;;; What each widget class implements here
+
+(defgeneric make-native [w]
+  "Make w's GTK widget, with a reference of our own, without its properties: the core
+sets them next.")
+
+(defgeneric set-native [w property value]
+  "Show value, w's new property, in its GTK widget. The default ignores the property.")
+
+(defmethod set-native [w property value]
+  nil)
+
+(defgeneric native-signal [w kind instance arg]
+  "w's GTK widget (or a controller of it), instance, emitted the signal we know as kind
+(:clicked, :changed, ...), with arg, its argument if it has one.")
+
+(defmethod native-signal [w kind instance arg]
+  nil)
+
+(defgeneric native-natural-size [w]
+  "w's natural [width height]: by default its GTK widget's natural size.")
+
+(defgeneric container-view [o]
+  "The GtkFixed that o's children go in: by default its own widget.")
+
+(defmethod container-view [o]
+  (:native o))
+
+(defn- native [o] (:native o))
+
+;;; ------------------------------------------------------------------------------------
+;;; Signals: a few callbacks, one for each C signature. The handler's user data is a
+;;; small integer saying which signal it is.
+
+(def ^:private signal-kinds
+  [:clicked :activate :changed :toggled :value-changed :resized :selected :switch-page
+   :close-request])
+
+(defn- kind-of [data] (nth signal-kinds (ffi/address data)))
+
+(defn connect!
+  "Connect the GTK object o's signal named signal-name to the callback handler (one of
+this namespace's), reporting it as kind. Returns o."
+  [o signal-name kind handler]
+  (lib/g-signal-connect-data o signal-name handler
+                             (lib/signal-data (index-of signal-kinds kind)) (ffi/null) 0)
+  o)
+
+(ffi/defcallback signal-imp void [instance ptr, data ptr]
+  (when-let [w (lib/object-for instance)]
+    (native-signal w (kind-of data) instance nil)))
+
+(ffi/defcallback signal-arg-imp void [instance ptr, arg ptr, data ptr]
+  (when-let [w (lib/object-for instance)]
+    (native-signal w (kind-of data) instance arg)))
+
+(ffi/defcallback close-request-imp bool [window ptr, data ptr]
+  (when-let [w (lib/object-for window)]
+    (ui/close! w))
+  ;; true: GTK doesn't close the window itself; ui/close! did, unless a handler vetoed.
+  true)
+
+(ffi/defcallback idle-imp bool [data ptr]
+  (drain-main-thread!)
+  false)
+
+;;; ------------------------------------------------------------------------------------
+;;; The backend, and running on the main thread
+
+(defclass gtk-backend [ui/backend]
+  "The GTK 4 backend."
+  (main-thread :init nil :doc "The GThread of the main thread, where GTK was initialized.")
+  (running :cell :atom :init false :doc "Whether ui/run!'s main loop runs."))
+
+(defn available?
+  "True if GTK 4 is installed and can open the display."
+  []
+  (and (lib/load!) (lib/gtk-init-check)))
+
+(defn backend
+  "A new GTK backend. Make it on the main thread (in -main, or a test)."
+  []
+  (when-not (lib/load!)
+    (error "the GTK backend needs GTK 4, which isn't installed"))
+  (when-not (lib/gtk-init-check)
+    (error "GTK 4 can't open the display"))
+  (make gtk-backend :main-thread (lib/g-thread-self)))
+
+(defn- main-thread? [b]
+  (= (ffi/address (lib/g-thread-self)) (ffi/address (:main-thread b))))
+
+(defmethod ui/backend-in-ui-thread [(b gtk-backend) f]
+  (if (main-thread? b)
+    (f)
+    (let [t (spawn-pinned :main (f))]
+      (lib/g-idle-add idle-imp (ffi/null))
+      @t)))
+
+(defmethod ui/backend-call-later [(b gtk-backend) f]
+  (spawn-pinned :main (f))
+  (lib/g-idle-add idle-imp (ffi/null))
+  nil)
+
+(defmethod ui/backend-run-loop [(b gtk-backend)]
+  (set-slot! b :running true)
+  (while (:running b)
+    (lib/g-main-context-iteration (ffi/null) true)))
+
+(defmethod ui/backend-quit-loop [(b gtk-backend)]
+  (set-slot! b :running false)
+  (lib/g-main-context-wakeup (ffi/null)))
+
+(defn settle!
+  "Run the main loop until it has nothing left to do: GTK lays out and draws what changed.
+For tests, outside ui/run!."
+  []
+  (loop [n 0]
+    (when (and (< n 1000) (lib/g-main-context-pending (ffi/null)))
+      (lib/g-main-context-iteration (ffi/null) false)
+      (recur (inc n)))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Objects, properties and layout
+
+(def ^:private quiet-depth
+  "Above 0 while the backend changes a widget itself, so the signal it emits isn't taken
+for the user's doing."
+  (atom 0))
+
+(defn- quiet? [] (pos? @quiet-depth))
+
+(defn- quietly [f]
+  (swap! quiet-depth inc)
+  (try (f) (finally (swap! quiet-depth dec))))
+
+(defn- owned
+  "Take a reference of our own to the new GTK widget o (sinking a floating one). Returns o."
+  [o]
+  (lib/g-object-ref-sink o))
+
+(defmethod ui/backend-realize [(b gtk-backend) o]
+  (lib/register! (make-native o) o))
+
+(defmethod ui/backend-destroy [(b gtk-backend) o]
+  (let [n (native o)]
+    (cond (instance? ui/window-widget o) (lib/window-destroy n)
+          (instance? ui/widget o) (when-not (ffi/null? (lib/widget-get-parent n))
+                                    (lib/widget-unparent n)))
+    (lib/unregister! n)
+    (lib/g-object-unref n)))
+
+(defmethod ui/backend-set-property [(b gtk-backend) o property value]
+  (quietly (fn [] (set-native o property value))))
+
+(defmethod ui/backend-get-property [(b gtk-backend) o property]
+  (slot o property))
+
+(defmethod ui/backend-add-child [(b gtk-backend) parent child]
+  (lib/fixed-put (container-view parent) (native child) 0.0 0.0))
+
+(defmethod ui/backend-remove-child [(b gtk-backend) parent child]
+  (lib/fixed-remove (container-view parent) (native child)))
+
+(defmethod native-natural-size [w]
+  (let [n (native w)
+        size (lib/natural-size n)]
+    ;; Measuring cleared the size request; put back the one layout gave.
+    (when-let [[_ _ width height] (:allocation w)]
+      (lib/widget-set-size-request n width height))
+    size))
+
+(defmethod ui/backend-natural-size [(b gtk-backend) w]
+  (native-natural-size w))
+
+(defmethod ui/backend-set-bounds [(b gtk-backend) w x y width height]
+  (let [n (native w)]
+    (when-let [p (:parent w)]
+      (lib/fixed-move (container-view p) n (f64 x) (f64 y)))
+    (lib/widget-set-size-request n width height)))
+
+(defmethod set-native [(w ui/widget) (p (= :visible)) v]
+  (lib/widget-set-visible (native w) (boolean v)))
+
+(defmethod set-native [(w ui/widget) (p (= :enabled)) v]
+  (lib/widget-set-sensitive (native w) (boolean v)))
+
+(defmethod set-native [(w ui/widget) (p (= :tooltip)) v]
+  (lib/widget-set-tooltip-text (native w) v))
+
+(defn- xalign [a] (case a :center 0.5 :right 1.0 0.0))
+
+;;; ------------------------------------------------------------------------------------
+;;; Windows
+
+(def ^:private window-contents
+  "window's GtkWindow address -> its GtkFixed content."
+  (atom {}))
+
+(defmethod make-native [(w ui/window-widget)]
+  (let [win (lib/g-object-ref (lib/window-new))
+        content (lib/fixed-new)]
+    (lib/window-set-child win content)
+    (swap! window-contents assoc (ffi/address win) content)
+    (connect! win "close-request" :close-request close-request-imp)
+    (connect! win "notify::default-width" :resized signal-arg-imp)
+    (connect! win "notify::default-height" :resized signal-arg-imp)
+    win))
+
+(defmethod container-view [(w ui/window-widget)]
+  (get @window-contents (ffi/address (native w))))
+
+(defmethod set-native [(w ui/window-widget) (p (= :title)) v]
+  (lib/window-set-title (native w) (or v "")))
+
+(defn- set-default-size! [w]
+  (when (and (:width w) (:height w))
+    (lib/window-set-default-size (native w) (:width w) (:height w))))
+
+(defmethod set-native [(w ui/window-widget) (p (= :width)) v] (set-default-size! w))
+(defmethod set-native [(w ui/window-widget) (p (= :height)) v] (set-default-size! w))
+
+(defmethod native-signal [(w ui/window-widget) (k (= :resized)) win arg]
+  (when-not (quiet?)
+    (ffi/with-foreign [width (ffi/alloc i32 1)]
+      (ffi/with-foreign [height (ffi/alloc i32 1)]
+        (lib/window-get-default-size win width height)
+        (let [size [(ffi/get width i32) (ffi/get height i32)]]
+          (when (and (every? pos? size) (not= size [(:width w) (:height w)]))
+            (apply ui/resized-by-user! w size)))))))
+
+(defmethod ui/backend-show [(b gtk-backend) w]
+  (lib/window-present (native w)))
+
+(defmethod ui/backend-close [(b gtk-backend) w]
+  (lib/widget-set-visible (native w) false))
+
+;;; ------------------------------------------------------------------------------------
+;;; Containers: GtkFixed, where layout places the children
+
+(defmethod make-native [(w ui/box-widget)] (owned (lib/fixed-new)))
+(defmethod make-native [(w ui/grid-widget)] (owned (lib/fixed-new)))
+(defmethod make-native [(w ui/spacer-widget)] (owned (lib/fixed-new)))
+
+(defmethod make-native [(s ui/separator-widget)]
+  (owned (lib/separator-new (if (= :vertical (:orientation s)) 1 0))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Labels, buttons and entries
+
+(defmethod make-native [(l ui/label-widget)] (owned (lib/label-new "")))
+
+(defmethod set-native [(l ui/label-widget) (p (= :text)) v]
+  (lib/label-set-text (native l) (str (or v ""))))
+
+(defmethod set-native [(l ui/label-widget) (p (= :alignment)) v]
+  (lib/label-set-xalign (native l) (f32 (xalign v))))
+
+(defmethod set-native [(l ui/label-widget) (p (= :wrap)) v]
+  (lib/label-set-wrap (native l) (boolean v)))
+
+(defmethod set-native [(l ui/label-widget) (p (= :selectable)) v]
+  (lib/label-set-selectable (native l) (boolean v)))
+
+(defmethod make-native [(b ui/button-widget)]
+  (connect! (owned (lib/button-new)) "clicked" :clicked signal-imp))
+
+(defmethod set-native [(b ui/button-widget) (p (= :label)) v]
+  (lib/button-set-label (native b) (str (or v ""))))
+
+(defmethod set-native [(b ui/button-widget) (p (= :style)) v]
+  (lib/button-set-has-frame (native b) (= v :push)))
+
+(defmethod native-signal [(b ui/button-widget) (k (= :clicked)) instance arg]
+  (ui/emit! b (ui/event-for b :clicked)))
+
+(defn- make-entry [n]
+  (connect! n "changed" :changed signal-imp)
+  (connect! n "activate" :activate signal-imp)
+  n)
+
+(defmethod make-native [(e ui/entry-widget)] (make-entry (owned (lib/entry-new))))
+(defmethod make-native [(e ui/password-entry-widget)]
+  (make-entry (owned (lib/password-entry-new))))
+(defmethod make-native [(e ui/search-entry-widget)] (make-entry (owned (lib/search-entry-new))))
+
+(defmethod set-native [(e ui/entry-widget) (p (= :text)) v]
+  (lib/editable-set-text (native e) (str (or v ""))))
+
+(defmethod set-native [(e ui/entry-widget) (p (= :placeholder)) v]
+  (if (instance? ui/password-entry-widget e)
+    (lib/g-object-set-string (native e) "placeholder-text" (or v "") (ffi/null))
+    (if (instance? ui/search-entry-widget e)
+      (lib/g-object-set-string (native e) "placeholder-text" (or v "") (ffi/null))
+      (lib/entry-set-placeholder (native e) v))))
+
+(defmethod set-native [(e ui/entry-widget) (p (= :editable)) v]
+  (lib/editable-set-editable (native e) (boolean v)))
+
+(defmethod set-native [(e ui/entry-widget) (p (= :alignment)) v]
+  (lib/editable-set-alignment (native e) (f32 (xalign v))))
+
+(defmethod set-native [(e ui/entry-widget) (p (= :width-chars)) v]
+  (lib/editable-set-width-chars (native e) (or v 20)))
+
+(defmethod native-signal [(e ui/entry-widget) (k (= :changed)) instance arg]
+  (when-not (quiet?)
+    (let [t (lib/editable-get-text instance)]
+      (when (not= t (:text e))
+        (ui/changed-by-user! e :text t)))))
+
+(defmethod native-signal [(e ui/entry-widget) (k (= :activate)) instance arg]
+  (ui/emit! e (ui/event-for e :activate)))
+
+;;; ------------------------------------------------------------------------------------
+;;; For tests: the real widgets, read and acted on
+
+(defn native-frame
+  "Where GTK placed the widget, [x y width height], in its container's coordinates."
+  [w]
+  (mapv (fn [v] (int (math/round v)))
+        (or (lib/bounds-in (native w) (container-view (:parent w))) [0 0 0 0])))
+
+(defn native-string
+  "The text the widget shows: a label's, a button's label, an entry's, a window's title."
+  [w]
+  (let [n (native w)]
+    (cond (instance? ui/window-widget w) (lib/window-get-title n)
+          (instance? ui/label-widget w) (lib/label-get-text n)
+          (instance? ui/button-widget w) (lib/button-get-label n)
+          (instance? ui/entry-widget w) (lib/editable-get-text n))))
+
+(defn native-visible?
+  "True if the widget's GTK widget is visible."
+  [w]
+  (lib/widget-get-visible (native w)))
+
+(defn click!
+  "Click the button, as GTK does for a mouse click."
+  [b]
+  (lib/emit! (native b) "clicked"))
+
+(defn type-text!
+  "Make the entry's text s, as typing does: GTK emits changed."
+  [e s]
+  (lib/editable-set-text (native e) s))
+
+(defn press-return!
+  "Press Return in the entry: GTK emits activate."
+  [e]
+  (lib/emit! (native e) "activate"))

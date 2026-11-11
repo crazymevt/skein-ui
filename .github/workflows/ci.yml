@@ -132,5 +132,24 @@ jobs:
       - name: Bootstrap Skein
         run: cd skein && make compiler
 
-      - name: Run the tests (headless backend)
-        run: cd skein-ui && ../skein/skein test
+      - name: Install GTK 4 and Xvfb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # Ubuntu's mirrors sometimes fail to resolve: try a few times.
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y libgtk-4-1 xvfb && break
+            sleep 30
+          done
+          dpkg -s libgtk-4-1 > /dev/null
+
+      - name: Run the tests
+        env:
+          # GTK under Xvfb draws without OpenGL.
+          GSK_RENDERER: cairo
+        run: |
+          cd skein-ui
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run -a ../skein/skein test
+          else
+            ../skein/skein test
+          fi

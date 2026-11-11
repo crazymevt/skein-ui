@@ -1,0 +1,81 @@
+(ns skein.ui.gtk-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.gtk :as gtk]))
+
+;; The GTK 4 backend (step 5 of M2.14, D-097), where GTK 4 is installed and can open a
+;; display (Linux CI runs it under Xvfb): the widgets as GTK's, read back from GTK and
+;; acted on as the user would.
+
+(def gtk? (delay (gtk/available?)))
+
+(def backend (delay (gtk/backend)))
+
+(use-fixtures :each (fn [t] (when @gtk? (ui/use-backend! @backend) (t))))
+
+(deftest windows-and-labels
+  (let [l (ui/label {:text "Hello" :tooltip "greeting"})
+        w (ui/window {:title "GTK" :width 300 :height 200} (ui/vbox {:padding 10} l))]
+    (is (= "GTK" (gtk/native-string w)))
+    (is (= "Hello" (gtk/native-string l)))
+    (set-slot! l :text "Goodbye")
+    (is (= "Goodbye" (gtk/native-string l)))
+    (ui/show! w)
+    (gtk/settle!)
+    (let [[x y width height] (gtk/native-frame l)]
+      (is (= [10 10] [x y]) "placed from the top left of its box")
+      (is (= 280 width))
+      (is (< 10 height 40)))
+    (set-slot! l :visible false)
+    (is (not (gtk/native-visible? l)))
+    (ui/close! w)))
+
+(deftest buttons-and-entries
+  (let [clicks (atom 0)
+        typed (atom [])
+        b (ui/button {:label "Go" :on-clicked (fn [e] (swap! clicks inc))})
+        e (ui/entry {:placeholder "Name" :on-changed (fn [ev] (swap! typed conj (:value ev)))
+                     :on-activate (fn [ev] (swap! typed conj :return))})
+        w (ui/window {} (ui/hbox {:spacing 8} e b))]
+    (is (= "Go" (gtk/native-string b)))
+    (gtk/click! b)
+    (is (= 1 @clicks))
+    (gtk/type-text! e "Ada")
+    (is (= "Ada" (:text e)))
+    (gtk/press-return! e)
+    (is (= ["Ada" :return] @typed))
+    (set-slot! e :text "Grace")
+    (is (= "Grace" (gtk/native-string e)))
+    (is (= ["Ada" :return] @typed) "a program's change emits nothing")
+    (ui/show! w)
+    (gtk/settle!)
+    (let [[ex _ ew _] (gtk/native-frame e)
+          [bx _ bw _] (gtk/native-frame b)]
+      (is (= 0 ex))
+      (is (= (+ ew 8) bx))
+      (is (< 20 bw 150)))
+    (ui/close! w)))
+
+(deftest closing-asks-the-handlers
+  (let [w (ui/window {:title "Close me"} (ui/label {:text "x"}))
+        veto? (atom true)]
+    (ui/on w :close-request (fn [e] (when @veto? (ui/veto e))))
+    (ui/show! w)
+    (is (not (ui/close! w)))
+    (is (gtk/native-visible? w))
+    (reset! veto? false)
+    (is (ui/close! w))))
+
+(deftest the-main-loop-runs-other-fibers-calls
+  (let [l (ui/label {:text "waiting"})
+        w (ui/window {:title "Loop"} l)
+        seen (atom nil)]
+    (ui/show! w)
+    (future
+      (sleep 0.2)
+      (set-slot! l :text "changed during the loop")
+      (reset! seen (ui/backend-in-ui-thread (ui/current-backend) (fn [] (gtk/native-string l))))
+      (ui/quit!))
+    (ui/run!)
+    (is (= "changed during the loop" @seen))
+    (ui/close! w)))
