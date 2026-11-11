@@ -691,6 +691,12 @@ hasn't placed it."
 (ffi/defcfun ^:blocking settings-get-default "gtk_settings_get_default" ptr [])
 (ffi/defcfun ^:blocking g-object-get-bool "g_object_get" void
   [o ptr, name c-string & out ptr, end ptr])
+(ffi/defcfun ^:blocking g-object-get-int "g_object_get" void
+  [o ptr, name c-string & out ptr, end ptr])
+(ffi/defcfun ^:blocking pango-layout-get-context "pango_layout_get_context" ptr [l ptr])
+(ffi/defcfun ^:blocking pango-layout-context-changed "pango_layout_context_changed" void [l ptr])
+(ffi/defcfun ^:blocking pango-cairo-context-set-resolution "pango_cairo_context_set_resolution"
+  void [c ptr, dpi f64])
 
 (ffi/defcfun ^:blocking g-menu-model-n-items "g_menu_model_get_n_items" i32 [m ptr])
 (ffi/defcfun ^:blocking g-menu-model-attribute "g_menu_model_get_item_attribute_value" ptr

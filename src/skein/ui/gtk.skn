@@ -1522,11 +1522,23 @@ inside it that holds its children."
                                          :semibold "Semi-Bold" :bold "Bold" nil)
                                    (str (or (:size f) 10))]))))
 
+(defn- font-dpi
+  "The resolution GTK lays its widgets' text out at (gtk-xft-dpi): 96 on Linux, 72 on
+macOS. Pango's Cairo layouts default to 96, so text drawn on a canvas, and measured,
+would be bigger than the widgets' where it differs."
+  []
+  (ffi/with-foreign [out (ffi/alloc i32 1)]
+    (lib/g-object-get-int (lib/settings-get-default) "gtk-xft-dpi" out (ffi/null))
+    (let [v (ffi/get out i32)]
+      (if (pos? v) (/ v 1024.0) 96.0))))
+
 (defn- text-layout
   "A Pango layout of s in font on the Cairo context cr; free it with g-object-unref."
   [cr s font]
   (let [layout (lib/pango-cairo-create-layout cr)
         desc (lib/pango-font-from-string (pango-font font))]
+    (lib/pango-cairo-context-set-resolution (lib/pango-layout-get-context layout) (font-dpi))
+    (lib/pango-layout-context-changed layout)
     (lib/pango-layout-set-text layout s -1)
     (lib/pango-layout-set-font layout desc)
     (lib/pango-font-free desc)
