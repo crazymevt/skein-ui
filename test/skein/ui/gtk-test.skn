@@ -276,7 +276,12 @@
   (let [ticks (atom [])
         once (ui/after 0.05 (fn [] (swap! ticks conj :once)))
         often (ui/every 0.04 (fn [] (swap! ticks conj :often)))]
-    (gtk/run-for! 0.3)
+    ;; Until the ticks came, or two seconds: a busy machine may run the loop late.
+    (loop [n 0]
+      (when (and (< n 20) (not (and (some #{:once} @ticks)
+                                    (<= 3 (count (filter #{:often} @ticks))))))
+        (gtk/run-for! 0.1)
+        (recur (inc n))))
     (ui/stop-timer! often)
     (is (= 1 (count (filter #{:once} @ticks))))
     (is (<= 3 (count (filter #{:often} @ticks))))

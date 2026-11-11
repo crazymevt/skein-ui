@@ -10,6 +10,7 @@ pixels a character, 16 a line of text, 24 for a field. Calls the core asks to ma
 
   (ui/use-backend! (headless/backend))"
   (:require [skein.ui :as ui]
+            [skein.math :as math]
             [skein.io :as io]
             [skein.string :as string]))
 
@@ -168,8 +169,13 @@ pixels a character, 16 a line of text, 24 for a field. Calls the core asks to ma
 (defmethod natural-size [(d ui/date-picker-widget)]
   [(case (:mode d) :time 80 :date-time 200 120) 24])
 
+(def ^:private size-factors {:regular 1 :small 0.85 :mini 0.72 :large 1.15})
+
 (defmethod ui/backend-natural-size [(b headless-backend) widget]
-  (natural-size widget))
+  ;; A control's size scales with its :control-size.
+  (let [[w h] (natural-size widget)
+        f (get size-factors (:control-size widget) 1)]
+    [(int (math/round (* f w))) (int (math/round (* f h)))]))
 
 (defmethod ui/backend-decoration-size [(b headless-backend) (n ui/notebook-widget)]
   [8 32])
@@ -541,7 +547,7 @@ the user would. Returns the event."
 the drawing, at the canvas's size. Returns the operations drawn, each [:op args...]."
   [c]
   (let [[_ _ w h] (or (:allocation c) (into [0 0] (ui/preferred-size c)))
-        gc (make recording-context :width w :height h)]
+        gc (make recording-context :width w :height h :widget c)]
     (ui/emit! c (ui/event-for c :draw :context gc :width w :height h))
     (:ops gc)))
 
@@ -680,3 +686,22 @@ emits :key-down. Returns the event, which a handler may have consumed."
         e (ui/event-for w :key-down :key key :modifiers mods :text (if (char? key) (str key) ""))]
     (ui/emit! w e)
     e))
+
+;;; ------------------------------------------------------------------------------------
+;;; Appearance and palettes
+
+(defmethod ui/backend-color-in-appearance [(b headless-backend) name w]
+  (let [dark (= :dark (ui/backend-widget-appearance b w))]
+    (or (ui/system-palette-color name dark)
+        (ui/parse-color (get (if dark dark-colors light-colors) name "#808080")))))
+
+(defmethod ui/backend-apply-palette [(b headless-backend) w]
+  (swap! (:native w) assoc :palette-colors
+         (into {} (keep (fn [role] (when (ui/palette-color w role)
+                                     [role (ui/widget-color w role)]))
+                        ui/palette-roles))))
+
+(defn palette-colors
+  "The colors the widget's native control was given by palettes, by role."
+  [w]
+  (:palette-colors @(:native w)))

@@ -1630,7 +1630,7 @@ stroke colors are set as each shape is drawn."
     (lib/cairo-restore cr)))
 
 (defn- draw-canvas! [c cr width height]
-  (let [gc (make gtk-context :cr cr :width width :height height)]
+  (let [gc (make gtk-context :cr cr :width width :height height :widget c)]
     (when (:background c)
       (ui/paint! gc (:background c)))
     (ui/emit! c (ui/event-for c :draw :context gc :width width :height height))))

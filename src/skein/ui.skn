@@ -421,6 +421,12 @@ Custom widgets call this when something changes their natural size."
 the default shows it in the native control, and lays the window out again for a layout
 property. Specialize it to react to property changes.")
 
+(def ^:private appearance-property-changed!)
+
+(defmethod property-changed :after [(o ui-object) property value]
+  (when (contains? #{:appearance :palette} property)
+    (appearance-property-changed! o property)))
+
 (defmethod property-changed [(o ui-object) property value]
   (when (realized? o)
     (when (some #{property} (properties o))
@@ -683,12 +689,20 @@ place it in a grid; :tab-label names its page in a notebook."
   (row-span :cell :atom :init 1)
   (tab-label :cell :atom :init nil :doc "In a notebook, the text on its page's tab.")
   (font :cell :atom :init nil :doc "Its font (a font designator), or nil for the platform's.")
-  (context-menu :cell :atom :init nil :doc "A menu shown when the user right-clicks it, or nil."))
+  (context-menu :cell :atom :init nil :doc "A menu shown when the user right-clicks it, or nil.")
+  (appearance :cell :atom :init :inherit
+              :doc ":inherit (its container's), :light or :dark (windows also :system).")
+  (control-size :cell :atom :init :regular :doc ":regular, :small, :mini or :large.")
+  (palette :cell :atom :init nil
+           :doc "Color overrides for it and what it holds: a map of palette roles to colors.")
+  (last-appearance :cell :atom :init nil))
 
-(declare-widget! widget {:properties [:visible :enabled :tooltip :font :context-menu]
+(declare-widget! widget {:properties [:visible :enabled :tooltip :font :context-menu
+                                      :appearance :control-size :palette]
+                         :signals {:appearance-changed value-event}
                          :layout [:visible :hexpand :vexpand :expand :halign :valign :margin
                                   :width :height :column :row :column-span :row-span
-                                  :tab-label :font]})
+                                  :tab-label :font :control-size]})
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Layout
@@ -844,7 +858,22 @@ vector of sizes."
 
 ;;; Box
 
-(defclass box-widget [widget]
+;;; Containers have a surface and a background
+
+(def surface-roles
+  "The semantic surfaces a container can be: :automatic keeps its native or inherited one."
+  #{:automatic :window :sidebar :content :status :toolbar :activity :popover})
+
+(defclass container-widget [widget]
+  "The superclass of widgets that hold others. :surface is a semantic surface role (one of
+surface-roles), drawn with the platform's material or theme color; :background, when set,
+fills it with a color instead."
+  (surface :cell :atom :init :automatic)
+  (background :cell :atom :init nil))
+
+(declare-widget! container-widget {:properties [:surface :background]})
+
+(defclass box-widget [container-widget]
   "Lays its children out in a column or a row. Children with :vexpand (in a column) or
 :hexpand (in a row), or with :expand, share the extra space."
   (orientation :cell :atom :init :vertical :doc ":vertical or :horizontal.")
@@ -909,7 +938,7 @@ vector of sizes."
 
 ;;; Grid
 
-(defclass grid-widget [widget]
+(defclass grid-widget [container-widget]
   "Lays its children out in rows and columns. Give each child :column and :row (and
 optionally :column-span and :row-span), or set the grid's :columns and add children in
 reading order. A column expands when a child in it has :hexpand; a row, when one has
@@ -1022,7 +1051,7 @@ and whether it expands."
 
 ;;; Frame
 
-(defclass bin-widget [widget]
+(defclass bin-widget [container-widget]
   "A container of at most one widget, its content.")
 
 (defmethod add! :before [(b bin-widget) child]
@@ -1161,15 +1190,22 @@ veto refuses) when asked to close, and :closed once it closed; :shown when shown
   (closable :cell :atom :init true :doc "Whether it has a close button.")
   (shown :cell :atom :init false)
   (menu-bar :cell :atom :init nil :doc "The window's menu bar, or nil.")
-  (shortcuts :cell :atom :init [] :doc "The window's own shortcuts (add-shortcut!)."))
+  (shortcuts :cell :atom :init [] :doc "The window's own shortcuts (add-shortcut!).")
+  (appearance :cell :atom :init :system :doc ":system (the system's), :light or :dark.")
+  (palette :cell :atom :init nil :doc "Color overrides for everything in it, as a widget's.")
+  (surface :cell :atom :init :window)
+  (background :cell :atom :init nil)
+  (last-appearance :cell :atom :init nil))
 
 (declare-widget! window-widget {:properties [:title :width :height :menu-bar :min-size
-                                             :position :resizable :closable]
+                                             :position :resizable :closable :appearance
+                                             :palette :surface :background]
                                 :layout [:width :height]
                                 :signals {:close-request close-event :closed event
                                           :shown event :resize resize-event
                                           :activated event :deactivated event
-                                          :moved value-event :key-down key-event}})
+                                          :moved value-event :key-down key-event
+                                          :appearance-changed value-event}})
 
 (def ^:private open-windows
   "The windows made and not yet closed, oldest first."
@@ -1781,6 +1817,8 @@ keyword such as :steelblue, or a system color keyword such as :accent."
 resolves them when they are used (system-color gives one's value now)."
   #{:text :secondary-text :disabled-text :background :control-background :window-background
     :selection :accent :separator :link :grid
+    :sidebar-background :content-background :status-background :toolbar-background
+    :activity-background :popover-background
     :system-red :system-orange :system-yellow :system-green :system-mint :system-teal
     :system-cyan :system-blue :system-indigo :system-purple :system-pink :system-brown
     :system-gray})
@@ -2269,7 +2307,7 @@ time) when the user changes it."
 (defgeneric backend-set-page-label [backend notebook page label]
   "Show label on the tab of the notebook's page.")
 
-(defclass notebook-widget [widget]
+(defclass notebook-widget [container-widget]
   "Pages of widgets, one shown at a time, chosen with tabs. Each child is a page, and its
 :tab-label is the tab's text (\"Page n\" if it has none). It emits :page-changed (a
 selection-event with the page) when the user picks another tab."
@@ -2323,7 +2361,7 @@ event."
   (sync-property! n :selected-index index)
   (emit! n (event-for n :page-changed :index index :value (get (:children n) index))))
 
-(defclass paned-widget [widget]
+(defclass paned-widget [container-widget]
   "Panes side by side, or one above another, with dividers the user drags. It emits
 :divider-moved (a value-event with the new :position) when the user drags one."
   (orientation :cell :atom :init :horizontal
@@ -2516,6 +2554,8 @@ default font), outside drawing."
          f (ensure-font font)]
      (in-ui (fn [] (backend-text-size b s f))))))
 
+(def ^:private widget-color)
+
 (defclass graphics-context []
   "What a canvas draws with during :draw. It keeps a fill color, a stroke color, a line
 width and a font, which with-saved-state saves and restores, with the transformation and
@@ -2526,7 +2566,8 @@ clipping. Backends subclass it and implement the gc- generic functions."
   (font :cell :atom :init nil)
   (width :init 0 :doc "The canvas's width.")
   (height :init 0 :doc "The canvas's height.")
-  (saved :cell :atom :init ()))
+  (saved :cell :atom :init ())
+  (widget :init nil :doc "The canvas it draws, whose palette resolves semantic colors."))
 
 (defgeneric gc-set-fill-color [gc color]
   "Fill shapes with color (a color or a system color keyword).")
@@ -2588,10 +2629,17 @@ as they were: (with-saved-state [gc] (translate! gc 10 10) ...)."
      (try (do ~@body)
           (finally (restore-state! g#)))))
 
+(defn- context-color
+  "A color designator as the context draws it: a semantic color through its canvas's
+palette, if it has one."
+  [gc color]
+  (let [c (ensure-color color)]
+    (if (and (keyword? c) (:widget gc)) (widget-color (:widget gc) c) c)))
+
 (defn set-fill-color!
   "Fill shapes with color, a color designator."
   [gc color]
-  (let [c (ensure-color color)]
+  (let [c (context-color gc color)]
     (set-slot! gc :fill-color c)
     (gc-set-fill-color gc c)
     c))
@@ -2599,7 +2647,7 @@ as they were: (with-saved-state [gc] (translate! gc 10 10) ...)."
 (defn set-stroke-color!
   "Draw lines with color, a color designator."
   [gc color]
-  (let [c (ensure-color color)]
+  (let [c (context-color gc color)]
     (set-slot! gc :stroke-color c)
     (gc-set-stroke-color gc c)
     c))
@@ -2800,7 +2848,7 @@ which point of the text is at x, y."
   ([gc s x y] (draw-text! gc s x y {}))
   ([gc s x y opts]
    (let [font (or (ensure-font (:font opts)) (:font gc))
-         color (or (ensure-color (:color opts)) (:fill-color gc))
+         color (or (context-color gc (:color opts)) (:fill-color gc))
          align (or (:align opts) :left)
          valign (or (:valign opts) :top)
          [w h] (if (and (= align :left) (= valign :top)) [0 0] (gc-text-size gc s font))]
@@ -3334,15 +3382,192 @@ stop-timer! stops."
   (let [b (current-backend)] (in-ui (fn [] (backend-open-url b url))))
   nil)
 
+;;; ------------------------------------------------------------------------------------
+;;; Appearance, palettes and control sizes
+
+(def system-palette
+  "The platform's palette of adaptable colors, for color coding: each keyword's light and
+dark sRGB values, which backends without a native palette (macOS has one) use."
+  {:system-red ["#FF3B30" "#FF453A"] :system-orange ["#FF9500" "#FF9F0A"]
+   :system-yellow ["#FFCC00" "#FFD60A"] :system-green ["#28CD41" "#32D74B"]
+   :system-mint ["#00C7BE" "#63E6E2"] :system-teal ["#30B0C7" "#40C8E0"]
+   :system-cyan ["#32ADE6" "#64D2FF"] :system-blue ["#007AFF" "#0A84FF"]
+   :system-indigo ["#5856D6" "#5E5CE6"] :system-purple ["#AF52DE" "#BF5AF2"]
+   :system-pink ["#FF2D55" "#FF375F"] :system-brown ["#A2845E" "#AC8E68"]
+   :system-gray ["#8E8E93" "#98989D"]})
+
+(defn system-palette-color
+  "The portable value of the palette color name in dark (dark true) or light mode, or nil."
+  [name dark]
+  (when-let [[light dark-value] (get system-palette name)]
+    (parse-color (if dark dark-value light))))
+
+(def derived-palette-roles
+  "Palette roles the platforms have no color of their own for, with the role each falls
+back to."
+  {:selection-text :text :caret :text :gutter-background :background :gutter-text :secondary-text})
+
+(def palette-roles
+  "The roles a widget's :palette can set: the semantic system colors (not the color
+coding palette), plus :selection-text, :caret, :gutter-background and :gutter-text."
+  (into (set (remove (fn [c] (contains? system-palette c)) system-colors))
+        (keys derived-palette-roles)))
+
+(def ^:private appearances #{:inherit :system :light :dark})
+(def ^:private control-sizes #{:regular :small :mini :large})
+
+(defgeneric backend-widget-appearance [backend widget]
+  "The widget's actual appearance, :light or :dark.")
+
+(defn- inherited-appearance
+  "The nearest :light or :dark that widget or what holds it asks for, or nil."
+  [w]
+  (some (fn [o] (let [a (:appearance o)] (when (or (= a :light) (= a :dark)) a)))
+        (take-while some? (iterate :parent w))))
+
+(defmethod backend-widget-appearance [(b backend) w]
+  (or (inherited-appearance w) (if (backend-dark-mode? b) :dark :light)))
+
+(defgeneric backend-color-in-appearance [backend name widget]
+  "The color the semantic color keyword name is in the widget's appearance.")
+
+(defmethod backend-color-in-appearance [(b backend) name widget]
+  (backend-system-color b name))
+
+(defgeneric backend-apply-palette [backend widget]
+  "Recolor the widget's native control after its palette, or an enclosing one, changed.")
+
+(defmethod backend-apply-palette [(b backend) widget]
+  nil)
+
+(defn effective-appearance
+  "The widget's actual appearance, :light or :dark: its own, or its container's, or the
+system's."
+  [w]
+  (let [b (current-backend)] (in-ui (fn [] (backend-widget-appearance b w)))))
+
+(defn palette-color
+  "The color the widget's palette, or the nearest enclosing one, sets for role, or nil."
+  [w role]
+  (some (fn [o] (get (:palette o) role)) (take-while some? (iterate :parent w))))
+
+(defn effective-palette?
+  "True if the widget or a container of it has a palette."
+  [w]
+  (boolean (some :palette (take-while some? (iterate :parent w)))))
+
+(defn widget-color
+  "The color designator as the widget shows it: a semantic color that a palette sets is
+the palette's (itself perhaps a semantic color), a derived role a palette leaves out its
+base role's, any other semantic color the platform's in the widget's appearance; a color
+is itself."
+  ([w d] (widget-color w d #{}))
+  ([w d seen]
+   (let [c (if (and (keyword? d) (contains? palette-roles d)) d (ensure-color d))]
+     (if-not (keyword? c)
+       c
+       (let [override (palette-color w c)
+             base (get derived-palette-roles c)]
+         (cond (and override (not (contains? seen c)))
+               (widget-color w override (conj seen c))
+               base (widget-color w base (conj seen c))
+               :else (let [b (current-backend)]
+                       (in-ui (fn [] (backend-color-in-appearance b c w))))))))))
+
 (defn system-color
   "The color the system color keyword name (one of system-colors) is now, in light or
-dark mode. Keep the keyword itself where a color should follow the mode."
-  [name]
-  (when-not (contains? system-colors name)
-    (error "not a system color:" (pr-str name)))
-  (let [b (current-backend)] (in-ui (fn [] (backend-system-color b name)))))
+dark mode, or as the widget shows it (its appearance and palette). Keep the keyword
+itself where a color should follow the mode."
+  ([name]
+   (when-not (contains? system-colors name)
+     (error "not a system color:" (pr-str name)))
+   (let [b (current-backend)] (in-ui (fn [] (backend-system-color b name)))))
+  ([name w]
+   (when-not (or (contains? system-colors name) (contains? palette-roles name))
+     (error "not a system color:" (pr-str name)))
+   (widget-color w name)))
 
 (defn dark-mode?
-  "True if the system is in dark mode."
-  []
-  (let [b (current-backend)] (in-ui (fn [] (backend-dark-mode? b)))))
+  "True if the system is in dark mode, or with a widget, if the widget's appearance is
+dark."
+  ([] (let [b (current-backend)] (in-ui (fn [] (backend-dark-mode? b)))))
+  ([w] (= :dark (effective-appearance w))))
+
+(defn notify-palette-changed!
+  "Let the backend recolor root and everything in it (and redraw the canvases), after a
+palette changed. The core does this when a :palette changes."
+  [root]
+  (when (realized? root)
+    (let [b (current-backend)]
+      (doseq [w (widgets-in root)]
+        (when (realized? w)
+          (in-ui (fn [] (backend-apply-palette b w)))
+          (when (instance? canvas-widget w) (redraw! w))))))
+  root)
+
+(defn notify-appearance-changed!
+  "Work out the appearance of root and everything in it again, and emit
+:appearance-changed on each whose effective appearance changed, redrawing canvases and
+recoloring palettes. The core does this when an :appearance changes; backends call it
+when the system's does."
+  [root]
+  (when (realized? root)
+    (doseq [w (widgets-in root)]
+      (when (realized? w)
+        (let [new (effective-appearance w)
+              old (:last-appearance w)]
+          (set-slot! w :last-appearance new)
+          (when (and old (not= old new))
+            (when (instance? canvas-widget w) (redraw! w))
+            (when (effective-palette? w)
+              (let [b (current-backend)] (in-ui (fn [] (backend-apply-palette b w)))))
+            (emit! w (event-for w :appearance-changed :value new)))))))
+  root)
+
+(defn- appearance-property-changed! [o property]
+  (if (= property :appearance)
+    (do (when (and (= (:appearance o) :system) (not (instance? window-widget o)))
+          (error ":system appearance is a window's; a widget inside one has :inherit"))
+        (when-not (contains? appearances (:appearance o))
+          (error "an appearance is :inherit, :light or :dark, not" (pr-str (:appearance o))))
+        (notify-appearance-changed! o))
+    (notify-palette-changed! o)))
+
+(defmethod initialize :after [(w widget)]
+  (when-not (contains? control-sizes (:control-size w))
+    (error "a control size is :regular, :small, :mini or :large, not" (pr-str (:control-size w))))
+  (when-not (contains? appearances (:appearance w))
+    (error "an appearance is :inherit, :light or :dark, not" (pr-str (:appearance w))))
+  (when (= :system (:appearance w))
+    (error ":system appearance is a window's; a widget inside one has :inherit"))
+  (when (:palette w)
+    (doseq [[role _] (:palette w)]
+      (when-not (contains? palette-roles role)
+        (error "unknown palette role" (pr-str role)))))
+  (when (realized? w)
+    (set-slot! w :last-appearance (effective-appearance w))))
+
+(defmethod initialize :after [(c container-widget)]
+  (when-not (contains? surface-roles (:surface c))
+    (error "unknown surface role" (pr-str (:surface c)))))
+
+(defmethod add! :after [(parent ui-object) child]
+  (when (instance? widget child)
+    (notify-appearance-changed! child)
+    (when (effective-palette? child) (notify-palette-changed! child))))
+
+(defn surface-color-role
+  "The palette role coloring the surface role, or nil for :automatic."
+  [role]
+  (get {:window :window-background :content :content-background :sidebar :sidebar-background
+        :status :status-background :toolbar :toolbar-background :activity :activity-background
+        :popover :popover-background}
+       role))
+
+(defn container-fill
+  "The color a container (or window) is filled with: its :background, else its palette's
+color for its surface role, else nil for the native surface."
+  [c]
+  (or (:background c)
+      (when-let [role (surface-color-role (:surface c))]
+        (when (palette-color c role) (widget-color c role)))))

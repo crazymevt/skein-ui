@@ -22,8 +22,8 @@
       (is (= "Goodbye!" (headless/native-property l :text)))
       (set-slot! l :enabled false)
       (is (= false (headless/native-property l :enabled))))
-    (is (= [:visible :enabled :tooltip :font :context-menu :text :alignment :wrap :selectable
-            :text-color :background]
+    (is (= [:visible :enabled :tooltip :font :context-menu :appearance :control-size :palette
+            :text :alignment :wrap :selectable :text-color :background]
            (ui/properties l)))))
 
 (deftest events-and-handlers

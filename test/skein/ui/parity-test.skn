@@ -120,3 +120,40 @@
   (let [img (ui/image-from-pixels 1 1 (make-array u8 4))]
     (ui/set-application-icon! img)
     (is (identical? img (:icon ui/app)))))
+
+(deftest appearance-and-palettes
+  (let [changes (atom [])
+        c (ui/canvas {:on-appearance-changed (fn [e] (swap! changes conj (:value e)))})
+        l (ui/label {:text "x"})
+        side (ui/vbox {:surface :sidebar :palette {:text "#ff0000"}} l)
+        w (ui/window {:title "Look"} (ui/hbox {} side c))]
+    (ui/show! w)
+    (is (= :light (ui/effective-appearance c)))
+    (testing "an appearance is inherited, and a change is announced"
+      (set-slot! w :appearance :dark)
+      (is (= :dark (ui/effective-appearance c)))
+      (is (= [:dark] @changes))
+      (is (ui/dark-mode? l))
+      (set-slot! side :appearance :light)
+      (is (= :light (ui/effective-appearance l)))
+      (is (= :dark (ui/effective-appearance c))))
+    (testing "palettes override semantic colors for what is inside"
+      (is (= (ui/rgb 1 0 0) (ui/system-color :text l)))
+      (is (= (ui/rgb 1 0 0) (ui/system-color :caret l)) "a derived role follows its base")
+      (is (= (ui/rgb 1 0 0) (:text (headless/palette-colors l))))
+      (is (not= (ui/rgb 1 0 0) (ui/system-color :text c)) "the canvas isn't inside the sidebar")
+      (set-slot! w :palette {:accent :system-green})
+      (is (= (ui/system-palette-color :system-green true) (ui/system-color :accent c))
+          "a palette may name a semantic color, which follows the appearance"))
+    (testing "drawing resolves semantic colors through the canvas's palette"
+      (set-slot! c :palette {:text "#00ff00"})
+      (ui/on c :draw (fn [e] (ui/draw-text! (:context e) "hi" 0 0 {:color :text})))
+      (is (= (ui/rgb 0 1 0) (nth (last (headless/draw! c)) 5))))
+    (ui/close! w))
+  (testing "control sizes scale a control's natural size"
+    (is (< (first (ui/preferred-size (ui/button {:label "Go" :control-size :small})))
+           (first (ui/preferred-size (ui/button {:label "Go"})))))
+    (is (thrown-with-msg? error "control size" (ui/button {:control-size :huge}))))
+  (is (thrown-with-msg? error "a window's" (ui/label {:appearance :system})))
+  (is (thrown-with-msg? error "surface role" (ui/vbox {:surface :ceiling})))
+  (is (thrown-with-msg? error "palette role" (ui/label {:palette {:sky "#0000ff"}}))))

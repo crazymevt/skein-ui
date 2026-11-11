@@ -1683,7 +1683,7 @@ down through the open ones."
 
 (defmethod native-draw [(c ui/canvas-widget)]
   (let [[_ _ w h] (objc/rect-vec (objc/send-rect (view c) (objc/sel "bounds")))
-        gc (make cocoa-context :cg (current-cg) :width w :height h)]
+        gc (make cocoa-context :cg (current-cg) :width w :height h :widget c)]
     (when (:background c)
       (ui/paint! gc (:background c)))
     (ui/emit! c (ui/event-for c :draw :context gc :width w :height h))))
