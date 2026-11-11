@@ -3533,7 +3533,9 @@ user's doing."
                                             (objc/rect 0 0 100 100) 128 2 false)]
                   (objc/send-b-void panel (objc/sel "setReleasedWhenClosed:") false)
                   (objc/send-p-void panel (objc/sel "setContentView:") host)
-                  (objc/send-b-void panel (objc/sel "setHidesOnDeactivate:") true)
+                  ;; The core closes it when its window loses the keyboard; hiding with the
+                  ;; application too would hide it where no application is active (CI).
+                  (objc/send-b-void panel (objc/sel "setHidesOnDeactivate:") false)
                   (objc/send-b-void panel (objc/sel "setHasShadow:") true)
                   (objc/send-b-void panel (objc/sel "setBecomesKeyOnlyIfNeeded:") true)
                   panel))]

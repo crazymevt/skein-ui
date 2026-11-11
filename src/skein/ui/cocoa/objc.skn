@@ -258,7 +258,7 @@ nothing holds it."
   [b]
   (ffi/field b token-block-literal :token))
 
-(ffi/defcfun-ptr %invoke-long-block void [block ptr, n i64])
+(ffi/defcfun-ptr ^:blocking %invoke-long-block void [block ptr, n i64])
 
 (defn invoke-block-with-long!
   "Call the block b (one taking an integer, as WebKit's decision handlers do) with n."
