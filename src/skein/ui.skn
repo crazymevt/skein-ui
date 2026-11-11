@@ -26,7 +26,10 @@ controls.
 The backend protocol is a set of generic functions on a backend object (backend-realize,
 backend-set-property, ...), which skein.ui.headless, skein.ui.cocoa, skein.ui.win32 and
 skein.ui.gtk implement. The core calls them through backend-in-ui-thread."
-  (:require [skein.math :as math]))
+  (:require [skein.math :as math]
+            [skein.string :as string]
+            [skein.system :as system]
+            [skein.time :as time]))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Backends
@@ -139,6 +142,88 @@ value."
   (index :init nil)
   (value :init nil))
 
+(defclass resize-event [event]
+  "A widget got a new size: :width by :height pixels."
+  (width :init 0)
+  (height :init 0))
+
+(defclass item-event [event]
+  "Something happened to one item of a list, table or tree: a row activated (double
+clicked, or Return), a tree item opened or closed. :item is the item, :index its row (nil
+in a tree), :click-count the clicks (0 from the keyboard)."
+  (item :init nil)
+  (index :init nil)
+  (click-count :init 0))
+
+(defclass column-event [event]
+  "A table's column title was clicked: :column is the column, :index its index."
+  (column :init nil)
+  (index :init nil))
+
+(defclass draw-event [event]
+  "A canvas needs drawing: draw with :context, a graphics context of :width by :height,
+during the handler."
+  (context :init nil)
+  (width :init 0)
+  (height :init 0))
+
+(defclass timer-event [event]
+  "A timer's interval passed. :source is the timer.")
+
+(defclass input-event [event]
+  "The superclass of mouse and key events. :modifiers is the set of modifier keys held,
+of :shift, :control, :alt and :command. A handler that deals with one itself calls
+consume!, and the native control skips what it would have done."
+  (modifiers :init #{})
+  (consumed :cell :atom :init false))
+
+(defn consume!
+  "Mark the input event as dealt with, so the native control doesn't act on it: the key
+isn't typed, the click doesn't select. Returns the event."
+  [e]
+  (set-slot! e :consumed true)
+  e)
+
+(defn consumed?
+  "True if a handler consumed the input event."
+  [e]
+  (boolean (:consumed e)))
+
+(defn primary-modifier
+  "The modifier of shortcuts on this platform: :command on macOS, :control elsewhere."
+  []
+  (if (= :macos (system/os)) :command :control))
+
+(defn modifier-down?
+  "True if modifier was held during the input event: :shift, :control, :alt, :command, or
+:primary (primary-modifier)."
+  [e modifier]
+  (contains? (set (:modifiers e)) (if (= modifier :primary) (primary-modifier) modifier)))
+
+(defclass mouse-event [input-event]
+  "The pointer moved, or a button went down or up, over a widget: :x and :y in the
+widget from its top left, :button (:left, :right, :middle or nil) and :click-count."
+  (x :init 0)
+  (y :init 0)
+  (button :init nil)
+  (click-count :init 0))
+
+(defclass scroll-event [mouse-event]
+  "The wheel turned or the trackpad scrolled: :delta-x and :delta-y, in pixels when
+:precise (a trackpad), else in lines."
+  (delta-x :init 0)
+  (delta-y :init 0)
+  (precise :init false))
+
+(defclass key-event [input-event]
+  "A key went down or up in the focused widget: :key is a character for a printing key
+(lower case) or a keyword such as :return, :escape, :tab, :backspace, :delete, :left,
+:right, :up, :down, :home, :end, :page-up, :page-down, :space or :f1 to :f12; :text is
+what it types; :repeat is true when it auto-repeats."
+  (key :init nil)
+  (text :init "")
+  (repeat :init false))
+
 (defclass vetoable-event [event]
   "An event a handler can refuse with veto, such as a window being asked to close."
   (vetoed :cell :atom :init false))
@@ -161,10 +246,13 @@ value."
 ;;; ------------------------------------------------------------------------------------
 ;;; Objects, properties and signals
 
-(defclass ui-object []
-  "Anything with a native counterpart: widgets and windows."
+(defclass emitter []
+  "Anything that emits events to handlers: widgets, windows, menus and timers."
+  (handlers :cell :atom :init {}))
+
+(defclass ui-object [emitter]
+  "Anything with a native counterpart: widgets, windows and menus."
   (native :cell :atom :init nil)
-  (handlers :cell :atom :init {})
   (name :init nil)
   (parent :cell :atom :init nil)
   (children :cell :atom :init [])
@@ -346,7 +434,7 @@ connected. Returns an id that off takes."
   "Called for each event object emits: the default runs the handlers connected to the
 event's signal. Specialize it to react to events in a subclass.")
 
-(defmethod handle-event [(o ui-object) e]
+(defmethod handle-event [(o emitter) e]
   (doseq [[_ f] (get (:handlers o) (:signal e))]
     (f e)))
 
@@ -461,7 +549,7 @@ extra width or height; :expand true makes it take extra space along a box; :hali
 :valign (:fill, :start, :center or :end) place it across the space it gets; :margin is
 the space around it (a number, [vertical horizontal] or [top right bottom left]); :width
 and :height are the least size it asks for; :column, :row, :column-span and :row-span
-place it in a grid."
+place it in a grid; :tab-label names its page in a notebook."
   (visible :cell :atom :init true :doc "Whether the widget is shown.")
   (enabled :cell :atom :init true :doc "Whether the widget responds to the user.")
   (tooltip :cell :atom :init nil :doc "Text shown when the pointer rests on it, or nil.")
@@ -476,11 +564,13 @@ place it in a grid."
   (column :cell :atom :init nil)
   (row :cell :atom :init nil)
   (column-span :cell :atom :init 1)
-  (row-span :cell :atom :init 1))
+  (row-span :cell :atom :init 1)
+  (tab-label :cell :atom :init nil :doc "In a notebook, the text on its page's tab."))
 
 (declare-widget! widget {:properties [:visible :enabled :tooltip]
                          :layout [:visible :hexpand :vexpand :expand :halign :valign :margin
-                                  :width :height :column :row :column-span :row-span]})
+                                  :width :height :column :row :column-span :row-span
+                                  :tab-label]})
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Layout
@@ -567,11 +657,15 @@ arrange its children."
   [w x y width height]
   (let [a [(px x) (px y) (max 0 (px width)) (max 0 (px height))]
         [ax ay aw ah] a]
-    (when (not= a (:allocation w))
-      (set-slot! w :allocation a)
-      (let [b (current-backend)]
-        (in-ui (fn [] (backend-set-bounds b w ax ay aw ah)))))
-    (arrange w aw ah)))
+    (let [old (:allocation w)]
+      (when (not= a old)
+        (set-slot! w :allocation a)
+        (let [b (current-backend)]
+          (in-ui (fn [] (backend-set-bounds b w ax ay aw ah)))))
+      (arrange w aw ah)
+      (when (and (contains? (signals w) :resize)
+                 (not= [aw ah] (when old [(nth old 2) (nth old 3)])))
+        (emit! w (event-for w :resize :width aw :height ah))))))
 
 (defn- align-in
   "[start size] of something of natural size pref aligned by align in avail pixels from
@@ -875,13 +969,16 @@ veto refuses) when asked to close."
   (title :cell :atom :init "")
   (width :cell :atom :init nil :doc "The width of its content area; nil to fit the content.")
   (height :cell :atom :init nil :doc "The height of its content area; nil to fit the content.")
-  (shown :cell :atom :init false))
+  (shown :cell :atom :init false)
+  (menu-bar :cell :atom :init nil :doc "The window's menu bar, or nil.")
+  (shortcuts :cell :atom :init [] :doc "The window's own shortcuts (add-shortcut!)."))
 
-(declare-widget! window-widget {:properties [:title :width :height] :layout [:width :height]
-                                :signals {:close-request close-event}})
+(declare-widget! window-widget {:properties [:title :width :height :menu-bar]
+                                :layout [:width :height]
+                                :signals {:close-request close-event :key-down key-event}})
 
 (defn window
-  "A window: (window {:title \"Hello\"} content)."
+  "A window: (window {:title \"Hello\" :menu-bar (menu-bar {} ...)} content)."
   [opts & children]
   (build window-widget opts children))
 
@@ -1219,9 +1316,11 @@ selection-event) when the user chooses one."
              (>= (:selected-index c) (count value)))
     (set-slot! c :selected-index nil)))
 
-(defn selected-item
-  "The chosen item of a combo box, or nil."
-  [w]
+(defgeneric selected-item [w]
+  "The chosen item of a combo box, or the first selected one of a list box, table or
+tree; nil if none.")
+
+(defmethod selected-item [(w combo-box-widget)]
   (when-let [i (:selected-index w)]
     (get (vec (:items w)) i)))
 
@@ -1273,3 +1372,1608 @@ text) when the user types or chooses, and :activate on Return."
   "Make run! return."
   []
   (backend-quit-loop (current-backend)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Colors and fonts
+
+(defstruct color :value
+  "An sRGB color: each component an f32 from 0 to 1. Make one with rgb, rgb255, hsv or
+parse-color; properties and drawing also take a string such as \"#3a7bd5\", a named color
+keyword such as :steelblue, or a system color keyword such as :accent."
+  (red f32) (green f32) (blue f32) (alpha f32))
+
+(defn- unit [x] (f32 (math/clamp x 0 1)))
+
+(defn rgb
+  "A color from red, green, blue and alpha (1 if not given) between 0 and 1."
+  ([r g b] (rgb r g b 1))
+  ([r g b a] (color (unit r) (unit g) (unit b) (unit a))))
+
+(defn rgb255
+  "A color from red, green, blue and alpha (255 if not given) between 0 and 255."
+  ([r g b] (rgb255 r g b 255))
+  ([r g b a] (rgb (/ r 255.0) (/ g 255.0) (/ b 255.0) (/ a 255.0))))
+
+(defn- hex2 [x] (format "%02x" (int (math/round (* 255 x)))))
+
+(defn color-hex
+  "The color as a string such as \"#3a7bd5\"."
+  [c]
+  (str "#" (hex2 (color-red c)) (hex2 (color-green c)) (hex2 (color-blue c))))
+
+(def named-colors
+  "The colors named by keywords, which color designators and parse-color take."
+  {:black (rgb255 0 0 0) :white (rgb255 255 255 255) :red (rgb255 220 50 47)
+   :green (rgb255 46 160 67) :blue (rgb255 38 110 220) :yellow (rgb255 245 200 30)
+   :orange (rgb255 245 130 32) :purple (rgb255 136 84 208) :pink (rgb255 232 92 160)
+   :gray (rgb255 128 128 128) :grey (rgb255 128 128 128) :light-gray (rgb255 211 211 211)
+   :dark-gray (rgb255 64 64 64) :brown (rgb255 140 90 50) :cyan (rgb255 30 190 210)
+   :magenta (rgb255 200 50 200) :navy (rgb255 20 40 110) :teal (rgb255 20 128 128)
+   :steelblue (rgb255 70 130 180) :transparent (rgb255 0 0 0 0)})
+
+(def system-colors
+  "Keywords naming the platform's colors, which follow light and dark mode: the backend
+resolves them when they are used (system-color gives one's value now)."
+  #{:text :secondary-text :disabled-text :background :control-background :window-background
+    :selection :accent :separator :link :grid
+    :system-red :system-orange :system-yellow :system-green :system-mint :system-teal
+    :system-cyan :system-blue :system-indigo :system-purple :system-pink :system-brown
+    :system-gray})
+
+(defn- parse-hex [s]
+  (reduce (fn [n ch]
+            (let [d (string/index-of "0123456789abcdef" ch)]
+              (when-not d (error "bad hex digit" (pr-str ch) "in a color"))
+              (+ (* 16 n) d)))
+          0
+          (string/lower-case s)))
+
+(defn parse-color
+  "The color s names: \"#rgb\", \"#rrggbb\", \"#rrggbbaa\", or a named color such as
+\"steelblue\" (named-colors)."
+  [s]
+  (let [s (string/trim s)
+        hex (fn [a b] (parse-hex (subs s a b)))]
+    (if (string/starts-with? s "#")
+      (case (count s)
+        4 (rgb255 (* 17 (hex 1 2)) (* 17 (hex 2 3)) (* 17 (hex 3 4)))
+        7 (rgb255 (hex 1 3) (hex 3 5) (hex 5 7))
+        9 (rgb255 (hex 1 3) (hex 3 5) (hex 5 7) (hex 7 9))
+        (error "bad color" (pr-str s)))
+      (or (get named-colors (keyword (string/lower-case (string/replace s " " ""))))
+          (error "unknown color" (pr-str s))))))
+
+(defn ensure-color
+  "The color designator d as a color, or as a system color keyword, which the backend
+resolves; nil stays nil. d is a color, a string parse-color takes, or a keyword of
+named-colors or system-colors."
+  [d]
+  (cond (nil? d) nil
+        (instance? color d) d
+        (string? d) (parse-color d)
+        (contains? system-colors d) d
+        (keyword? d) (or (get named-colors d) (error "unknown color" (pr-str d)))
+        :else (error "a color is a color, a string such as \"#3a7bd5\" or a keyword, not"
+                     (pr-str d))))
+
+(defn color-lerp
+  "The color fraction of the way from color a to color b."
+  [a b fraction]
+  (let [mix (fn [x y] (+ x (* fraction (- y x))))]
+    (rgb (mix (color-red a) (color-red b)) (mix (color-green a) (color-green b))
+         (mix (color-blue a) (color-blue b)) (mix (color-alpha a) (color-alpha b)))))
+
+(defn hsv
+  "A color from hue in degrees and saturation and value between 0 and 1."
+  ([hue saturation value] (hsv hue saturation value 1))
+  ([hue saturation value alpha]
+   (let [h (/ (mod hue 360) 60.0)
+         c (* value saturation)
+         x (* c (- 1 (abs (- (mod h 2) 1))))
+         m (- value c)
+         [r g b] (case (int (math/floor h))
+                   0 [c x 0] 1 [x c 0] 2 [0 c x] 3 [0 x c] 4 [x 0 c] [c 0 x])]
+     (rgb (+ r m) (+ g m) (+ b m) alpha))))
+
+(def ^:private font-weights #{:light :regular :medium :semibold :bold})
+
+(defn font
+  "A font, a map: :family is :system (the platform's interface font), :monospace or a
+family name; :size is in points, or nil for the platform's normal size; :weight is :light,
+:regular, :medium, :semibold or :bold; :italic is true or false."
+  ([] (font {}))
+  ([opts]
+   (let [f (merge {:family :system :size nil :weight :regular :italic false} opts)]
+     (when-not (contains? font-weights (:weight f))
+       (error "a font's weight is :light, :regular, :medium, :semibold or :bold, not"
+              (pr-str (:weight f))))
+     f)))
+
+(defn ensure-font
+  "The font designator d as a font: a font map, nil (the default font), :system,
+:monospace, :bold, a number (the system font at that size) or a family name."
+  [d]
+  (cond (nil? d) nil
+        (map? d) (font d)
+        (number? d) (font {:size d})
+        (= d :system) (font)
+        (= d :monospace) (font {:family :monospace})
+        (= d :bold) (font {:weight :bold})
+        (string? d) (font {:family d})
+        :else (error "a font is a map, a size, a family name, :system, :monospace or :bold,"
+                     "not" (pr-str d))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Text views
+
+(defgeneric backend-text-append [backend view s]
+  "Add s at the end of the text view's text, and scroll to it.")
+
+(defgeneric backend-text-insert [backend view s]
+  "Replace the text view's selection with s, or insert s at its insertion point.")
+
+(defgeneric backend-text-selection [backend view]
+  "The text view's selection as [start end]; they are equal, at the insertion point, when
+nothing is selected.")
+
+(defgeneric backend-set-text-selection [backend view start end]
+  "Select the text view's text from start to end.")
+
+(defclass text-view-widget [widget]
+  "Lines of text the user edits, with their own scroll bars. It emits :changed (a
+value-event with the text) as the user edits."
+  (text :cell :atom :init "")
+  (editable :cell :atom :init true :doc "Whether the user can change the text.")
+  (wrap :cell :atom :init true :doc "Whether lines wrap at the edge; if not, it scrolls sideways.")
+  (border :cell :atom :init true :doc "Whether to draw a border around it.")
+  (placeholder :cell :atom :init nil :doc "Dimmed text shown while it's empty, or nil.")
+  (hexpand :cell :atom :init true)
+  (vexpand :cell :atom :init true))
+
+(declare-widget! text-view-widget {:properties [:text :editable :wrap :border :placeholder]
+                                   :signals {:changed value-event}})
+
+(defn text-view
+  "A text view: (text-view {:text \"Notes\" :on-changed f})."
+  ([] (text-view {}))
+  ([opts] (build text-view-widget opts nil)))
+
+(defn append-text!
+  "Add s at the end of the text view's text and scroll to it. Returns the view."
+  [v s]
+  (sync-property! v :text (str (:text v) s))
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-text-append b v s))))
+  v)
+
+(defn text-selection
+  "The text view's selection as [start end], positions in its text; they are equal when
+nothing is selected: that is where the insertion point is."
+  [v]
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-text-selection b v)))))
+
+(defn set-text-selection!
+  "Select the text view's text from start to end. Returns the view."
+  [v start end]
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-set-text-selection b v start end))))
+  v)
+
+(defn insert-text!
+  "Replace the text view's selection with s, or insert s at the insertion point. Returns
+the view."
+  [v s]
+  (let [[start end] (text-selection v)
+        t (:text v)]
+    (sync-property! v :text (str (subs t 0 start) s (subs t end)))
+    (let [b (current-backend)]
+      (in-ui (fn [] (backend-text-insert b v s))))
+    v))
+
+;;; ------------------------------------------------------------------------------------
+;;; Lists, tables and trees
+
+(defgeneric selected-items [w]
+  "The selected items of a list box, table or tree, in order.")
+
+(defclass list-box-widget [item-widget]
+  "A scrolling list of items to select from. It emits :selection-changed (a
+selection-event) when the user changes the selection, and :row-activated (an item-event)
+when the user double-clicks a row or presses Return on it."
+  (icon-fn :cell :atom :init nil
+           :doc "A function from an item to the image before its text, or nil.")
+  (selection-mode :cell :atom :init :single :doc ":single or :multiple.")
+  (selected-indices :cell :atom :init [] :doc "The indices of the selected items, in order.")
+  (border :cell :atom :init true :doc "Whether to draw a border around it.")
+  (alternating :cell :atom :init false :doc "Whether rows alternate background colors.")
+  (hexpand :cell :atom :init true)
+  (vexpand :cell :atom :init true))
+
+(declare-widget! list-box-widget {:properties [:icon-fn :selection-mode :selected-indices
+                                               :border :alternating]
+                                  :signals {:selection-changed selection-event
+                                            :row-activated item-event}})
+
+(defn list-box
+  "A list box: (list-box {:items [\"One\" \"Two\"] :on-selection-changed f})."
+  ([] (list-box {}))
+  ([opts] (build list-box-widget opts nil)))
+
+(defmethod selected-items [(w list-box-widget)]
+  (let [items (vec (:items w))]
+    (vec (keep (fn [i] (get items i)) (:selected-indices w)))))
+
+(defmethod selected-item [(w list-box-widget)]
+  (first (selected-items w)))
+
+(defmethod property-changed :after [(w list-box-widget) property value]
+  (when (= property :items)
+    (let [n (count value)
+          kept (filterv (fn [i] (< i n)) (:selected-indices w))]
+      (when (not= kept (:selected-indices w))
+        (set-slot! w :selected-indices kept)))))
+
+(defn selection-changed-by-user!
+  "Backends call this when the user changed the selection of a list box or table to the
+rows at indices: it stores them and emits :selection-changed. Returns the event."
+  [w indices]
+  (sync-property! w :selected-indices (vec indices))
+  (let [i (first indices)]
+    (emit! w (event-for w :selection-changed :index i :value (when i (get (vec (:items w)) i))))))
+
+(defn row-activated-by-user!
+  "Backends call this when the user double-clicked (click-count 2) or pressed Return
+(click-count 0) on the row at index of a list box or table. Returns the event."
+  ([w index] (row-activated-by-user! w index 2))
+  ([w index click-count]
+   (emit! w (event-for w :row-activated :index index :item (get (vec (:items w)) index)
+                       :click-count click-count))))
+
+(defn compare-values
+  "A comparator of mixed values, for sorting table rows: numbers by size, then strings
+without regard to case, then anything else by its printed form."
+  [a b]
+  (cond (and (number? a) (number? b)) (compare a b)
+        (number? a) -1
+        (number? b) 1
+        (and (string? a) (string? b)) (compare (string/lower-case a) (string/lower-case b))
+        (string? a) -1
+        (string? b) 1
+        :else (compare (pr-str a) (pr-str b))))
+
+(defclass table-column []
+  "A column of a table or tree: its :title, and how to show a row in it: :key (a function
+of the row), :format (a function from that value to its text), :width (pixels, or nil to
+share the width left), :alignment (:left, :center or :right), :sort (a comparator, or
+nil if the column can't sort the table) and :icon-fn (a function from the row to an image
+or nil)."
+  (title :init "")
+  (key :init identity)
+  (format :init str)
+  (width :init nil)
+  (alignment :init :left)
+  (sort :init compare-values)
+  (icon-fn :init nil))
+
+(defn column
+  "A table column titled title whose cells show (key row): key is a function, a keyword
+(read from a map row) or an integer (an index into a vector row). opts are the column's
+:width, :alignment, :format, :sort and :icon-fn."
+  ([title key] (column title key {}))
+  ([title key opts]
+   (apply make table-column :title title
+          :key (if (integer? key) (fn [row] (nth row key)) key)
+          (mapcat identity opts))))
+
+(defn cell-text
+  "The text column shows for row."
+  [col row]
+  (str ((:format col) ((:key col) row))))
+
+(defclass table-view-widget [list-box-widget]
+  "Rows of items shown in columns: :items are the rows, and each of :columns (made with
+column) says what to show of a row. Clicking a column title emits :column-clicked (a
+column-event) and, when :sortable, sorts the rows by that column."
+  (columns :cell :atom :init [])
+  (headers :cell :atom :init true :doc "Whether to show the column titles.")
+  (sortable :cell :atom :init true :doc "Whether clicking a column title sorts by it.")
+  (sort-column :cell :atom :init nil :doc "The column the rows are sorted by, or nil.")
+  (sort-descending :cell :atom :init false)
+  (alternating :cell :atom :init true))
+
+(declare-widget! table-view-widget {:properties [:columns :headers :sort-column
+                                                 :sort-descending]
+                                    :layout [:columns]
+                                    :signals {:column-clicked column-event}})
+
+(defn table-view
+  "A table: (table-view {:columns [(column \"Name\" :name)] :items rows})."
+  ([] (table-view {}))
+  ([opts] (build table-view-widget opts nil)))
+
+(defn table-cell-text
+  "The text the table shows at row-index in the column at column-index."
+  [t row-index column-index]
+  (let [items (vec (:items t))
+        col (get (vec (:columns t)) column-index)]
+    (if (and col (< -1 row-index (count items)))
+      (cell-text col (nth items row-index))
+      "")))
+
+(defn sort-table!
+  "Sort the table's rows by column (descending if asked), keeping the selected rows
+selected. Returns the table."
+  ([t col] (sort-table! t col false))
+  ([t col descending]
+   (let [items (vec (:items t))
+         key (:key col)
+         cmp (or (:sort col) compare-values)
+         order (vec (sort-by (fn [i] (key (nth items i)))
+                             (if descending (fn [a b] (cmp b a)) cmp)
+                             (range (count items))))
+         new-index (into {} (map-indexed (fn [pos i] [i pos]) order))
+         selected (vec (sort (keep new-index (:selected-indices t))))]
+     (set-slot! t :items (mapv (fn [i] (nth items i)) order))
+     (set-slot! t :selected-indices selected)
+     (set-slot! t :sort-column col)
+     (set-slot! t :sort-descending descending)
+     t)))
+
+(defmethod handle-event :after [(t table-view-widget) (e column-event)]
+  (let [col (:column e)]
+    (when (and (:sortable t) (:sort col))
+      (sort-table! t col (and (identical? col (:sort-column t)) (not (:sort-descending t)))))))
+
+(defn column-clicked-by-user!
+  "Backends call this when the user clicked the title of the table's column at index.
+Returns the event."
+  [t index]
+  (emit! t (event-for t :column-clicked :column (get (vec (:columns t)) index) :index index)))
+
+(defgeneric backend-tree-refresh [backend tree item]
+  "The children of item in the tree, or of every item if item is nil, may have changed:
+ask tree-children for them again.")
+
+(defclass tree-view-widget [widget]
+  "Items in a hierarchy the user opens and closes. Give it :roots and :children-fn, a
+function from an item to its children; :item-key gives each item a key (compared with =)
+that keeps it open or selected when the items are made again. With :columns it shows a
+table whose first column holds the tree; without, each item's :item-label text. It emits
+:selection-changed, :row-activated (an item-event), and :expanded and :collapsed (item
+events) when the user opens or closes an item."
+  (roots :cell :atom :init [])
+  (children-fn :cell :atom :init (fn [item] []))
+  (item-key :cell :atom :init identity)
+  (item-label :cell :atom :init str)
+  (icon-fn :cell :atom :init nil)
+  (columns :cell :atom :init [])
+  (headers :cell :atom :init false)
+  (selection-mode :cell :atom :init :single :doc ":single or :multiple.")
+  (selection :cell :atom :init [] :doc "The selected items, in row order.")
+  (expanded :cell :atom :init #{} :doc "The keys of the open items.")
+  (child-cache :cell :atom :init {})
+  (hexpand :cell :atom :init true)
+  (vexpand :cell :atom :init true))
+
+(declare-widget! tree-view-widget {:properties [:roots :item-label :icon-fn :columns :headers
+                                                :selection-mode :selection :expanded]
+                                   :layout [:columns]
+                                   :signals {:selection-changed selection-event
+                                             :row-activated item-event
+                                             :expanded item-event :collapsed item-event}})
+
+(defn tree-view
+  "A tree: (tree-view {:roots [root] :children-fn :children})."
+  ([] (tree-view {}))
+  ([opts] (build tree-view-widget opts nil)))
+
+(defmethod property-changed :before [(t tree-view-widget) property value]
+  (when (= property :roots)
+    (set-slot! t :child-cache {}))
+  (when (and (= property :selection) (= :single (:selection-mode t)) (> (count value) 1))
+    (error "the tree selects one item at a time; set its :selection-mode to :multiple")))
+
+(defn tree-children
+  "The children of item in the tree, or its roots if item is nil, as a vector; asked of
+:children-fn once until refresh-tree!."
+  [t item]
+  (if (nil? item)
+    (vec (:roots t))
+    (let [k ((:item-key t) item)]
+      (or (get (:child-cache t) k)
+          (let [cs (vec ((:children-fn t) item))]
+            (update-slot! t :child-cache assoc k cs)
+            cs)))))
+
+(defn refresh-tree!
+  "Ask :children-fn again for item's children, or every item's. Returns the tree."
+  ([t] (refresh-tree! t nil))
+  ([t item]
+   (if item
+     (update-slot! t :child-cache dissoc ((:item-key t) item))
+     (set-slot! t :child-cache {}))
+   (let [b (current-backend)]
+     (in-ui (fn [] (backend-tree-refresh b t item))))
+   t))
+
+(defn expanded?
+  "True if item is open in the tree."
+  [t item]
+  (contains? (:expanded t) ((:item-key t) item)))
+
+(defn expand!
+  "Open item in the tree (the roots, for nil); with all, its descendants too. Returns the
+tree."
+  ([t item] (expand! t item false))
+  ([t item all]
+   (let [start (if (nil? item) (tree-children t nil) [item])
+         items (if all
+                 (mapcat (fn [i] (tree-seq (fn [_] true) (fn [x] (tree-children t x)) i)) start)
+                 start)]
+     (update-slot! t :expanded into (map (:item-key t) items))
+     t)))
+
+(defn collapse!
+  "Close item in the tree. Returns the tree."
+  [t item]
+  (update-slot! t :expanded disj ((:item-key t) item))
+  t)
+
+(defn visible-tree-items
+  "The tree's items that show, in row order: the roots, and the children of open items."
+  [t]
+  (let [visit (fn visit [item]
+                (cons item (when (expanded? t item)
+                             (mapcat visit (tree-children t item)))))]
+    (vec (mapcat visit (tree-children t nil)))))
+
+(defn tree-cell-text
+  "The text the tree shows for item in the column at column-index."
+  [t item column-index]
+  (if-let [col (get (vec (:columns t)) column-index)]
+    (cell-text col item)
+    (str ((:item-label t) item))))
+
+(defmethod selected-items [(t tree-view-widget)]
+  (vec (:selection t)))
+
+(defmethod selected-item [(t tree-view-widget)]
+  (first (:selection t)))
+
+(defn expansion-changed-by-user!
+  "Backends call this when the user opened (expanded true) or closed an item of the
+tree: it records it and emits :expanded or :collapsed."
+  [t item expanded]
+  (let [k ((:item-key t) item)
+        was (contains? (:expanded t) k)]
+    (sync-property! t :expanded ((if expanded conj disj) (:expanded t) k))
+    (when (not= was (boolean expanded))
+      (emit! t (event-for t (if expanded :expanded :collapsed) :item item)))))
+
+(defn tree-selection-changed-by-user!
+  "Backends call this when the user selected items in the tree: it stores them and emits
+:selection-changed, whose :value is the first. Returns the event."
+  [t items]
+  (sync-property! t :selection (vec items))
+  (emit! t (event-for t :selection-changed :value (first items))))
+
+(defn tree-item-activated-by-user!
+  "Backends call this when the user double-clicked an item of the tree, or pressed Return
+on it. Returns the event."
+  ([t item] (tree-item-activated-by-user! t item 2))
+  ([t item click-count]
+   (emit! t (event-for t :row-activated :item item :click-count click-count))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Color and date pickers
+
+(defclass color-button-widget [widget]
+  "A swatch of a color that opens the platform's color chooser. It emits :changed (a
+value-event with the color) when the user picks one."
+  (color :cell :atom :init (rgb 0 0 0) :doc "The color, or a color designator."))
+
+(declare-widget! color-button-widget {:properties [:color] :signals {:changed value-event}})
+
+(defn color-button
+  "A color button: (color-button {:color :steelblue :on-changed f})."
+  ([] (color-button {}))
+  ([opts] (build color-button-widget opts nil)))
+
+(defclass date-picker-widget [widget]
+  "A field for picking a date or a time. It emits :changed (a value-event with the new
+time) when the user changes it."
+  (date :cell :atom :init (time/epoch-millis)
+        :doc "The date and time, in milliseconds since 1970 (UTC); now, at first.")
+  (mode :cell :atom :init :date :doc ":date, :time or :date-time: what the user picks."))
+
+(declare-widget! date-picker-widget {:properties [:date :mode] :layout [:mode]
+                                     :signals {:changed value-event}})
+
+(defn date-picker
+  "A date picker: (date-picker {:mode :date-time :on-changed f})."
+  ([] (date-picker {}))
+  ([opts] (build date-picker-widget opts nil)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Notebooks, split panes and scrolled windows
+
+(defgeneric backend-set-page-label [backend notebook page label]
+  "Show label on the tab of the notebook's page.")
+
+(defclass notebook-widget [widget]
+  "Pages of widgets, one shown at a time, chosen with tabs. Each child is a page, and its
+:tab-label is the tab's text (\"Page n\" if it has none). It emits :page-changed (a
+selection-event with the page) when the user picks another tab."
+  (selected-index :cell :atom :init 0 :doc "The index of the page shown.")
+  (tab-position :cell :atom :init :top :doc ":top, :bottom, :left or :right."))
+
+(declare-widget! notebook-widget {:properties [:selected-index :tab-position]
+                                  :layout [:tab-position]
+                                  :signals {:page-changed selection-event}})
+
+(defn notebook
+  "A notebook: (notebook {} (vbox {:tab-label \"General\"} ...) ...)."
+  [opts & children]
+  (build notebook-widget opts children))
+
+(defmethod add! :before [(n notebook-widget) child]
+  (when (nil? (:tab-label child))
+    (set-slot! child :tab-label (str "Page " (inc (count (:children n)))))))
+
+(defn add-page!
+  "Add child to the notebook as a page whose tab says label. Returns child."
+  [n child label]
+  (set-slot! child :tab-label label)
+  (add! n child))
+
+(defn selected-page
+  "The page the notebook shows, or nil."
+  [n]
+  (get (:children n) (:selected-index n)))
+
+(defmethod property-changed :after [(w widget) property value]
+  (when (and (= property :tab-label) (instance? notebook-widget (:parent w)) (realized? w))
+    (let [b (current-backend)
+          n (:parent w)]
+      (in-ui (fn [] (backend-set-page-label b n w value))))))
+
+(defmethod measure [(n notebook-widget)]
+  (let [[dw dh] (backend-decoration-size (current-backend) n)
+        sizes (map outer-size (:children n))]
+    [(+ dw (reduce max 0 (map first sizes))) (+ dh (reduce max 0 (map second sizes)))]))
+
+(defmethod arrange [(n notebook-widget) width height]
+  (let [[x y w h] (backend-content-area (current-backend) n width height)]
+    (doseq [c (:children n)]
+      (allocate-in-cell c x y w h))))
+
+(defn page-changed-by-user!
+  "Backends call this when the user picked the notebook's page at index. Returns the
+event."
+  [n index]
+  (sync-property! n :selected-index index)
+  (emit! n (event-for n :page-changed :index index :value (get (:children n) index))))
+
+(defclass paned-widget [widget]
+  "Panes side by side, or one above another, with dividers the user drags. It emits
+:divider-moved (a value-event with the new :position) when the user drags one."
+  (orientation :cell :atom :init :horizontal
+               :doc ":horizontal puts the panes side by side, :vertical one above another.")
+  (position :cell :atom :init nil
+            :doc "The first pane's length, in pixels, or nil for its natural length. It
+keeps it when the paned widget is resized; the other panes share the rest."))
+
+(declare-widget! paned-widget {:properties [:orientation :position]
+                               :layout [:orientation :position]
+                               :signals {:divider-moved value-event}})
+
+(defn paned
+  "A paned widget: (paned {:position 200} sidebar content)."
+  [opts & children]
+  (build paned-widget opts children))
+
+(defn- divider-size
+  "The thickness of the paned widget's dividers: the backend's decoration size."
+  [p]
+  (first (backend-decoration-size (current-backend) p)))
+
+(defmethod measure [(p paned-widget)]
+  (let [h? (= :horizontal (:orientation p))
+        kids (visible-children p)
+        sizes (map outer-size kids)
+        main (+ (reduce + 0 (map (fn [[w h]] (if h? w h)) sizes))
+                (* (divider-size p) (max 0 (dec (count kids)))))
+        cross (reduce max 0 (map (fn [[w h]] (if h? h w)) sizes))]
+    (if h? [main cross] [cross main])))
+
+(defn pane-lengths
+  "The length of each shown pane of p along the split, for total pixels: the first gets
+its :position (or its natural length), and the others share the rest."
+  [p total]
+  (let [h? (= :horizontal (:orientation p))
+        kids (visible-children p)
+        n (count kids)
+        available (max 0 (- total (* (divider-size p) (max 0 (dec n)))))]
+    (cond
+      (zero? n) []
+      (= n 1) [available]
+      :else (let [natural (let [[w h] (outer-size (first kids))] (if h? w h))
+                  first-length (max 0 (min (or (:position p) natural) available))
+                  rest-length (- available first-length)
+                  each (quot rest-length (dec n))]
+              (into [first-length]
+                    (concat (repeat (- n 2) each) [(- rest-length (* each (- n 2)))]))))))
+
+(defmethod arrange [(p paned-widget) width height]
+  (let [h? (= :horizontal (:orientation p))
+        d (divider-size p)]
+    (reduce (fn [pos [c len]]
+              (if h?
+                (allocate-in-cell c pos 0 len height)
+                (allocate-in-cell c 0 pos width len))
+              (+ pos len d))
+            0
+            (map vector (visible-children p) (pane-lengths p (if h? width height))))
+    nil))
+
+(defn divider-moved-by-user!
+  "Backends call this when the user dragged the paned widget's first divider to
+position: it places the panes again and emits :divider-moved. Returns the event."
+  [p position]
+  (sync-property! p :position position)
+  (when-let [[_ _ w h] (:allocation p)]
+    (arrange p w h))
+  (emit! p (event-for p :divider-moved :value position)))
+
+(defgeneric backend-set-scroll-extent [backend scrolled width height]
+  "Make the scrolled window's content area width by height. Returns the view's new [width
+height] if showing or hiding a scroll bar changed it, else nil.")
+
+(defgeneric backend-scroll-to [backend scrolled x y]
+  "Scroll so that the point x, y of the content is at the view's top left.")
+
+(defclass scrolled-window-widget [bin-widget]
+  "Shows part of a widget bigger than its space, with scroll bars. Its natural size is
+:min-content-width by :min-content-height, or the content's along an axis whose policy is
+:never. It emits :scrolled (a value-event with [x y], the content's point at the top
+left) when the user scrolls."
+  (horizontal-policy :cell :atom :init :automatic
+                     :doc ":automatic shows a scroll bar when the content is wider than the
+view, :always always, and :never makes the content as wide as the view.")
+  (vertical-policy :cell :atom :init :automatic :doc "As :horizontal-policy, for height.")
+  (border :cell :atom :init false :doc "Whether to draw a border around the view.")
+  (min-content-width :cell :atom :init 120)
+  (min-content-height :cell :atom :init 80))
+
+(declare-widget! scrolled-window-widget
+                 {:properties [:horizontal-policy :vertical-policy :border]
+                  :layout [:horizontal-policy :vertical-policy :border :min-content-width
+                           :min-content-height]
+                  :signals {:scrolled value-event}})
+
+(defn scrolled-window
+  "A scrolled window: (scrolled-window {:min-content-height 200} content)."
+  [opts & children]
+  (build scrolled-window-widget opts children))
+
+(defmethod measure [(s scrolled-window-widget)]
+  (let [[dw dh] (backend-decoration-size (current-backend) s)
+        [cw ch] (if-let [c (content s)] (outer-size c) [0 0])]
+    [(+ dw (if (= :never (:horizontal-policy s)) cw (min cw (:min-content-width s))))
+     (+ dh (if (= :never (:vertical-policy s)) ch (min ch (:min-content-height s))))]))
+
+(defmethod arrange [(s scrolled-window-widget) width height]
+  (when-let [c (content s)]
+    (let [b (current-backend)
+          [_ _ vw vh] (backend-content-area b s width height)
+          [cw ch] (outer-size c)
+          extent (fn [vw vh] [(if (= :never (:horizontal-policy s)) vw (max vw cw))
+                              (if (= :never (:vertical-policy s)) vh (max vh ch))])
+          [w h] (extent vw vh)
+          ;; Showing a scroll bar can shrink the view; if it did, size the content again.
+          changed (in-ui (fn [] (backend-set-scroll-extent b s w h)))
+          [w h] (if (and changed (not= changed [vw vh]))
+                  (let [[w h] (apply extent changed)]
+                    (in-ui (fn [] (backend-set-scroll-extent b s w h)))
+                    [w h])
+                  [w h])]
+      (allocate-in-cell c 0 0 w h))))
+
+(defn scroll-to!
+  "Scroll the scrolled window so that the point x, y of its content is at the top left.
+Returns it."
+  [s x y]
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-scroll-to b s x y))))
+  s)
+
+(defn scrolled-by-user!
+  "Backends call this when the user scrolled the scrolled window so that the content's
+point x, y is at the top left. Returns the event."
+  [s x y]
+  (emit! s (event-for s :scrolled :value [x y])))
+
+;;; ------------------------------------------------------------------------------------
+;;; Canvases and drawing
+
+(defgeneric backend-redraw [backend canvas rect]
+  "Draw the canvas again soon (emitting :draw): all of it, or the part [x y width height]
+that rect gives.")
+
+(defgeneric backend-text-size [backend s font]
+  "The [width height] of the string s drawn in font (a font map or nil).")
+
+(defclass canvas-widget [widget]
+  "A widget you draw yourself, which gets the mouse and the keyboard: handle :draw to draw
+with the event's :context, and call redraw! when what it shows changes. Subclass it, with
+methods on handle-event, to make a custom widget. Coordinates start at its top left."
+  (focusable :cell :atom :init true :doc "Whether a click gives it the keyboard focus.")
+  (background :cell :atom :init nil :doc "A color to fill it with before :draw, or nil.")
+  (hexpand :cell :atom :init true)
+  (vexpand :cell :atom :init true))
+
+(declare-widget! canvas-widget
+                 {:properties [:focusable :background]
+                  :signals {:draw draw-event :resize resize-event
+                            :mouse-down mouse-event :mouse-up mouse-event
+                            :mouse-move mouse-event :mouse-drag mouse-event
+                            :mouse-enter mouse-event :mouse-leave mouse-event
+                            :scroll scroll-event :key-down key-event :key-up key-event}})
+
+(defn canvas
+  "A canvas: (canvas {:width 200 :height 100 :on-draw (fn [e] (draw (:context e)))})."
+  ([] (canvas {}))
+  ([opts] (build canvas-widget opts nil)))
+
+(defmethod measure [(c canvas-widget)]
+  [100 100])
+
+(defn redraw!
+  "Draw the canvas again soon, all of it or the rectangle given. Returns the canvas."
+  ([c] (redraw! c nil))
+  ([c x y width height] (redraw! c [x y width height]))
+  ([c rect]
+   (let [b (current-backend)]
+     (in-ui (fn [] (backend-redraw b c rect))))
+   c))
+
+(defn text-extent
+  "The [width height] the string s takes drawn in font (a font designator, nil for the
+default font), outside drawing."
+  ([s] (text-extent s nil))
+  ([s font]
+   (let [b (current-backend)
+         f (ensure-font font)]
+     (in-ui (fn [] (backend-text-size b s f))))))
+
+(defclass graphics-context []
+  "What a canvas draws with during :draw. It keeps a fill color, a stroke color, a line
+width and a font, which with-saved-state saves and restores, with the transformation and
+clipping. Backends subclass it and implement the gc- generic functions."
+  (fill-color :cell :atom :init (rgb 0 0 0))
+  (stroke-color :cell :atom :init (rgb 0 0 0))
+  (line-width :cell :atom :init 1.0)
+  (font :cell :atom :init nil)
+  (width :init 0 :doc "The canvas's width.")
+  (height :init 0 :doc "The canvas's height.")
+  (saved :cell :atom :init ()))
+
+(defgeneric gc-set-fill-color [gc color]
+  "Fill shapes with color (a color or a system color keyword).")
+(defgeneric gc-set-stroke-color [gc color] "Draw lines with color.")
+(defgeneric gc-set-line-width [gc width] "Draw lines width pixels wide.")
+(defgeneric gc-set-line-style [gc cap join dash]
+  "End lines with cap (:butt, :round or :square), join them with join (:miter, :round or
+:bevel), and dash them with dash, a vector of lengths, or nil for solid lines.")
+(defgeneric gc-save [gc] "Save the colors, line, transformation and clipping.")
+(defgeneric gc-restore [gc] "Restore what the matching gc-save saved.")
+(defgeneric gc-translate [gc dx dy] "Move the origin by dx, dy.")
+(defgeneric gc-scale [gc sx sy] "Scale the coordinates.")
+(defgeneric gc-rotate [gc radians] "Rotate the coordinates clockwise by radians.")
+(defgeneric gc-clip-rectangle [gc x y width height] "Limit drawing to the rectangle.")
+(defgeneric gc-rectangle [gc x y width height mode] "Draw a rectangle: mode is :fill or :stroke.")
+(defgeneric gc-ellipse [gc x y width height mode] "Draw the ellipse in the rectangle.")
+(defgeneric gc-begin-path [gc] "Start a new path.")
+(defgeneric gc-move-to [gc x y] "Start a new part of the path at x, y.")
+(defgeneric gc-line-to [gc x y] "Add a line to x, y.")
+(defgeneric gc-curve-to [gc x1 y1 x2 y2 x y]
+  "Add a cubic Bézier curve to x, y with control points x1, y1 and x2, y2.")
+(defgeneric gc-arc [gc cx cy radius start end]
+  "Add an arc of the circle at cx, cy from angle start to end, in radians, clockwise on
+the screen.")
+(defgeneric gc-close-path [gc] "Close the path's current part with a line to its start.")
+(defgeneric gc-draw-path [gc mode]
+  "Draw the path and forget it: :fill, :stroke or :fill-and-stroke.")
+(defgeneric gc-text [gc s x y font color] "Draw s with its top left at x, y in font and color.")
+(defgeneric gc-text-size [gc s font] "The [width height] of s in font.")
+(defgeneric gc-image [gc image x y width height] "Draw the image scaled into the rectangle.")
+
+(defn- d [x] (f64 x))
+
+(defn save-state!
+  "Save the context's colors, line width, font, transformation and clipping, for
+restore-state!. with-saved-state is usually clearer."
+  [gc]
+  (update-slot! gc :saved conj [(:fill-color gc) (:stroke-color gc) (:line-width gc) (:font gc)])
+  (gc-save gc))
+
+(defn restore-state!
+  "Put back what the last save-state! saved."
+  [gc]
+  (let [[f s w font] (first (:saved gc))]
+    (update-slot! gc :saved rest)
+    (gc-restore gc)
+    (set-slot! gc :fill-color f)
+    (set-slot! gc :stroke-color s)
+    (set-slot! gc :line-width w)
+    (set-slot! gc :font font)
+    nil))
+
+(defmacro with-saved-state
+  "Run body, then put the context's colors, line, font, transformation and clipping back
+as they were: (with-saved-state [gc] (translate! gc 10 10) ...)."
+  [[gc] & body]
+  `(let [g# ~gc]
+     (save-state! g#)
+     (try (do ~@body)
+          (finally (restore-state! g#)))))
+
+(defn set-fill-color!
+  "Fill shapes with color, a color designator."
+  [gc color]
+  (let [c (ensure-color color)]
+    (set-slot! gc :fill-color c)
+    (gc-set-fill-color gc c)
+    c))
+
+(defn set-stroke-color!
+  "Draw lines with color, a color designator."
+  [gc color]
+  (let [c (ensure-color color)]
+    (set-slot! gc :stroke-color c)
+    (gc-set-stroke-color gc c)
+    c))
+
+(defn set-color!
+  "Fill shapes and draw lines with color."
+  [gc color]
+  (set-fill-color! gc color)
+  (set-stroke-color! gc color))
+
+(defn set-line-width!
+  "Draw lines width pixels wide."
+  [gc width]
+  (set-slot! gc :line-width (d width))
+  (gc-set-line-width gc (d width))
+  width)
+
+(defn set-font!
+  "Draw text in font, a font designator."
+  [gc font]
+  (set-slot! gc :font (ensure-font font)))
+
+(defn set-line-style!
+  "How lines end (:cap, :butt, :round or :square), join (:join, :miter, :round or :bevel)
+and are dashed (:dash, a vector of lengths, or nil)."
+  [gc {:keys [cap join dash]}]
+  (gc-set-line-style gc (or cap :butt) (or join :miter) dash))
+
+(defn- with-style
+  "Call f with the :color and :line-width of opts in effect, if any."
+  [gc opts f]
+  (let [{:keys [color line-width]} opts]
+    (if (or color line-width)
+      (with-saved-state [gc]
+        (when color (set-color! gc color))
+        (when line-width (set-line-width! gc line-width))
+        (f))
+      (f))))
+
+(defn- rounded-rectangle-path [gc x y width height radius]
+  (let [r (min radius (/ width 2) (/ height 2))
+        q (/ math/pi 2)]
+    (gc-begin-path gc)
+    (gc-move-to gc (d (+ x r)) (d y))
+    (gc-line-to gc (d (- (+ x width) r)) (d y))
+    (gc-arc gc (d (- (+ x width) r)) (d (+ y r)) (d r) (d (- q)) 0.0)
+    (gc-line-to gc (d (+ x width)) (d (- (+ y height) r)))
+    (gc-arc gc (d (- (+ x width) r)) (d (- (+ y height) r)) (d r) 0.0 (d q))
+    (gc-line-to gc (d (+ x r)) (d (+ y height)))
+    (gc-arc gc (d (+ x r)) (d (- (+ y height) r)) (d r) (d q) (d math/pi))
+    (gc-line-to gc (d x) (d (+ y r)))
+    (gc-arc gc (d (+ x r)) (d (+ y r)) (d r) (d math/pi) (d (* 3 q)))
+    (gc-close-path gc)))
+
+(defn- rectangle [gc x y width height opts mode]
+  (with-style gc opts
+    (fn []
+      (if (and (:radius opts) (pos? (:radius opts)))
+        (do (rounded-rectangle-path gc x y width height (:radius opts))
+            (gc-draw-path gc mode))
+        (gc-rectangle gc (d x) (d y) (d width) (d height) mode)))))
+
+(defn fill-rectangle!
+  "Fill the rectangle, with corners rounded to :radius if given, in :color or the fill
+color."
+  ([gc x y width height] (fill-rectangle! gc x y width height {}))
+  ([gc x y width height opts] (rectangle gc x y width height (dissoc opts :line-width) :fill)))
+
+(defn stroke-rectangle!
+  "Outline the rectangle, with corners rounded to :radius if given, in :color and
+:line-width or the context's."
+  ([gc x y width height] (stroke-rectangle! gc x y width height {}))
+  ([gc x y width height opts] (rectangle gc x y width height opts :stroke)))
+
+(defn fill-ellipse!
+  "Fill the ellipse inside the rectangle, in :color or the fill color."
+  ([gc x y width height] (fill-ellipse! gc x y width height {}))
+  ([gc x y width height opts]
+   (with-style gc (dissoc opts :line-width)
+     (fn [] (gc-ellipse gc (d x) (d y) (d width) (d height) :fill)))))
+
+(defn stroke-ellipse!
+  "Outline the ellipse inside the rectangle, in :color and :line-width or the context's."
+  ([gc x y width height] (stroke-ellipse! gc x y width height {}))
+  ([gc x y width height opts]
+   (with-style gc opts (fn [] (gc-ellipse gc (d x) (d y) (d width) (d height) :stroke)))))
+
+(defn fill-circle!
+  "Fill the circle of radius centered on cx, cy."
+  ([gc cx cy radius] (fill-circle! gc cx cy radius {}))
+  ([gc cx cy radius opts]
+   (fill-ellipse! gc (- cx radius) (- cy radius) (* 2 radius) (* 2 radius) opts)))
+
+(defn stroke-circle!
+  "Outline the circle of radius centered on cx, cy."
+  ([gc cx cy radius] (stroke-circle! gc cx cy radius {}))
+  ([gc cx cy radius opts]
+   (stroke-ellipse! gc (- cx radius) (- cy radius) (* 2 radius) (* 2 radius) opts)))
+
+(defn draw-line!
+  "Draw a line from x1, y1 to x2, y2 in :color and :line-width or the context's."
+  ([gc x1 y1 x2 y2] (draw-line! gc x1 y1 x2 y2 {}))
+  ([gc x1 y1 x2 y2 opts]
+   (with-style gc opts
+     (fn []
+       (gc-begin-path gc)
+       (gc-move-to gc (d x1) (d y1))
+       (gc-line-to gc (d x2) (d y2))
+       (gc-draw-path gc :stroke)))))
+
+(defn- point-pairs
+  "points as a seq of [x y]: from [[x y] ...] or a flat [x1 y1 x2 y2 ...]."
+  [points]
+  (if (number? (first points)) (partition 2 points) points))
+
+(defn- polygon-path [gc points closed]
+  (let [ps (point-pairs points)]
+    (gc-begin-path gc)
+    (when (seq ps)
+      (let [[x y] (first ps)] (gc-move-to gc (d x) (d y)))
+      (doseq [[x y] (rest ps)] (gc-line-to gc (d x) (d y)))
+      (when closed (gc-close-path gc)))))
+
+(defn draw-polyline!
+  "Draw lines through points ([[x y] ...] or [x1 y1 x2 y2 ...]), back to the first if
+:closed, in :color and :line-width or the context's."
+  ([gc points] (draw-polyline! gc points {}))
+  ([gc points opts]
+   (with-style gc opts
+     (fn [] (polygon-path gc points (:closed opts)) (gc-draw-path gc :stroke)))))
+
+(defn fill-polygon!
+  "Fill the polygon with corners points, in :color or the fill color."
+  ([gc points] (fill-polygon! gc points {}))
+  ([gc points opts]
+   (with-style gc (dissoc opts :line-width)
+     (fn [] (polygon-path gc points true) (gc-draw-path gc :fill)))))
+
+(defn begin-path! "Start a new path." [gc] (gc-begin-path gc))
+(defn move-to! "Start a new part of the path at x, y." [gc x y] (gc-move-to gc (d x) (d y)))
+(defn line-to! "Add a line to x, y to the path." [gc x y] (gc-line-to gc (d x) (d y)))
+
+(defn curve-to!
+  "Add a Bézier curve to x, y with control points x1, y1 and x2, y2 to the path."
+  [gc x1 y1 x2 y2 x y]
+  (gc-curve-to gc (d x1) (d y1) (d x2) (d y2) (d x) (d y)))
+
+(defn arc!
+  "Add an arc of the circle at cx, cy from start to end, angles in radians (0 pointing
+right, clockwise on the screen), to the path."
+  [gc cx cy radius start end]
+  (gc-arc gc (d cx) (d cy) (d radius) (d start) (d end)))
+
+(defn close-path! "Close the path's current part." [gc] (gc-close-path gc))
+
+(defn fill-path!
+  "Fill the path, in :color or the fill color, and start a new one."
+  ([gc] (fill-path! gc {}))
+  ([gc opts] (with-style gc (dissoc opts :line-width) (fn [] (gc-draw-path gc :fill)))))
+
+(defn stroke-path!
+  "Draw the path's lines, in :color and :line-width or the context's, and start a new one."
+  ([gc] (stroke-path! gc {}))
+  ([gc opts] (with-style gc opts (fn [] (gc-draw-path gc :stroke)))))
+
+(defn translate! "Move the origin by dx, dy." [gc dx dy] (gc-translate gc (d dx) (d dy)))
+
+(defn scale!
+  "Scale the coordinates by s, or by sx and sy."
+  ([gc s] (scale! gc s s))
+  ([gc sx sy] (gc-scale gc (d sx) (d sy))))
+
+(defn rotate!
+  "Rotate the coordinates clockwise by radians."
+  [gc radians]
+  (gc-rotate gc (d radians)))
+
+(defn clip-rectangle!
+  "Limit drawing to the rectangle, until the state is restored."
+  [gc x y width height]
+  (gc-clip-rectangle gc (d x) (d y) (d width) (d height)))
+
+(defn paint!
+  "Fill the whole canvas with color, or the fill color."
+  ([gc] (paint! gc nil))
+  ([gc color] (fill-rectangle! gc 0 0 (:width gc) (:height gc) {:color color})))
+
+(defn text-size
+  "The [width height] of the string s drawn in :font (a font designator) or the context's
+font."
+  ([gc s] (text-size gc s {}))
+  ([gc s opts] (gc-text-size gc s (or (ensure-font (:font opts)) (:font gc)))))
+
+(defn draw-text!
+  "Draw the string s at x, y in :font and :color (the context's font and fill color if
+not given). :align (:left, :center or :right) and :valign (:top, :center or :bottom) say
+which point of the text is at x, y."
+  ([gc s x y] (draw-text! gc s x y {}))
+  ([gc s x y opts]
+   (let [font (or (ensure-font (:font opts)) (:font gc))
+         color (or (ensure-color (:color opts)) (:fill-color gc))
+         align (or (:align opts) :left)
+         valign (or (:valign opts) :top)
+         [w h] (if (and (= align :left) (= valign :top)) [0 0] (gc-text-size gc s font))]
+     (gc-text gc s
+              (d (case align :left x :center (- x (/ w 2)) :right (- x w)))
+              (d (case valign :top y :center (- y (/ h 2)) :bottom (- y h)))
+              font color))))
+
+(defn draw-image!
+  "Draw the image with its top left at x, y, scaled to :width and :height if given."
+  ([gc image x y] (draw-image! gc image x y {}))
+  ([gc image x y opts]
+   (gc-image gc image (d x) (d y) (d (or (:width opts) (:width image)))
+             (d (or (:height opts) (:height image))))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Dialogs
+
+(defgeneric backend-message-box [backend parent message detail type labels]
+  "Show the platform's alert with the buttons labels (the default first) and wait for
+the user to click one. Returns its index, or nil if the alert was dismissed.")
+
+(defgeneric backend-prompt-text [backend parent message detail default ok cancel]
+  "Ask for a line of text and wait. Returns it, or nil if the user cancelled.")
+
+(defgeneric backend-choose-file [backend parent opts]
+  "Show the platform's file chooser and wait. opts are choose-file's, with :mode filled
+in. Returns a vector of paths, or nil if the user cancelled.")
+
+(defgeneric backend-show-about [backend info]
+  "Show the platform's About box: info has :name, :version, :copyright, :comments,
+:website and :icon.")
+
+(def ^:private response-labels
+  {:ok "OK" :cancel "Cancel" :yes "Yes" :no "No" :save "Save" :discard "Don't Save"
+   :close "Close"})
+
+(defn- dialog-buttons
+  "buttons as a vector of [label response]."
+  [buttons]
+  (mapv (fn [b] (if (vector? b) b [(get response-labels b (string/capitalize (name b))) b]))
+        (case buttons
+          :ok [:ok]
+          :ok-cancel [:ok :cancel]
+          :yes-no [:yes :no]
+          :yes-no-cancel [:yes :no :cancel]
+          :save-discard-cancel [:save :discard :cancel]
+          buttons)))
+
+(defn message-box
+  "Show message in the platform's alert, wait for the user to click a button, and return
+the button's response. opts: :detail, smaller text under the message; :type, :info (the
+default), :warning, :error or :question; :buttons, :ok (the default), :ok-cancel, :yes-no,
+:yes-no-cancel, :save-discard-cancel, or a vector of responses (keywords) and [label
+response] pairs, the default first; :parent, the window it is for."
+  ([message] (message-box message {}))
+  ([message opts]
+   (let [type (or (:type opts) :info)
+         specs (dialog-buttons (or (:buttons opts) :ok))
+         b (current-backend)]
+     (when-not (contains? #{:info :warning :error :question} type)
+       (error "a message box's :type is :info, :warning, :error or :question, not"
+              (pr-str type)))
+     (let [i (in-ui (fn [] (backend-message-box b (:parent opts) message (:detail opts) type
+                                                (mapv first specs))))]
+       (second (get specs (or i 0)))))))
+
+(defn confirm
+  "Ask message with two buttons, :yes (\"OK\") and :no (\"Cancel\") labels, and return
+true if the user clicked yes. opts: :detail, :yes, :no, :type (:question) and :parent."
+  ([message] (confirm message {}))
+  ([message opts]
+   (= :yes (message-box message {:detail (:detail opts) :parent (:parent opts)
+                                 :type (or (:type opts) :question)
+                                 :buttons [[(or (:yes opts) "OK") :yes]
+                                           [(or (:no opts) "Cancel") :no]]}))))
+
+(defn prompt-text
+  "Ask for a line of text with message, starting with :default (\"\"). Returns the text,
+or nil if the user cancelled. opts: :detail, :default, :ok, :cancel and :parent."
+  ([message] (prompt-text message {}))
+  ([message opts]
+   (let [b (current-backend)]
+     (in-ui (fn [] (backend-prompt-text b (:parent opts) message (:detail opts)
+                                        (or (:default opts) "") (or (:ok opts) "OK")
+                                        (or (:cancel opts) "Cancel")))))))
+
+(defn choose-file
+  "Show the platform's file chooser. :mode is :open (the default) to pick existing files,
+:save to name a file to write, or :directory to pick a folder; :filters limits the files
+offered, a vector of [description extension ...] such as [[\"Skein\" \"skn\"]];
+:multiple lets :open pick several; :directory is where to start, :name the suggested name
+for :save, :title the chooser's title and :parent its window. Returns a path, a vector of
+paths with :multiple, or nil if the user cancelled."
+  ([] (choose-file {}))
+  ([opts]
+   (let [mode (or (:mode opts) :open)
+         b (current-backend)]
+     (when-not (contains? #{:open :save :directory} mode)
+       (error "a file chooser's :mode is :open, :save or :directory, not" (pr-str mode)))
+     (when (and (:parent opts) (:destroyed (:parent opts)))
+       (error "the file chooser's parent window was destroyed"))
+     (let [paths (in-ui (fn [] (backend-choose-file b (:parent opts) (assoc opts :mode mode))))]
+       (when (seq paths)
+         (if (:multiple opts) (vec paths) (first paths)))))))
+
+(defn choose-directory
+  "Show the folder chooser. Returns a path, or nil. opts: :title, :directory, :parent."
+  ([] (choose-directory {}))
+  ([opts] (choose-file (assoc opts :mode :directory :multiple false))))
+
+(defn show-about
+  "Show the platform's About box. opts: :name, :version, :copyright, :comments, :website
+and :icon (an image)."
+  ([] (show-about {}))
+  ([opts]
+   (let [b (current-backend)]
+     (in-ui (fn [] (backend-show-about b opts))))
+   nil))
+
+;;; ------------------------------------------------------------------------------------
+;;; Menus and shortcuts
+
+(defgeneric backend-popup-menu [backend menu widget x y]
+  "Show the menu at x, y in the widget, and return when the user chose an item or
+dismissed it.")
+
+(defgeneric backend-perform-role [backend role]
+  "Do what a menu item with role (:undo, :copy, :minimize, ...) does natively, to the
+focused control or the active window.")
+
+(defgeneric backend-active-window [backend]
+  "The window that has the keyboard, if it is one of skein-ui's, or nil.")
+
+(defgeneric backend-shortcut-label [backend shortcut]
+  "How the platform shows the shortcut string, such as \"⌘S\" or \"Ctrl+S\".")
+
+(defn active-window
+  "The window that has the keyboard, or nil."
+  []
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-active-window b)))))
+
+(defclass menu-object [ui-object]
+  "The superclass of menu bars, menus, menu items and separators. They aren't widgets:
+they take no part in layout.")
+
+(defclass menu-bar-widget [menu-object]
+  "The menus of a window, left to right: give it to the window's :menu-bar. On macOS it
+shows at the top of the screen, after the application menu.")
+
+(defclass menu-widget [menu-object]
+  "A menu of items: in a menu bar, in another menu as a submenu, or shown with
+popup-menu!. It emits :opening (an event) when it is about to open, a chance to update
+its items."
+  (title :cell :atom :init "" :doc "The menu's title, in the menu bar or its parent menu."))
+
+(declare-widget! menu-widget {:properties [:title] :signals {:opening event}})
+
+(defclass menu-item-widget [menu-object]
+  "An item of a menu. It emits :activate (an action-event) when the user chooses it."
+  (label :cell :atom :init "" :doc "Its text; by default its :role's.")
+  (shortcut :cell :atom :init nil
+            :doc "A shortcut such as \"Primary+S\" (parse-shortcut), or nil; by default
+its :role's.")
+  (enabled :cell :atom :init true :doc "Whether the user can choose it.")
+  (enabled-fn :cell :atom :init nil
+              :doc "A function of the item, asked when its menu opens and before it runs:
+false disables it.")
+  (role :init nil
+        :doc "A standard item: :quit, :about, :preferences, :close-window, :undo, :redo,
+:cut, :copy, :paste, :delete, :select-all, :minimize, :zoom or :fullscreen. It gets the
+platform's label, shortcut and place (on macOS :quit, :about and :preferences go to the
+application menu), and does its usual job if it has no :activate handler."))
+
+(declare-widget! menu-item-widget {:properties [:label :shortcut :enabled]
+                                   :signals {:activate action-event}})
+
+(defclass check-menu-item-widget [menu-item-widget]
+  "A menu item with a check mark that it turns on and off when chosen; in its :activate
+handler, :checked is already the new state."
+  (checked :cell :atom :init false)
+  (checked-fn :cell :atom :init nil
+              :doc "A function of the item, asked when its menu opens, giving its :checked."))
+
+(declare-widget! check-menu-item-widget {:properties [:checked]})
+
+(defclass menu-separator-widget [menu-object]
+  "A line between groups of items in a menu.")
+
+(def menu-roles
+  "Each menu item role's standard label and shortcut."
+  {:quit ["Quit" "Primary+Q"] :about ["About" nil] :preferences ["Settings…" "Primary+,"]
+   :close-window ["Close" "Primary+W"] :undo ["Undo" "Primary+Z"]
+   :redo ["Redo" "Primary+Shift+Z"] :cut ["Cut" "Primary+X"] :copy ["Copy" "Primary+C"]
+   :paste ["Paste" "Primary+V"] :delete ["Delete" nil] :select-all ["Select All" "Primary+A"]
+   :minimize ["Minimize" "Primary+M"] :zoom ["Zoom" nil]
+   :fullscreen ["Enter Full Screen" "Primary+Control+F"]})
+
+(defmethod initialize :after [(item menu-item-widget)]
+  (when-let [role (:role item)]
+    (let [[label shortcut] (or (get menu-roles role)
+                               (error "unknown menu item role" (pr-str role)))]
+      (when (= "" (:label item)) (set-slot! item :label label))
+      (when (nil? (:shortcut item)) (set-slot! item :shortcut shortcut)))))
+
+(defn- check-menu-parent [parent child]
+  (when (:destroyed parent) (error "can't add to a destroyed menu"))
+  (when (:destroyed child) (error "can't add a destroyed menu object"))
+  (when (some (fn [p] (identical? p child)) (take-while some? (iterate :parent parent)))
+    (error "a menu can't hold itself or a menu it is in")))
+
+(defmethod add! :before [(bar menu-bar-widget) child]
+  (when-not (instance? menu-widget child)
+    (error "a menu bar holds menus, not" (pr-str (class-name (class-of child)))))
+  (check-menu-parent bar child))
+
+(defmethod add! :before [(m menu-widget) child]
+  (when-not (or (instance? menu-widget child) (instance? menu-item-widget child)
+                (instance? menu-separator-widget child))
+    (error "a menu holds menu items, submenus and separators, not"
+           (pr-str (class-name (class-of child)))))
+  (check-menu-parent m child))
+
+(defn menu-bar
+  "A menu bar: (menu-bar {} (menu {:title \"File\"} ...) ...)."
+  [opts & menus]
+  (build menu-bar-widget opts menus))
+
+(defn menu
+  "A menu: (menu {:title \"File\"} (menu-item {:label \"Open…\" :shortcut \"Primary+O\"
+:on-activate f}) (menu-separator) (menu-item {:role :quit}))."
+  [opts & items]
+  (build menu-widget opts items))
+
+(defn menu-item
+  "A menu item: (menu-item {:label \"Save\" :shortcut \"Primary+S\" :on-activate f})."
+  [opts]
+  (build menu-item-widget opts nil))
+
+(defn check-menu-item
+  "A check menu item: (check-menu-item {:label \"Wrap Lines\" :checked true :on-activate f})."
+  [opts]
+  (build check-menu-item-widget opts nil))
+
+(defn menu-separator
+  "A separator between groups of menu items."
+  ([] (menu-separator {}))
+  ([opts] (build menu-separator-widget opts nil)))
+
+(defn validate-menu-item!
+  "Work out the item's check mark (:checked-fn) and whether the user can choose it
+(:enabled and :enabled-fn), and show that natively. True if it can be chosen."
+  [item]
+  (when-not (:destroyed item)
+    (when (and (instance? check-menu-item-widget item) (:checked-fn item))
+      (set-slot! item :checked (boolean ((:checked-fn item) item))))
+    (let [ok (boolean (and (:enabled item)
+                           (or (nil? (:enabled-fn item)) ((:enabled-fn item) item))))
+          b (current-backend)]
+      (in-ui (fn [] (backend-set-property b item :enabled ok)))
+      ok)))
+
+(defn map-menu-items
+  "Call (f item menus) for each menu item in root (a menu bar or menu), where menus are
+the menus it is in, outermost first. Separators are skipped. Returns root."
+  [f root]
+  (let [walk (fn walk [o path]
+               (cond (instance? menu-widget o)
+                     (let [path (conj path o)] (doseq [c (:children o)] (walk c path)))
+                     (instance? menu-bar-widget o) (doseq [c (:children o)] (walk c path))
+                     (instance? menu-item-widget o) (when-not (:destroyed o) (f o path))))]
+    (walk root [])
+    root))
+
+(defn refresh-menus!
+  "Validate every item in root, a menu bar or menu. Returns root."
+  [root]
+  (map-menu-items (fn [item _] (validate-menu-item! item)) root))
+
+(defgeneric perform-role [role item]
+  "What a menu item with role does when it has no :activate handler: by default the
+platform's own action.")
+
+(defmethod perform-role [role item]
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-perform-role b role)))))
+
+(defmethod perform-role [(role (= :quit)) item]
+  (quit!))
+
+(defmethod perform-role [(role (= :about)) item]
+  (show-about))
+
+(defmethod perform-role [(role (= :close-window)) item]
+  (when-let [w (active-window)] (close! w)))
+
+(defn activate-menu-item!
+  "Choose the item as the user would: if it can be chosen, a check item toggles, then it
+emits :activate, or does its role's job if it has no handler. True if it ran."
+  [item]
+  (boolean
+   (when (validate-menu-item! item)
+     (when (instance? check-menu-item-widget item) (update-slot! item :checked not))
+     (if (and (empty? (get (:handlers item) :activate)) (:role item))
+       (perform-role (:role item) item)
+       (emit! item (event-for item :activate)))
+     true)))
+
+(defn menu-opening!
+  "Backends call this when the menu is about to open: it emits :opening, then validates
+the items."
+  [m]
+  (emit! m (event-for m :opening))
+  (refresh-menus! m))
+
+(defn popup-menu!
+  "Show the menu at x, y in the widget, and return when the user chose an item or
+dismissed it."
+  ([m widget] (popup-menu! m widget 0 0))
+  ([m widget x y]
+   (let [b (current-backend)]
+     (in-ui (fn [] (backend-popup-menu b m widget x y))))))
+
+(def ^:private modifier-names
+  {"primary" :primary "ctrl" :control "control" :control "cmd" :command "command" :command
+   "super" :command "meta" :command "alt" :alt "option" :alt "opt" :alt "shift" :shift})
+
+(def ^:private key-aliases
+  {:enter :return :esc :escape :del :delete :pageup :page-up :pagedown :page-down})
+
+(defn parse-shortcut
+  "The shortcut string s, such as \"Primary+Shift+S\", as [key modifiers]: key is a
+lower-case character or a keyword such as :f5, :return or :left, and modifiers a set of
+:shift, :control, :alt and :command. Primary is :command on macOS and :control elsewhere.
+Parts are joined with + or -, and names aren't case-sensitive."
+  [s]
+  (let [[parts cur] (reduce (fn [[parts cur] ch]
+                              (if (and (or (= ch \+) (= ch \-)) (seq cur))
+                                [(conj parts cur) ""]
+                                [parts (str cur ch)]))
+                            [[] ""] s)
+        parts (conj parts cur)
+        key-name (peek parts)
+        mods (set (map (fn [p]
+                         (let [m (get modifier-names (string/lower-case p))]
+                           (cond (nil? m) (error "unknown modifier" (pr-str p) "in the shortcut"
+                                                 (pr-str s))
+                                 (= m :primary) (primary-modifier)
+                                 :else m)))
+                       (pop parts)))
+        key (if (= 1 (count key-name))
+              (first (string/lower-case key-name))
+              (let [k (keyword (string/lower-case key-name))] (get key-aliases k k)))]
+    [key mods]))
+
+(defn portable-shortcut-label
+  "The shortcut string s as \"Ctrl+Shift+S\": how backends without their own symbols
+show it."
+  [s]
+  (let [[key mods] (parse-shortcut s)
+        names (keep (fn [[m label]] (when (contains? mods m) label))
+                    [[:control "Ctrl"] [:alt "Alt"] [:shift "Shift"] [:command "Cmd"]])
+        key-label (if (char? key)
+                    (string/upper-case (str key))
+                    (get {:return "Enter" :escape "Esc" :page-up "PgUp" :page-down "PgDown"}
+                         key (string/capitalize (name key))))]
+    (string/join "+" (concat names [key-label]))))
+
+(defmethod backend-shortcut-label [(b backend) shortcut]
+  (portable-shortcut-label shortcut))
+
+(defn shortcut-label
+  "How the platform shows the shortcut (a string or a menu item's), or \"\" for none."
+  [shortcut]
+  (let [s (if (instance? menu-item-widget shortcut) (:shortcut shortcut) shortcut)
+        b (current-backend)]
+    (if s (in-ui (fn [] (backend-shortcut-label b s))) "")))
+
+(defn shortcut-matches?
+  "True if the key event is the shortcut string s."
+  [s e]
+  (let [[key mods] (parse-shortcut s)
+        ekey (:key e)]
+    (and (= mods (set (:modifiers e)))
+         (if (and (char? key) (char? ekey))
+           (= (string/lower-case (str key)) (string/lower-case (str ekey)))
+           (= key ekey)))))
+
+(defn menu-item-for-key
+  "The menu item in root (a menu bar or menu) whose shortcut the key event is, or nil."
+  [root e]
+  (let [found (atom nil)]
+    (map-menu-items (fn [item _]
+                      (when (and (nil? @found) (:shortcut item)
+                                 (shortcut-matches? (:shortcut item) e))
+                        (reset! found item)))
+                    root)
+    @found))
+
+(defn add-shortcut!
+  "Make the shortcut string s call f (of no arguments) in the window, before the focused
+widget gets the key; enabled-fn, if given, is asked first. It replaces a binding of the
+same keys. Returns the binding, which remove-shortcut! takes."
+  ([w s f] (add-shortcut! w s f nil))
+  ([w s f enabled-fn]
+   (when (:destroyed w) (error "can't add a shortcut to a destroyed window"))
+   (let [[key mods] (parse-shortcut s)
+         binding {:shortcut s :key key :modifiers mods :fn f :enabled-fn enabled-fn}]
+     (update-slot! w :shortcuts
+                   (fn [bs] (conj (filterv (fn [b] (not (and (= key (:key b))
+                                                             (= mods (:modifiers b)))))
+                                           bs)
+                                  binding)))
+     binding)))
+
+(defn remove-shortcut!
+  "Remove the binding (from add-shortcut!), or the shortcut string's, from the window.
+True if there was one."
+  [w binding]
+  (let [[key mods] (if (string? binding) (parse-shortcut binding)
+                       [(:key binding) (:modifiers binding)])
+        old (:shortcuts w)
+        new (filterv (fn [b] (not (and (= key (:key b)) (= mods (:modifiers b))))) old)]
+    (set-slot! w :shortcuts new)
+    (not= (count old) (count new))))
+
+(defn dispatch-shortcut!
+  "Backends call this with a key-down event in the window before its focused widget gets
+it: if it is one of the window's shortcuts, it consumes the event, runs the binding and
+returns true."
+  [w e]
+  (when (and (not (:destroyed w)) (not (consumed? e)))
+    (when-let [b (first (filter (fn [b] (shortcut-matches? (:shortcut b) e)) (:shortcuts w)))]
+      (when (or (nil? (:enabled-fn b)) ((:enabled-fn b)))
+        (consume! e)
+        ((:fn b))
+        true))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Timers, the clipboard and the system
+
+(defgeneric backend-start-timer [backend timer]
+  "Call timer-fired! on the UI thread after the timer's :interval seconds, and again
+every interval if it :repeat-s. Returns a handle for backend-stop-timer.")
+
+(defgeneric backend-stop-timer [backend timer handle]
+  "Stop the timer that backend-start-timer gave handle for.")
+
+(defgeneric backend-clipboard-text [backend] "The text on the clipboard, or nil.")
+(defgeneric backend-set-clipboard-text [backend s] "Put the string s on the clipboard.")
+(defgeneric backend-beep [backend] "Play the system's alert sound.")
+(defgeneric backend-open-url [backend url] "Open url in the browser or the app for it.")
+(defgeneric backend-system-color [backend name] "The color the system color keyword name is now.")
+(defgeneric backend-dark-mode? [backend] "True if the system is in dark mode.")
+
+(defclass timer [emitter]
+  "Emits :tick (a timer-event) every :interval seconds, or once if :repeat is false, on
+the UI thread. after and every make and start one; start-timer! and stop-timer! start and
+stop it."
+  (interval :cell :atom :init 1 :doc "Seconds between ticks.")
+  (repeat :cell :atom :init true :doc "Whether it keeps ticking, or ticks once.")
+  (handle :cell :atom :init nil))
+
+(declare-widget! timer {:signals {:tick timer-event}})
+
+(defn stop-timer!
+  "Stop the timer; start-timer! starts it again. Returns it."
+  [t]
+  (when-let [h (:handle t)]
+    (let [b (current-backend)]
+      (in-ui (fn [] (backend-stop-timer b t h))))
+    (set-slot! t :handle nil))
+  t)
+
+(defn start-timer!
+  "Start the timer, or start it again from now. Returns it."
+  [t]
+  (stop-timer! t)
+  (let [b (current-backend)]
+    (set-slot! t :handle (in-ui (fn [] (backend-start-timer b t)))))
+  t)
+
+(defn timer-running?
+  "True if the timer will tick."
+  [t]
+  (some? (:handle t)))
+
+(defn timer-fired!
+  "Backends call this when the timer's interval passed: it emits :tick."
+  [t]
+  (when-not (:repeat t) (set-slot! t :handle nil))
+  (emit! t (event-for t :tick)))
+
+(defn after
+  "Call f (of no arguments) once, seconds from now, on the UI thread. Returns the timer,
+which stop-timer! cancels."
+  [seconds f]
+  (let [t (make timer :interval seconds :repeat false)]
+    (on t :tick (fn [_] (f)))
+    (start-timer! t)))
+
+(defn every
+  "Call f (of no arguments) every seconds on the UI thread. Returns the timer, which
+stop-timer! stops."
+  [seconds f]
+  (let [t (make timer :interval seconds :repeat true)]
+    (on t :tick (fn [_] (f)))
+    (start-timer! t)))
+
+(defn clipboard-text
+  "The text on the clipboard, or nil."
+  []
+  (let [b (current-backend)] (in-ui (fn [] (backend-clipboard-text b)))))
+
+(defn set-clipboard-text!
+  "Put the string s on the clipboard. Returns s."
+  [s]
+  (let [b (current-backend)] (in-ui (fn [] (backend-set-clipboard-text b s))))
+  s)
+
+(defn beep!
+  "Play the system's alert sound."
+  []
+  (let [b (current-backend)] (in-ui (fn [] (backend-beep b))))
+  nil)
+
+(defn open-url!
+  "Open url, a string, in the user's browser, or the app that handles it."
+  [url]
+  (let [b (current-backend)] (in-ui (fn [] (backend-open-url b url))))
+  nil)
+
+(defn system-color
+  "The color the system color keyword name (one of system-colors) is now, in light or
+dark mode. Keep the keyword itself where a color should follow the mode."
+  [name]
+  (when-not (contains? system-colors name)
+    (error "not a system color:" (pr-str name)))
+  (let [b (current-backend)] (in-ui (fn [] (backend-system-color b name)))))
+
+(defn dark-mode?
+  "True if the system is in dark mode."
+  []
+  (let [b (current-backend)] (in-ui (fn [] (backend-dark-mode? b)))))

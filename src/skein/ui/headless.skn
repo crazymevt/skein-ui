@@ -15,7 +15,16 @@ pixels a character, 16 a line of text, 24 for a field. Calls the core asks to ma
 
 (defclass headless-backend [ui/backend]
   "The headless backend: native objects are atoms of maps."
-  (pending :cell :atom :init [] :doc "The functions backend-call-later was given."))
+  (pending :cell :atom :init [] :doc "The functions backend-call-later was given.")
+  (answers :cell :atom :init [] :doc "What the next dialogs answer (answer!).")
+  (dialogs :cell :atom :init [] :doc "The dialogs shown, oldest first.")
+  (clock :cell :atom :init 0 :doc "Seconds of imagined time (advance!).")
+  (timers :cell :atom :init {} :doc "handle -> {:timer :due}, the running timers.")
+  (next-handle :cell :atom :init 0)
+  (clipboard :cell :atom :init nil)
+  (log :cell :atom :init [] :doc "Beeps, opened URLs, roles performed and popup menus.")
+  (active :cell :atom :init nil :doc "The window with the keyboard.")
+  (dark :cell :atom :init false :doc "Whether the imagined system is in dark mode."))
 
 (defn backend
   "A new headless backend."
@@ -49,9 +58,11 @@ pixels a character, 16 a line of text, 24 for a field. Calls the core asks to ma
          (fn [cs] (vec (remove (fn [c] (identical? c (:native child))) cs)))))
 
 (defmethod ui/backend-show [(b headless-backend) window]
+  (set-slot! b :active window)
   (swap! (:native window) assoc :shown true))
 
 (defmethod ui/backend-close [(b headless-backend) window]
+  (when (identical? window (:active b)) (set-slot! b :active nil))
   (swap! (:native window) assoc :shown false))
 
 (defmethod ui/backend-set-bounds [(b headless-backend) widget x y width height]
@@ -137,8 +148,194 @@ pixels a character, 16 a line of text, 24 for a field. Calls the core asks to ma
 (defmethod natural-size [(v ui/image-view-widget)]
   (if-let [i (:image v)] [(:width i) (:height i)] [0 0]))
 
+(defmethod natural-size [(v ui/text-view-widget)]
+  [240 120])
+
+(defmethod natural-size [(l ui/list-box-widget)]
+  [(max 120 (+ 16 (widest-item l))) 100])
+
+(defmethod natural-size [(t ui/table-view-widget)]
+  [(max 120 (reduce + 0 (map (fn [c] (or (:width c) 80)) (:columns t)))) 100])
+
+(defmethod natural-size [(t ui/tree-view-widget)]
+  [160 120])
+
+(defmethod natural-size [(c ui/color-button-widget)]
+  [44 28])
+
+(defmethod natural-size [(d ui/date-picker-widget)]
+  [(case (:mode d) :time 80 :date-time 200 120) 24])
+
 (defmethod ui/backend-natural-size [(b headless-backend) widget]
   (natural-size widget))
+
+(defn- position-of
+  "The index of x in coll (compared with identical?), or nil."
+  [x coll]
+  (first (keep-indexed (fn [i y] (when (identical? x y) i)) coll)))
+
+(defmethod ui/backend-decoration-size [(b headless-backend) (n ui/notebook-widget)]
+  [8 32])
+
+(defmethod ui/backend-content-area [(b headless-backend) (n ui/notebook-widget) width height]
+  [4 28 (max 0 (- width 8)) (max 0 (- height 32))])
+
+(defmethod ui/backend-decoration-size [(b headless-backend) (p ui/paned-widget)]
+  [1 1])
+
+(defmethod ui/backend-decoration-size [(b headless-backend) (s ui/scrolled-window-widget)]
+  (if (:border s) [2 2] [0 0]))
+
+(defmethod ui/backend-content-area [(b headless-backend) (s ui/scrolled-window-widget)
+                                    width height]
+  (if (:border s)
+    [1 1 (max 0 (- width 2)) (max 0 (- height 2))]
+    [0 0 width height]))
+
+(defmethod ui/backend-set-scroll-extent [(b headless-backend) s width height]
+  (swap! (:native s) assoc :scroll-extent [width height])
+  nil)
+
+(defmethod ui/backend-scroll-to [(b headless-backend) s x y]
+  (swap! (:native s) assoc :scrolled-to [x y]))
+
+(defmethod ui/backend-set-page-label [(b headless-backend) n page label]
+  (swap! (:native n) assoc-in [:page-labels (position-of page (:children n))] label))
+
+(defmethod ui/backend-text-size [(b headless-backend) s font]
+  (text-size s))
+
+;;; Text views and trees
+
+(defn- text-of [v] (or (get-in @(:native v) [:properties :text]) ""))
+
+(defmethod ui/backend-text-append [(b headless-backend) v s]
+  (let [t (str (text-of v) s)]
+    (swap! (:native v) (fn [n] (-> n (assoc-in [:properties :text] t)
+                                   (assoc :selection [(count t) (count t)]))))))
+
+(defmethod ui/backend-text-selection [(b headless-backend) v]
+  (or (:selection @(:native v)) [0 0]))
+
+(defmethod ui/backend-set-text-selection [(b headless-backend) v start end]
+  (swap! (:native v) assoc :selection [start end]))
+
+(defmethod ui/backend-text-insert [(b headless-backend) v s]
+  (let [[start end] (ui/backend-text-selection b v)
+        t (text-of v)
+        at (+ start (count s))]
+    (swap! (:native v) (fn [n] (-> n (assoc-in [:properties :text]
+                                               (str (subs t 0 start) s (subs t end)))
+                                   (assoc :selection [at at]))))))
+
+(defmethod ui/backend-tree-refresh [(b headless-backend) tree item]
+  (swap! (:native tree) update :refreshes (fnil conj []) item))
+
+;;; Canvases
+
+(defmethod ui/backend-redraw [(b headless-backend) c rect]
+  (swap! (:native c) update :redraws (fnil conj []) rect))
+
+(defclass recording-context [ui/graphics-context]
+  "A graphics context that records the drawing operations, as [:op args...]."
+  (ops :cell :atom :init []))
+
+(defn- record! [gc & op] (update-slot! gc :ops conj (vec op)) nil)
+
+(defmethod ui/gc-set-fill-color [(gc recording-context) c] (record! gc :fill-color c))
+(defmethod ui/gc-set-stroke-color [(gc recording-context) c] (record! gc :stroke-color c))
+(defmethod ui/gc-set-line-width [(gc recording-context) w] (record! gc :line-width w))
+(defmethod ui/gc-set-line-style [(gc recording-context) cap join dash]
+  (record! gc :line-style cap join dash))
+(defmethod ui/gc-save [(gc recording-context)] (record! gc :save))
+(defmethod ui/gc-restore [(gc recording-context)] (record! gc :restore))
+(defmethod ui/gc-translate [(gc recording-context) dx dy] (record! gc :translate dx dy))
+(defmethod ui/gc-scale [(gc recording-context) sx sy] (record! gc :scale sx sy))
+(defmethod ui/gc-rotate [(gc recording-context) r] (record! gc :rotate r))
+(defmethod ui/gc-clip-rectangle [(gc recording-context) x y w h] (record! gc :clip x y w h))
+(defmethod ui/gc-rectangle [(gc recording-context) x y w h mode]
+  (record! gc :rectangle x y w h mode))
+(defmethod ui/gc-ellipse [(gc recording-context) x y w h mode] (record! gc :ellipse x y w h mode))
+(defmethod ui/gc-begin-path [(gc recording-context)] (record! gc :begin-path))
+(defmethod ui/gc-move-to [(gc recording-context) x y] (record! gc :move-to x y))
+(defmethod ui/gc-line-to [(gc recording-context) x y] (record! gc :line-to x y))
+(defmethod ui/gc-curve-to [(gc recording-context) x1 y1 x2 y2 x y]
+  (record! gc :curve-to x1 y1 x2 y2 x y))
+(defmethod ui/gc-arc [(gc recording-context) cx cy r start end] (record! gc :arc cx cy r start end))
+(defmethod ui/gc-close-path [(gc recording-context)] (record! gc :close-path))
+(defmethod ui/gc-draw-path [(gc recording-context) mode] (record! gc :draw-path mode))
+(defmethod ui/gc-text [(gc recording-context) s x y font color] (record! gc :text s x y font color))
+(defmethod ui/gc-text-size [(gc recording-context) s font] (text-size s))
+(defmethod ui/gc-image [(gc recording-context) image x y w h] (record! gc :image image x y w h))
+
+;;; Dialogs
+
+(defn- next-answer! [b kind info]
+  (update-slot! b :dialogs conj (assoc info :kind kind))
+  (when (empty? (:answers b))
+    (error "the headless backend has no answer for the" (name kind) "dialog: call answer! first"))
+  (let [a (first (:answers b))]
+    (update-slot! b :answers (fn [as] (vec (rest as))))
+    a))
+
+(defmethod ui/backend-message-box [(b headless-backend) parent message detail type labels]
+  (let [a (next-answer! b :message {:message message :detail detail :type type :labels labels})]
+    (cond (nil? a) nil
+          (integer? a) a
+          :else (or (first (keep-indexed (fn [i l] (when (= l a) i)) labels))
+                    (error "the message box has no button" (pr-str a) "; its buttons are"
+                           (pr-str labels))))))
+
+(defmethod ui/backend-prompt-text [(b headless-backend) parent message detail default ok cancel]
+  (next-answer! b :prompt {:message message :detail detail :default default}))
+
+(defmethod ui/backend-choose-file [(b headless-backend) parent opts]
+  (let [a (next-answer! b :file opts)]
+    (cond (nil? a) nil
+          (string? a) [a]
+          :else (vec a))))
+
+(defmethod ui/backend-show-about [(b headless-backend) info]
+  (update-slot! b :dialogs conj (assoc info :kind :about)))
+
+;;; Menus, timers and the system
+
+(defmethod ui/backend-popup-menu [(b headless-backend) menu widget x y]
+  (update-slot! b :log conj [:popup-menu menu widget x y]))
+
+(defmethod ui/backend-perform-role [(b headless-backend) role]
+  (update-slot! b :log conj [:role role]))
+
+(defmethod ui/backend-active-window [(b headless-backend)]
+  (:active b))
+
+(defmethod ui/backend-start-timer [(b headless-backend) t]
+  (let [h (update-slot! b :next-handle inc)]
+    (update-slot! b :timers assoc h {:timer t :due (+ (:clock b) (:interval t))})
+    h))
+
+(defmethod ui/backend-stop-timer [(b headless-backend) t h]
+  (update-slot! b :timers dissoc h))
+
+(defmethod ui/backend-clipboard-text [(b headless-backend)] (:clipboard b))
+(defmethod ui/backend-set-clipboard-text [(b headless-backend) s] (set-slot! b :clipboard s))
+(defmethod ui/backend-beep [(b headless-backend)] (update-slot! b :log conj [:beep]))
+(defmethod ui/backend-open-url [(b headless-backend) url]
+  (update-slot! b :log conj [:open-url url]))
+(defmethod ui/backend-dark-mode? [(b headless-backend)] (:dark b))
+
+(def ^:private light-colors
+  {:text "#000000" :secondary-text "#808080" :disabled-text "#b0b0b0" :background "#ffffff"
+   :control-background "#ffffff" :window-background "#ececec" :selection "#b3d7ff"
+   :accent "#007aff" :separator "#d0d0d0" :link "#0068da" :grid "#e0e0e0"})
+
+(def ^:private dark-colors
+  {:text "#ffffff" :secondary-text "#a0a0a0" :disabled-text "#606060" :background "#1e1e1e"
+   :control-background "#1e1e1e" :window-background "#323232" :selection "#3f638b"
+   :accent "#0a84ff" :separator "#404040" :link "#419cff" :grid "#3a3a3a"})
+
+(defmethod ui/backend-system-color [(b headless-backend) name]
+  (ui/parse-color (get (if (:dark b) dark-colors light-colors) name "#808080")))
 
 (defmethod ui/backend-decoration-size [(b headless-backend) (f ui/frame-widget)]
   [4 (if (:title f) 20 4)])
@@ -253,3 +450,179 @@ Returns the event."
 vetoes. True if it closed."
   [window]
   (ui/close! window))
+
+(defn page-label
+  "The tab label the notebook's native control shows for its page at index."
+  [n index]
+  (get-in @(:native n) [:page-labels index]))
+
+(defn edit-text!
+  "Make the text view's text s, as the user editing would: it emits :changed. Returns the
+event."
+  [v s]
+  (user-sets! v :text s))
+
+(defn selection
+  "The text view's selection in its native control, [start end]."
+  [v]
+  (ui/backend-text-selection (ui/current-backend) v))
+
+(defn select-rows!
+  "Select the rows at indices in the list box or table, as the user would. Returns the
+event."
+  [w indices]
+  (swap! (:native w) assoc-in [:properties :selected-indices] (vec indices))
+  (ui/selection-changed-by-user! w indices))
+
+(defn activate-row!
+  "Double-click the row at index of the list box or table. Returns the event."
+  [w index]
+  (ui/row-activated-by-user! w index 2))
+
+(defn click-column!
+  "Click the title of the table's column at index, as the user would. Returns the event."
+  [t index]
+  (ui/column-clicked-by-user! t index))
+
+(defn open-item!
+  "Open (expanded true) or close the tree's item, as the user would."
+  [tree item expanded]
+  (ui/expansion-changed-by-user! tree item expanded))
+
+(defn select-tree-items!
+  "Select the tree's items, as the user would. Returns the event."
+  [tree items]
+  (ui/tree-selection-changed-by-user! tree items))
+
+(defn refreshes
+  "The items whose children the tree was asked to show again (nil for all), in order."
+  [tree]
+  (:refreshes @(:native tree)))
+
+(defn pick!
+  "Pick value in a color button (:color) or date picker (:date), as the user would.
+Returns the event."
+  [w value]
+  (user-sets! w (if (instance? ui/color-button-widget w) :color :date) value))
+
+(defn choose-page!
+  "Click the notebook's tab at index, as the user would. Returns the event."
+  [n index]
+  (swap! (:native n) assoc-in [:properties :selected-index] index)
+  (ui/page-changed-by-user! n index))
+
+(defn drag-divider!
+  "Drag the paned widget's first divider to position. Returns the event."
+  [p position]
+  (swap! (:native p) assoc-in [:properties :position] position)
+  (ui/divider-moved-by-user! p position))
+
+(defn scroll!
+  "Scroll the scrolled window so that the content's point x, y is at the top left, as
+the user would. Returns the event."
+  [s x y]
+  (swap! (:native s) assoc :scrolled-to [x y])
+  (ui/scrolled-by-user! s x y))
+
+(defn scroll-extent
+  "The size the scrolled window's content area was given, [width height]."
+  [s]
+  (:scroll-extent @(:native s)))
+
+(defn scrolled-to
+  "Where the scrolled window was last scrolled to, [x y], or nil."
+  [s]
+  (:scrolled-to @(:native s)))
+
+(defn redraws
+  "The redraws asked of the canvas, oldest first: nil for all of it, or [x y w h]."
+  [c]
+  (:redraws @(:native c)))
+
+(defn draw!
+  "Draw the canvas, as the platform would: it emits :draw with a context that records
+the drawing, at the canvas's size. Returns the operations drawn, each [:op args...]."
+  [c]
+  (let [[_ _ w h] (or (:allocation c) (into [0 0] (ui/preferred-size c)))
+        gc (make recording-context :width w :height h)]
+    (ui/emit! c (ui/event-for c :draw :context gc :width w :height h))
+    (:ops gc)))
+
+(defn mouse!
+  "Send the canvas a mouse event, as the user's mouse would: signal is :mouse-down,
+:mouse-up, :mouse-move, :mouse-drag, :mouse-enter or :mouse-leave; opts are the event's
+:button, :click-count and :modifiers. Returns the event."
+  ([c signal x y] (mouse! c signal x y {}))
+  ([c signal x y opts]
+   (ui/emit! c (apply ui/event-for c signal :x x :y y (mapcat identity opts)))))
+
+(defn scroll-wheel!
+  "Turn the wheel over the canvas by dx, dy lines. Returns the event."
+  [c dx dy]
+  (ui/emit! c (ui/event-for c :scroll :delta-x dx :delta-y dy)))
+
+(defn press-key!
+  "Press the key described by the shortcut string s (\"Primary+S\", \"a\", \"Return\") in
+the canvas, or in the window: there, as the platform would, it chooses a menu item with
+that shortcut, or runs the window's shortcut, or else emits :key-down. Returns the key
+event."
+  [target s]
+  (let [[key mods] (ui/parse-shortcut s)
+        e (ui/event-for target :key-down :key key :modifiers mods
+                        :text (if (char? key) (str key) ""))]
+    (if (instance? ui/window-widget target)
+      (let [item (when-let [bar (:menu-bar target)] (ui/menu-item-for-key bar e))]
+        (cond item (do (ui/consume! e) (ui/activate-menu-item! item))
+              (ui/dispatch-shortcut! target e) nil
+              :else (ui/emit! target e)))
+      (ui/emit! target e))
+    e))
+
+(defn choose-menu-item!
+  "Choose the menu item as the user would: its menu opens (:opening), then it runs if it
+can. True if it ran."
+  [item]
+  (when-let [m (:parent item)]
+    (when (instance? ui/menu-widget m) (ui/menu-opening! m)))
+  (ui/activate-menu-item! item))
+
+(defn answer!
+  "Give the answers the next dialogs get, in order: for a message box, a button's label
+or index (nil to dismiss it); for a text prompt, the text (nil to cancel); for a file
+chooser, a path, a vector of paths, or nil to cancel."
+  [& answers]
+  (update-slot! (ui/current-backend) :answers into answers)
+  nil)
+
+(defn dialogs
+  "The dialogs shown, oldest first: maps with :kind (:message, :prompt, :file or
+:about) and what the dialog was given."
+  []
+  (:dialogs (ui/current-backend)))
+
+(defn advance!
+  "Let seconds of imagined time pass, firing the timers that come due, in order."
+  [seconds]
+  (let [b (ui/current-backend)
+        end (+ (:clock b) seconds)]
+    (loop []
+      (let [[h {:keys [timer due]}] (first (sort-by (fn [[_ t]] (:due t)) (:timers b)))]
+        (if (and h (<= due end))
+          (do (set-slot! b :clock due)
+              (if (:repeat timer)
+                (update-slot! b :timers assoc-in [h :due] (+ due (:interval timer)))
+                (update-slot! b :timers dissoc h))
+              (ui/timer-fired! timer)
+              (recur))
+          (set-slot! b :clock end))))
+    nil))
+
+(defn backend-log
+  "The beeps, opened URLs, popup menus and menu roles performed, oldest first."
+  []
+  (:log (ui/current-backend)))
+
+(defn set-dark-mode!
+  "Put the imagined system in dark mode, or out of it."
+  [dark]
+  (set-slot! (ui/current-backend) :dark dark))

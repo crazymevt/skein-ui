@@ -1,0 +1,179 @@
+(ns skein.ui.widgets-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless :refer [bounds]]))
+
+;; The rest of the widgets on the headless backend (step 3 of M2.14, D-097): the text view,
+;; list boxes, tables, trees, color and date pickers, notebooks, split panes and scrolled
+;; windows.
+
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)))
+
+(deftest text-views
+  (let [seen (atom [])
+        v (ui/text-view {:text "Hello" :on-changed (fn [e] (swap! seen conj (:value e)))})]
+    (is (ui/expands? v :vertical))
+    (ui/append-text! v ", world")
+    (is (= "Hello, world" (:text v)))
+    (is (= "Hello, world" (headless/native-property v :text)))
+    (ui/set-text-selection! v 0 5)
+    (is (= [0 5] (ui/text-selection v)))
+    (ui/insert-text! v "Goodbye")
+    (is (= "Goodbye, world" (:text v)))
+    (is (= "Goodbye, world" (headless/native-property v :text)))
+    (is (= [7 7] (ui/text-selection v)) "the insertion point follows the text inserted")
+    (is (empty? @seen) "a program's changes emit nothing")
+    (headless/edit-text! v "typed")
+    (is (= ["typed"] @seen))
+    (is (= "typed" (:text v)))))
+
+(deftest list-boxes
+  (let [seen (atom [])
+        l (ui/list-box {:items ["a" "b" "c"] :selection-mode :multiple
+                        :on-selection-changed (fn [e] (swap! seen conj [(:index e) (:value e)]))
+                        :on-row-activated (fn [e] (swap! seen conj [:activated (:item e)]))})]
+    (headless/select-rows! l [1 2])
+    (is (= ["b" "c"] (ui/selected-items l)))
+    (is (= "b" (ui/selected-item l)))
+    (headless/activate-row! l 2)
+    (is (= [[1 "b"] [:activated "c"]] @seen))
+    (set-slot! l :items ["x" "y"])
+    (is (= [1] (:selected-indices l)) "selections of rows that went away are dropped")
+    (is (= [1] (headless/native-property l :selected-indices)))))
+
+(def people
+  [{:name "Ada" :age 36} {:name "bob" :age 7} {:name "Cy" :age 51} {:name "Al" :age 7}])
+
+(deftest tables
+  (let [name-col (ui/column "Name" :name {:width 100})
+        age-col (ui/column "Age" :age {:alignment :right})
+        t (ui/table-view {:columns [name-col age-col] :items people})]
+    (is (= "36" (ui/table-cell-text t 0 1)))
+    (is (= "" (ui/table-cell-text t 9 0)))
+    (is (= "bob" (ui/cell-text name-col (nth people 1))))
+    (is (= [180 100] (ui/preferred-size t)))
+    (testing "clicking a title sorts by its column, keeping the selection"
+      (headless/select-rows! t [2])
+      (headless/click-column! t 1)
+      (is (= ["bob" "Al" "Ada" "Cy"] (mapv :name (:items t))) "a stable sort")
+      (is (identical? age-col (:sort-column t)))
+      (is (= "Cy" (:name (ui/selected-item t))))
+      (headless/click-column! t 1)
+      (is (= ["Cy" "Ada" "bob" "Al"] (mapv :name (:items t))) "again, descending")
+      (is (:sort-descending t))
+      (headless/click-column! t 0)
+      (is (= ["Ada" "Al" "bob" "Cy"] (mapv :name (:items t))) "strings regardless of case"))
+    (testing "a table that isn't sortable, or a column that can't sort, stays put"
+      (set-slot! t :sortable false)
+      (headless/click-column! t 1)
+      (is (= ["Ada" "Al" "bob" "Cy"] (mapv :name (:items t))))))
+  (let [vec-col (ui/column "Second" 1)]
+    (is (= "b" (ui/cell-text vec-col ["a" "b"]))))
+  (are [a b] (neg? (ui/compare-values a b))
+    1 2
+    5 "a"
+    "a" "B"
+    "z" :k))
+
+(def files
+  {"/" ["docs" "src"] "docs" ["a.md"] "src" ["main.skn" "util"] "util" ["x.skn"]})
+
+(deftest trees
+  (let [seen (atom [])
+        t (ui/tree-view {:roots ["/"] :children-fn (fn [f] (get files f []))
+                         :on-expanded (fn [e] (swap! seen conj [:open (:item e)]))
+                         :on-collapsed (fn [e] (swap! seen conj [:close (:item e)]))})]
+    (is (= ["/"] (ui/visible-tree-items t)))
+    (ui/expand! t "/")
+    (is (= ["/" "docs" "src"] (ui/visible-tree-items t)))
+    (ui/expand! t "src" true)
+    (is (= ["/" "docs" "src" "main.skn" "util" "x.skn"] (ui/visible-tree-items t)))
+    (ui/collapse! t "src")
+    (is (= ["/" "docs" "src"] (ui/visible-tree-items t)))
+    (is (ui/expanded? t "util") "it remembers the open items inside a closed one")
+    (is (empty? @seen) "a program's changes emit nothing")
+    (headless/open-item! t "docs" true)
+    (headless/open-item! t "docs" true)
+    (headless/open-item! t "docs" false)
+    (is (= [[:open "docs"] [:close "docs"]] @seen) "only changes are emitted")
+    (testing "children are asked for once, until refresh-tree!"
+      (let [calls (atom 0)
+            t (ui/tree-view {:roots [1] :children-fn (fn [n] (swap! calls inc) [(inc n)])})]
+        (ui/tree-children t 1)
+        (ui/tree-children t 1)
+        (is (= 1 @calls))
+        (ui/refresh-tree! t 1)
+        (ui/tree-children t 1)
+        (is (= 2 @calls))
+        (is (= [1] (headless/refreshes t)))))
+    (testing "selection"
+      (headless/select-tree-items! t ["src"])
+      (is (= "src" (ui/selected-item t)))
+      (is (thrown-with-msg? error "one item at a time"
+                            (set-slot! t :selection ["src" "docs"]))))
+    (is (= "docs" (ui/tree-cell-text t "docs" 0)))))
+
+(deftest pickers
+  (let [c (ui/color-button {:color :steelblue})
+        d (ui/date-picker {:mode :date-time})]
+    (is (= :steelblue (headless/native-property c :color)))
+    (is (= (ui/rgb 1 0 0) (:value (headless/pick! c (ui/rgb 1 0 0)))))
+    (is (< 1700000000000 (:date d)) "it starts at now")
+    (headless/pick! d 0)
+    (is (= 0 (:date d)))
+    (is (= [200 24] (ui/preferred-size d)))))
+
+(deftest notebooks
+  (let [general (ui/label {:text "General" :tab-label "General"})
+        other (ui/label {:text "abc"})
+        seen (atom nil)
+        n (ui/notebook {:on-page-changed (fn [e] (reset! seen [(:index e) (:value e)]))}
+                       general other)]
+    (is (= "Page 2" (:tab-label other)))
+    (is (identical? general (ui/selected-page n)))
+    (ui/show! (ui/window {} n))
+    (is (= [64 48] (ui/preferred-size n)) "the biggest page, and the tabs")
+    (is (= [4 28 56 16] (bounds general)))
+    (is (= [4 28 56 16] (bounds other)) "every page gets the page area")
+    (headless/choose-page! n 1)
+    (is (= [1 other] @seen))
+    (set-slot! other :tab-label "Other")
+    (is (= "Other" (headless/page-label n 1)))))
+
+(deftest split-panes
+  (let [a (ui/label {:text "abcd"})
+        b (ui/label {:text "ab"})
+        p (ui/paned {} a b)
+        w (ui/window {:width 101 :height 50} p)
+        seen (atom nil)]
+    (ui/on p :divider-moved (fn [e] (reset! seen (:value e))))
+    (is (= [49 16] (ui/preferred-size p)))
+    (ui/show! w)
+    (is (= [0 0 32 50] (bounds a)) "the first pane at its natural width")
+    (is (= [33 0 68 50] (bounds b)) "the second takes the rest, after the divider")
+    (headless/drag-divider! p 60)
+    (is (= 60 @seen))
+    (is (= [0 0 60 50] (bounds a)))
+    (is (= [61 0 40 50] (bounds b)))
+    (testing "three panes share what the first leaves"
+      (let [p (ui/paned {:orientation :vertical :position 10} (ui/label {}) (ui/label {})
+                        (ui/label {}))]
+        (is (= [10 44 45] (ui/pane-lengths p 101)))))))
+
+(deftest scrolled-windows
+  (let [big (ui/label {:text "abcdefghijklmnopqrstuvwxyz" :height 300})
+        s (ui/scrolled-window {:min-content-width 100 :min-content-height 50} big)
+        seen (atom nil)]
+    (ui/on s :scrolled (fn [e] (reset! seen (:value e))))
+    (is (= [100 50] (ui/preferred-size s)) "the view's natural size, not the content's")
+    (ui/show! (ui/window {:width 150 :height 100} s))
+    (is (= [208 300] (headless/scroll-extent s)) "the content keeps its size")
+    (is (= [0 0 208 300] (bounds big)))
+    (ui/scroll-to! s 0 120)
+    (is (= [0 120] (headless/scrolled-to s)))
+    (headless/scroll! s 0 40)
+    (is (= [0 40] @seen))
+    (set-slot! s :horizontal-policy :never)
+    (headless/run-pending!)
+    (is (= [150 300] (headless/scroll-extent s)) ":never makes the content as wide as the view")
+    (is (thrown-with-msg? error "holds one widget" (ui/add! s (ui/label {}))))))

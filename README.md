@@ -36,11 +36,18 @@ programs look and behave the way their users expect.
   `:vexpand` and `:expand` take extra space, `:halign` and `:valign` place a widget in
   its space, `:margin` goes around it, and `:column` and `:row` place it in a grid.
 
+- **Drawing:** a `ui/canvas` emits `:draw` with a graphics context to draw on
+  (`ui/fill-rectangle!`, `ui/draw-line!`, `ui/draw-text!`, ...), and mouse and key events.
+- **Menus, dialogs and the rest:** menu bars with shortcuts (`ui/menu-bar`, `ui/menu`,
+  `ui/menu-item`), the platform's alerts and file choosers (`ui/message-box`,
+  `ui/choose-file`), timers (`ui/after`, `ui/every`) and the clipboard.
+
 This is Skein's milestone M2.14 (its D-090 and D-097), a port of the design of LGT, a
-Common Lisp toolkit. It has the core, layout and the simple controls (labels, buttons,
-toggles, check boxes, radio buttons, entries, sliders, spin buttons, progress bars,
-spinners, combo boxes, images and frames) on the headless backend, for tests. LGT's
-other widgets, then the Cocoa, Win32 and GTK 4 backends, come next.
+Common Lisp toolkit. It has LGT's widgets except the web view: labels, buttons, toggles,
+check boxes, radio buttons, entries, text views, sliders, spin buttons, progress bars,
+spinners, combo boxes, list boxes, sortable tables, trees, images, color and date
+pickers, frames, notebooks, split panes, scrolled windows and canvases, on the headless
+backend, for tests. The Cocoa, Win32 and GTK 4 backends come next.
 
 ## Using it
 

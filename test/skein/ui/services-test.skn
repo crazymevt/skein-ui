@@ -1,0 +1,190 @@
+(ns skein.ui.services-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]
+            [skein.system :as system]))
+
+;; Drawing, menus and shortcuts, dialogs, timers and the clipboard on the headless backend
+;; (step 3 of M2.14, D-097).
+
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)))
+
+(deftest colors-and-fonts
+  (is (= (ui/rgb 1 0 0) (ui/parse-color "#f00")))
+  (is (= "#3a7bd5" (ui/color-hex (ui/parse-color "#3A7BD5"))))
+  (is (= (ui/rgb255 70 130 180) (ui/parse-color "Steel Blue")))
+  (is (< 0.5 (ui/color-alpha (ui/parse-color "#00000080")) 0.51) "128/255")
+  (is (= (ui/rgb 1 1 1) (ui/rgb 2 5 1)) "components are clamped")
+  (is (= :accent (ui/ensure-color :accent)) "system colors stay keywords")
+  (is (= (ui/rgb 0 1 0) (ui/hsv 120 1 1)))
+  (is (= "#808080" (ui/color-hex (ui/color-lerp (ui/rgb 0 0 0) (ui/rgb 1 1 1) 0.5))))
+  (is (thrown-with-msg? error "unknown color" (ui/ensure-color :nope)))
+  (is (thrown-with-msg? error "bad hex digit" (ui/parse-color "#ggg")))
+  (is (= {:family :monospace :size nil :weight :regular :italic false}
+         (ui/ensure-font :monospace)))
+  (is (= 14 (:size (ui/ensure-font 14))))
+  (is (thrown-with-msg? error "weight" (ui/font {:weight :heavy})))
+  (is (not (ui/dark-mode?)))
+  (is (= "#007aff" (ui/color-hex (ui/system-color :accent))))
+  (headless/set-dark-mode! true)
+  (is (ui/dark-mode?))
+  (is (= "#0a84ff" (ui/color-hex (ui/system-color :accent)))))
+
+(deftest drawing
+  (let [c (ui/canvas {:width 200 :height 100
+                      :on-draw (fn [e]
+                                 (let [gc (:context e)]
+                                   (ui/paint! gc :white)
+                                   (ui/fill-rectangle! gc 10 10 20 20 {:color :red})
+                                   (ui/with-saved-state [gc]
+                                     (ui/translate! gc 5 5)
+                                     (ui/set-line-width! gc 3))
+                                   (ui/draw-line! gc 0 0 10 10)
+                                   (ui/draw-text! gc "hi" 100 50 {:align :center
+                                                                  :valign :center})))})
+        ops (headless/draw! c)]
+    (is (= [200 100] (ui/preferred-size c)))
+    (is (= [:save] (nth ops 0)) "paint! sets its color in a saved state")
+    (is (= [:rectangle 0.0 0.0 200.0 100.0 :fill] (nth ops 3)))
+    (is (= [:rectangle 10.0 10.0 20.0 20.0 :fill] (nth ops 8)))
+    (is (some (fn [op] (= [:translate 5.0 5.0] op)) ops))
+    (is (= [:begin-path] (first (filter (fn [op] (= :begin-path (first op))) ops))))
+    (is (= [:line-to 10.0 10.0] (first (filter (fn [op] (= :line-to (first op))) ops))))
+    (let [[_ s x y] (last ops)]
+      (is (= ["hi" 92.0 42.0] [s x y]) "centered on 100, 50"))
+    (testing "the context's state comes back after with-saved-state"
+      (let [gc (make headless/recording-context :width 10 :height 10)]
+        (ui/set-line-width! gc 2)
+        (ui/with-saved-state [gc] (ui/set-line-width! gc 5) (ui/set-color! gc :blue))
+        (is (= 2.0 (:line-width gc)))
+        (is (= (ui/rgb 0 0 0) (:fill-color gc)))))
+    (testing "polygons take pairs or flat coordinates"
+      (let [gc (make headless/recording-context)]
+        (ui/fill-polygon! gc [0 0 10 0 5 5])
+        (ui/fill-polygon! gc [[0 0] [10 0] [5 5]])
+        (is (= (subvec (:ops gc) 0 6) (subvec (:ops gc) 6 12)))))
+    (testing "redraws and input"
+      (ui/redraw! c)
+      (ui/redraw! c 1 2 3 4)
+      (is (= [nil [1 2 3 4]] (headless/redraws c)))
+      (let [seen (atom [])]
+        (ui/on c :mouse-down (fn [e] (swap! seen conj [(:x e) (:y e) (:button e)])))
+        (ui/on c :key-down (fn [e] (swap! seen conj [(:key e) (ui/modifier-down? e :primary)])))
+        (headless/mouse! c :mouse-down 3 4 {:button :left :click-count 1})
+        (headless/press-key! c "Primary+K")
+        (is (= [[3 4 :left] [\k true]] @seen))))
+    (testing "a canvas emits :resize when its size changes"
+      (let [sizes (atom [])
+            c (ui/canvas {:on-resize (fn [e] (swap! sizes conj [(:width e) (:height e)]))})
+            w (ui/window {:width 50 :height 40} c)]
+        (ui/show! w)
+        (headless/resize! w 60 40)
+        (headless/resize! w 60 40)
+        (is (= [[50 40] [60 40]] @sizes))))))
+
+(deftest menus-and-shortcuts
+  (let [log (atom [])
+        save (ui/menu-item {:label "Save" :shortcut "Primary+S"
+                            :on-activate (fn [e] (swap! log conj :save))})
+        wrap (ui/check-menu-item {:label "Wrap" :on-activate
+                                  (fn [e] (swap! log conj [:wrap (:checked (:source e))]))})
+        dirty (atom false)
+        revert (ui/menu-item {:label "Revert" :enabled-fn (fn [_] @dirty)
+                              :on-activate (fn [e] (swap! log conj :revert))})
+        quit (ui/menu-item {:role :quit})
+        copy (ui/menu-item {:role :copy})
+        file (ui/menu {:title "File"} save revert (ui/menu-separator) quit)
+        bar (ui/menu-bar {} file (ui/menu {:title "Edit"} copy wrap))
+        w (ui/window {:menu-bar bar} (ui/label {:text "x"}))]
+    (ui/show! w)
+    (testing "roles give items their labels and shortcuts"
+      (is (= "Quit" (:label quit)))
+      (is (= "Primary+Q" (:shortcut quit)))
+      (is (= "Copy" (headless/native-property copy :label))))
+    (testing "choosing items"
+      (is (headless/choose-menu-item! save))
+      (is (headless/choose-menu-item! wrap))
+      (is (not (headless/choose-menu-item! revert)) "its enabled-fn says no")
+      (is (= false (headless/native-property revert :enabled)))
+      (reset! dirty true)
+      (is (headless/choose-menu-item! revert))
+      (is (= [:save [:wrap true] :revert] @log))
+      (is (headless/choose-menu-item! copy))
+      (is (= [[:role :copy]] (headless/backend-log)) "a role with no handler does its job"))
+    (testing "a menu shortcut chooses its item"
+      (reset! log [])
+      (is (ui/consumed? (headless/press-key! w "Primary+S")))
+      (is (= [:save] @log)))
+    (testing "window shortcuts"
+      (let [b (ui/add-shortcut! w "Primary+Shift+K" (fn [] (swap! log conj :k)))]
+        (headless/press-key! w "Primary+Shift+K")
+        (is (= [:save :k] @log))
+        (is (ui/remove-shortcut! w b))
+        (is (not (ui/remove-shortcut! w "Primary+Shift+K")))
+        (let [keys (atom [])]
+          (ui/on w :key-down (fn [e] (swap! keys conj (:key e))))
+          (headless/press-key! w "Primary+Shift+K")
+          (is (= [\k] @keys) "an unbound key goes to the window"))))
+    (testing "a menu can't hold itself, and holds only menu things"
+      (let [sub (ui/menu {:title "Recent"})]
+        (ui/add! file sub)
+        (is (thrown-with-msg? error "can't hold itself" (ui/add! sub file))))
+      (is (thrown-with-msg? error "a menu holds" (ui/add! file (ui/label {}))))
+      (is (thrown-with-msg? error "a menu bar holds menus" (ui/add! bar save)))))
+  (testing "parsing shortcuts"
+    (let [primary (if (= :macos (system/os)) :command :control)]
+      (is (= [\s #{primary :shift}] (ui/parse-shortcut "Primary+Shift+S")))
+      (is (= [:f5 #{:alt}] (ui/parse-shortcut "Option-F5")))
+      (is (= [:return #{}] (ui/parse-shortcut "Enter")))
+      (is (= [\+ #{:control}] (ui/parse-shortcut "Ctrl++")))
+      (is (= "Ctrl+Shift+Z" (ui/portable-shortcut-label "Control+Shift+z")))
+      (is (= "Alt+PgUp" (ui/shortcut-label "alt+pageup")))
+      (is (thrown-with-msg? error "unknown modifier" (ui/parse-shortcut "Hyper+X"))))))
+
+(deftest dialogs
+  (headless/answer! "Don't Save" nil "Ada" nil "/tmp/a.txt" ["/x" "/y"] nil)
+  (is (= :discard (ui/message-box "Save changes?" {:buttons :save-discard-cancel
+                                                   :type :warning})))
+  (is (= :save (ui/message-box "Again?" {:buttons :save-discard-cancel}))
+      "dismissing gives the default button's response")
+  (is (= "Ada" (ui/prompt-text "Your name?" {:default "A"})))
+  (is (nil? (ui/prompt-text "Your name?")))
+  (is (= "/tmp/a.txt" (ui/choose-file {:filters [["Text" "txt"]]})))
+  (is (= ["/x" "/y"] (ui/choose-file {:multiple true})))
+  (is (nil? (ui/choose-directory)))
+  (let [shown (headless/dialogs)]
+    (is (= ["Save" "Don't Save" "Cancel"] (:labels (first shown))))
+    (is (= :warning (:type (first shown))))
+    (is (= :directory (:mode (last shown)))))
+  (headless/answer! "OK" "Cancel")
+  (is (ui/confirm "Delete it?"))
+  (is (not (ui/confirm "Delete it?")))
+  (is (thrown-with-msg? error "no answer" (ui/message-box "Hi")))
+  (is (thrown-with-msg? error ":type is" (ui/message-box "Hi" {:type :loud})))
+  (ui/show-about {:name "Demo" :version "1.0"})
+  (is (= {:kind :about :name "Demo" :version "1.0"} (last (headless/dialogs)))))
+
+(deftest timers
+  (let [ticks (atom [])
+        once (ui/after 1.5 (fn [] (swap! ticks conj :once)))
+        often (ui/every 1 (fn [] (swap! ticks conj :often)))]
+    (is (ui/timer-running? once))
+    (headless/advance! 0.5)
+    (is (empty? @ticks))
+    (headless/advance! 2)
+    (is (= [:often :once :often] @ticks) "in the order they came due")
+    (is (not (ui/timer-running? once)))
+    (ui/stop-timer! often)
+    (headless/advance! 5)
+    (is (= 3 (count @ticks)))
+    (ui/start-timer! often)
+    (headless/advance! 1)
+    (is (= 4 (count @ticks)))))
+
+(deftest clipboard-and-system
+  (is (nil? (ui/clipboard-text)))
+  (ui/set-clipboard-text! "copied")
+  (is (= "copied" (ui/clipboard-text)))
+  (ui/beep!)
+  (ui/open-url! "https://example.com")
+  (is (= [[:beep] [:open-url "https://example.com"]] (headless/backend-log))))
