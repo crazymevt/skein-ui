@@ -293,3 +293,26 @@
     (when saved (ui/set-clipboard-text! saved)))
   (is (instance? ui/color (ui/system-color :accent)))
   (is (boolean? (ui/dark-mode?))))
+
+(deftest lgt-basics
+  (let [l (ui/label {:text "Big" :font {:size 22 :weight :bold} :text-color :red})
+        e (ui/entry {})
+        keys (atom [])
+        w (ui/window {:title "Basics" :resizable false :position [100 120]} (ui/vbox {} l e))]
+    (ui/on e :key-down (fn [ev] (swap! keys conj (:key ev))
+                         (when (= (:key ev) \x) (ui/consume! ev))))
+    (is (= 22.0 (cocoa/native-font-size l)))
+    (ui/show! w)
+    (is (not (cocoa/native-resizable? w)))
+    (is (= [100 120] (cocoa/native-top-left w)))
+    (ui/focus! e)
+    (is (identical? e (ui/focused-widget)))
+    (is (not (cocoa/send-key! e \a)))
+    (is (cocoa/send-key! e \x) "a handler consumed it: AppKit never sees it")
+    (is (= [\a \x] @keys))
+    (ui/close! w))
+  (testing "modal runs"
+    (let [w (ui/window {:title "Modal"} (ui/label {:text "x"}))]
+      (ui/after 0.1 (fn [] (ui/end-modal! w 42)))
+      (is (= 42 (ui/run-modal w)))
+      (ui/close! w))))

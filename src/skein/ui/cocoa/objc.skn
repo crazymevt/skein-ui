@@ -177,6 +177,35 @@ and all of them run on the main thread, which no fiber waits to share."
 (ffi/defcfun ^:blocking send-ppdp-void "objc_msgSend" void
   [self ptr, sel ptr, selector ptr, arg ptr, delay f64, modes ptr])
 (ffi/defcfun ns-beep "NSBeep" void [])
+(ffi/defcfun ^:blocking send-lp "objc_msgSend" ptr [self ptr, sel ptr, n u64, p ptr])
+(ffi/defcfun ^:blocking send-pt "objc_msgSend" ptr [self ptr, sel ptr, p ns-point])
+(ffi/defcfun dlopen "dlopen" ptr [path ptr, mode i32])
+(ffi/defcfun ^:blocking send-key-event "objc_msgSend" ptr
+  [self ptr, sel ptr, type u64, location ns-point, flags u64, time f64, window i64,
+   context ptr, chars ptr, plain ptr, repeat bool, code u16])
+(ffi/defcfun dlsym "dlsym" ptr [handle ptr, name c-string])
+
+;;; Blocks: a global block whose invoke function is a Skein callback, for the AppKit
+;;; methods that take one (Apple's block ABI).
+
+(ffi/defcstruct block-descriptor (reserved u64) (size u64))
+(ffi/defcstruct block-literal
+  (isa ptr) (flags i32) (reserved i32) (invoke ptr) (descriptor ptr))
+
+(defn global-block
+  "A global block (never freed) that calls the callback invoke, whose first argument is
+the block itself."
+  [invoke]
+  (let [d (ffi/alloc block-descriptor)
+        b (ffi/alloc block-literal)]
+    (ffi/put-field! d block-descriptor :reserved 0)
+    (ffi/put-field! d block-descriptor :size (ffi/sizeof block-literal))
+    (ffi/put-field! b block-literal :isa (dlsym (dlopen (ffi/null) 1) "_NSConcreteGlobalBlock"))
+    (ffi/put-field! b block-literal :flags 0x10000000)   ; BLOCK_IS_GLOBAL
+    (ffi/put-field! b block-literal :reserved 0)
+    (ffi/put-field! b block-literal :invoke invoke)
+    (ffi/put-field! b block-literal :descriptor d)
+    b))
 
 ;;; CoreGraphics, for drawing in a canvas's view
 

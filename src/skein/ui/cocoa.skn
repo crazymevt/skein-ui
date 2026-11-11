@@ -203,7 +203,26 @@ button the mouse button, event the NSEvent.")
 
 (ffi/defcallback key-window-imp void [self ptr, cmd ptr, note ptr]
   (when-let [w (objc/object-for (objc/send note (objc/sel "object")))]
-    (install-menu-bar! w)))
+    (install-menu-bar! w)
+    (ui/activated-by-user! w true)))
+
+(ffi/defcallback resign-key-imp void [self ptr, cmd ptr, note ptr]
+  (when-let [w (objc/object-for (objc/send note (objc/sel "object")))]
+    (ui/activated-by-user! w false)))
+
+(def ^:private window-moved!
+  "Report a window the user moved (defined below).")
+
+(ffi/defcallback did-move-imp void [self ptr, cmd ptr, note ptr]
+  (when-let [w (objc/object-for (objc/send note (objc/sel "object")))]
+    (window-moved! w)))
+
+(def ^:private route-input!
+  "Emit an NSEvent as the input signals of the widget it is for; true if a handler
+consumed it (defined below).")
+
+(ffi/defcallback monitor-imp ptr [block ptr, event ptr]
+  (if (route-input! event) (ffi/null) event))
 
 (ffi/defcallback menu-opening-imp void [self ptr, cmd ptr, menu ptr]
   (when-let [m (objc/object-for menu)]
@@ -273,7 +292,9 @@ button the mouse button, event the NSEvent.")
   (objc/define-class! "SkeinWindowDelegate" "NSObject"
                       [["windowShouldClose:" should-close-imp "B@:@"]
                        ["windowDidResize:" did-resize-imp "v@:@"]
-                       ["windowDidBecomeKey:" key-window-imp "v@:@"]])
+                       ["windowDidBecomeKey:" key-window-imp "v@:@"]
+                       ["windowDidResignKey:" resign-key-imp "v@:@"]
+                       ["windowDidMove:" did-move-imp "v@:@"]])
   (objc/define-class! "SkeinTextDelegate" "NSObject"
                       [["controlTextDidChange:" text-changed-imp "v@:@"]
                        ["textDidChange:" text-changed-imp "v@:@"]
@@ -307,6 +328,13 @@ button the mouse button, event the NSEvent.")
                           "NSEventTrackingRunLoopMode"])]
        (objc/send-l-void app (objc/sel "setActivationPolicy:") 0)
        (define-classes!)
+       ;; Every key and mouse event goes by route-input! before AppKit gives it to a
+       ;; control, so handlers can see and consume! it.
+       (objc/retain (objc/send-lp (objc/cls "NSEvent")
+                                  (objc/sel "addLocalMonitorForEventsMatchingMask:handler:")
+                                  (reduce + 0 (map (fn [t] (bit-shift-left 1 t))
+                                                   [1 2 3 4 10 11 25 26]))
+                                  (objc/global-block monitor-imp)))
        (make cocoa-backend :app app :modes (objc/retain modes)
              :waker (objc/new-object "SkeinWaker")
              :target (objc/new-object "SkeinTarget")
@@ -466,8 +494,10 @@ as iOS does; Intel Macs put right before center."
   (set-content-size! w))
 
 (defmethod ui/backend-show [(b cocoa-backend) w]
-  (objc/send-void (view w) (objc/sel "center"))
   (objc/send-p-void (view w) (objc/sel "makeKeyAndOrderFront:") (ffi/null)))
+
+(defmethod ui/backend-center-window [(b cocoa-backend) w]
+  (objc/send-void (view w) (objc/sel "center")))
 
 (defmethod ui/backend-close [(b cocoa-backend) w]
   (objc/send-p-void (view w) (objc/sel "orderOut:") (ffi/null)))
@@ -1883,8 +1913,10 @@ has it: About first, Settings after it, Quit last, in place of the default Quit.
 (defmethod native-action [(item ui/menu-item-widget) sender]
   (ui/activate-menu-item! item))
 
-(defn- install-menu-bar! [w]
-  (when-let [bar (:menu-bar w)]
+(defn- install-menu-bar!
+  "Make the window's menu bar, or else the application's, the main menu."
+  [w]
+  (when-let [bar (or (:menu-bar w) (:menu-bar ui/app))]
     (objc/send-p-void (:app (ui/current-backend)) (objc/sel "setMainMenu:") (view bar))))
 
 (defmethod set-native [(w ui/window-widget) (p (= :menu-bar)) bar]
@@ -2335,3 +2367,213 @@ text answer and clicks OK, or clicks Cancel for nil; a file chooser is cancelled
   (let [menu (objc/send (view item) (objc/sel "menu"))
         i (objc/send-p-long menu (objc/sel "indexOfItem:") (view item))]
     (objc/send-l-void menu (objc/sel "performActionForItemAtIndex:") i)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Fonts, colors, focus and context menus
+
+(defn- font-target
+  "The AppKit object whose font a widget's :font sets."
+  [w]
+  (if (instance? ui/text-view-widget w) (text-view-of w) (view w)))
+
+(defmethod set-native [(w ui/widget) (p (= :font)) f]
+  (let [n (font-target w)]
+    (when (objc/responds? n "setFont:")
+      (objc/send-p-void n (objc/sel "setFont:")
+                        (if f
+                          (ns-font (ui/ensure-font f))
+                          (objc/send-d (objc/cls "NSFont") (objc/sel "systemFontOfSize:")
+                                       (objc/send-double (objc/cls "NSFont")
+                                                         (objc/sel "systemFontSize"))))))))
+
+(defmethod set-native [(l ui/label-widget) (p (= :text-color)) c]
+  (objc/send-p-void (view l) (objc/sel "setTextColor:")
+                    (if c (ns-color c) (objc/send (objc/cls "NSColor") (objc/sel "labelColor")))))
+
+(defmethod set-native [(l ui/label-widget) (p (= :background)) c]
+  (objc/send-b-void (view l) (objc/sel "setDrawsBackground:") (some? c))
+  (when c (objc/send-p-void (view l) (objc/sel "setBackgroundColor:") (ns-color c))))
+
+(defn- menu-target
+  "The view whose menu a widget's :context-menu sets: a list's table view."
+  [w]
+  (cond (or (instance? ui/list-box-widget w) (instance? ui/tree-view-widget w)) (table-of w)
+        (instance? ui/text-view-widget w) (text-view-of w)
+        :else (view w)))
+
+(defmethod set-native [(w ui/widget) (p (= :context-menu)) m]
+  ;; A combo box's NSPopUpButton keeps its items in its menu: leave that alone.
+  (when-not (instance? ui/combo-box-widget w)
+    (objc/send-p-void (menu-target w) (objc/sel "setMenu:") (if m (view m) (ffi/null)))))
+
+(defmethod ui/backend-focus [(b cocoa-backend) w]
+  (let [n (menu-target w)]
+    (objc/send-p-bool (objc/send n (objc/sel "window")) (objc/sel "makeFirstResponder:") n)))
+
+(defn- widget-of-view
+  "The widget a view (or one of the views it is in) stands for, or nil; with input, only
+a widget with input signals other than a canvas, which handles its own."
+  ([v] (widget-of-view v false))
+  ([v input]
+   (loop [v v]
+     (when-not (ffi/null? v)
+       (let [w (objc/object-for v)]
+         (if (and w (instance? ui/widget w)
+                  (or (not input)
+                      (and (contains? (ui/signals w) :key-down)
+                           (not (instance? ui/canvas-widget w)))))
+           w
+           (recur (if (objc/responds? v "superview")
+                    (objc/send v (objc/sel "superview"))
+                    (ffi/null)))))))))
+
+(defmethod ui/backend-focused-widget [(b cocoa-backend)]
+  (let [win (objc/send (:app b) (objc/sel "keyWindow"))]
+    (when-not (ffi/null? win)
+      (widget-of-view (objc/send win (objc/sel "firstResponder"))))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Input events of the controls, through the event monitor
+
+(defn- key-fields
+  "The fields of a key event for an NSEvent."
+  [e]
+  (let [code (objc/send-long e (objc/sel "keyCode"))
+        chars (objc/string-of (objc/send e (objc/sel "charactersIgnoringModifiers")))]
+    {:key (or (get named-keys code) (when (seq chars) (first (string/lower-case chars))))
+     :modifiers (event-modifiers e)
+     :text (or (objc/string-of (objc/send e (objc/sel "characters"))) "")}))
+
+(defn- emit-input! [w signal & kvs]
+  (let [e (apply ui/event-for w signal kvs)]
+    (ui/emit! w e)
+    (ui/consumed? e)))
+
+(defn- printable? [s]
+  (and (seq s) (every? (fn [c] (let [n (int c)] (and (>= n 32) (not= n 127) (< n 0xf700))))
+                       s)))
+
+(defn- route-input! [e]
+  (let [type (objc/send-long e (objc/sel "type"))
+        window (objc/send e (objc/sel "window"))]
+    (when-not (ffi/null? window)
+      (case type
+        (10 11)
+        (when-let [w (widget-of-view (objc/send window (objc/sel "firstResponder")) true)]
+          (let [{:keys [key modifiers text]} (key-fields e)]
+            (if (= type 11)
+              (emit-input! w :key-up :key key :modifiers modifiers :text text)
+              (or (emit-input! w :key-down :key key :modifiers modifiers :text text
+                               :repeat (objc/send-bool e (objc/sel "isARepeat")))
+                  (and (printable? text) (not (contains? modifiers :command))
+                       (emit-input! w :text-input :text text :modifiers modifiers))))))
+        (1 2 3 4 25 26)
+        (let [loc (objc/send-point e (objc/sel "locationInWindow"))
+              point {:x (ffi/field loc objc/ns-point :x) :y (ffi/field loc objc/ns-point :y)}
+              frame-view (objc/send (objc/send window (objc/sel "contentView")) (objc/sel "superview"))
+              hit (objc/send-pt frame-view (objc/sel "hitTest:") point)]
+          (when-let [w (widget-of-view hit true)]
+            (let [p (objc/send-point-p (menu-target w) (objc/sel "convertPoint:fromView:") point
+                                       (ffi/null))
+                  x (ffi/field p objc/ns-point :x)
+                  y (ffi/field p objc/ns-point :y)
+                  mods (event-modifiers e)
+                  button (case type (1 2) :left (3 4) :right :middle)
+                  down (contains? #{1 3 25} type)
+                  clicks (objc/send-long e (objc/sel "clickCount"))]
+              (or (emit-input! w (if down :mouse-down :mouse-up) :x x :y y :button button
+                               :click-count clicks :modifiers mods)
+                  (and down (or (= button :right) (contains? mods :control))
+                       (emit-input! w :context-request :x x :y y :button button
+                                    :click-count clicks :modifiers mods))))))
+        false))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Windows' options, modal runs and the application
+
+(defn- style-mask [w]
+  ;; titled 1, closable 2, miniaturizable 4, resizable 8
+  (+ 1 4 (if (:closable w) 2 0) (if (:resizable w) 8 0)))
+
+(defmethod set-native [(w ui/window-widget) (p (= :resizable)) v]
+  (objc/send-l-void (view w) (objc/sel "setStyleMask:") (style-mask w)))
+
+(defmethod set-native [(w ui/window-widget) (p (= :closable)) v]
+  (objc/send-l-void (view w) (objc/sel "setStyleMask:") (style-mask w)))
+
+(defn- screen-height []
+  (let [[_ _ _ h] (objc/rect-vec (objc/send-rect (objc/send (objc/cls "NSScreen")
+                                                            (objc/sel "mainScreen"))
+                                                 (objc/sel "frame")))]
+    h))
+
+(defmethod set-native [(w ui/window-widget) (p (= :position)) pos]
+  (when-let [[x y] pos]
+    (quietly
+     (fn [] (objc/send-point-void (view w) (objc/sel "setFrameTopLeftPoint:")
+                                  {:x (f64 x) :y (f64 (- (screen-height) y))})))))
+
+(defn- window-moved! [w]
+  (when-not (quiet?)
+    (let [[x y _ h] (objc/rect-vec (objc/send-rect (view w) (objc/sel "frame")))
+          pos [(int (math/round x)) (int (math/round (- (screen-height) (+ y h))))]]
+      (when (not= pos (:position w))
+        (apply ui/moved-by-user! w pos)))))
+
+(defmethod set-native [(w ui/window-widget) (p (= :min-size)) size]
+  (when-let [[mw mh] size]
+    (objc/send-z-void (view w) (objc/sel "setContentMinSize:")
+                      {:width (f64 mw) :height (f64 mh)})))
+
+(def ^:private modal-results
+  "A window's address -> the value end-modal! gave."
+  (atom {}))
+
+(defmethod ui/backend-run-modal [(b cocoa-backend) w]
+  (objc/send-p-long (:app b) (objc/sel "runModalForWindow:") (view w))
+  (let [a (ffi/address (view w))
+        v (get @modal-results a)]
+    (swap! modal-results dissoc a)
+    v))
+
+(defmethod ui/backend-end-modal [(b cocoa-backend) w value]
+  (swap! modal-results assoc (ffi/address (view w)) value)
+  (objc/send-void (:app b) (objc/sel "stopModal")))
+
+(defmethod ui/backend-set-application-icon [(b cocoa-backend) image]
+  (objc/send-p-void (:app b) (objc/sel "setApplicationIconImage:") (ns-image image)))
+
+(defmethod ui/backend-install-menu-bar [(b cocoa-backend) bar]
+  (let [key (objc/object-for (objc/send (:app b) (objc/sel "keyWindow")))]
+    (when (and bar (not (and key (:menu-bar key))))
+      (objc/send-p-void (:app b) (objc/sel "setMainMenu:") (view bar)))))
+
+(defn send-key!
+  "Make an NSEvent of the key (a character or a key code, with the modifiers) in the
+window's first responder, and route it as the event monitor does. True if a handler
+consumed it."
+  [w ch]
+  (let [win (if (instance? ui/window-widget w) (view w) (objc/send (view w) (objc/sel "window")))
+        e (objc/send-key-event
+           (objc/cls "NSEvent")
+           (objc/sel (str "keyEventWithType:location:modifierFlags:timestamp:windowNumber:"
+                          "context:characters:charactersIgnoringModifiers:isARepeat:keyCode:"))
+           10 {:x 0.0 :y 0.0} 0 0.0 (objc/send-long win (objc/sel "windowNumber")) (ffi/null)
+           (objc/ns-string (str ch)) (objc/ns-string (str ch)) false 0)]
+    (boolean (route-input! e))))
+
+(defn native-font-size
+  "The point size of the widget's AppKit font."
+  [w]
+  (objc/send-double (objc/send (font-target w) (objc/sel "font")) (objc/sel "pointSize")))
+
+(defn native-resizable?
+  "True if the window's style mask lets the user resize it."
+  [w]
+  (pos? (bit-and 8 (objc/send-long (view w) (objc/sel "styleMask")))))
+
+(defn native-top-left
+  "The window's top left corner on the screen, [x y] from the top left."
+  [w]
+  (let [[x y _ h] (objc/rect-vec (objc/send-rect (view w) (objc/sel "frame")))]
+    [(int (math/round x)) (int (math/round (- (screen-height) (+ y h))))]))
