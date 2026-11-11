@@ -4,7 +4,8 @@
             [skein.ui.cocoa :as cocoa]
             [skein.system :as system]
             [skein.io :as io]
-            [skein.ffi :as ffi]))
+            [skein.ffi :as ffi]
+            [skein.string :as string]))
 
 ;; The Cocoa backend (step 4 of M2.14, D-097), on macOS only: the widgets as AppKit
 ;; controls, read back from AppKit and acted on as the user would.
@@ -539,4 +540,40 @@
       (cocoa/run-for! 0.8)
       (is (= :normal (ui/window-state w))))
     (is (= [:maximized :normal :minimized :normal] @seen))
+    (ui/close! w)))
+
+(deftest web-views
+  (let [loaded (atom [])
+        messages (atom [])
+        v (ui/web-view {:html "<html><body><h1 id='t'>Hello</h1><script>window.skein.postMessage({ready:true});</script></body></html>"
+                        :local-messages true
+                        :on-loaded (fn [e] (swap! loaded conj (:value e)))
+                        :on-message (fn [e] (swap! messages conj (:value e)))})
+        w (ui/window {:title "Web" :width 500 :height 400} v)
+        wait (fn [pred] (loop [n 0] (when (and (< n 100) (not (pred))) (cocoa/run-for! 0.05) (recur (inc n)))))]
+    (is (= :webkit (ui/web-engine v)))
+    (ui/show! w)
+    (wait (fn [] (seq @loaded)))
+    (is (= ["about:blank"] @loaded))
+    (wait (fn [] (seq @messages)))
+    (is (= ["{\"ready\":true}"] @messages) "a trusted local page's message, as JSON")
+    (testing "scripts give JSON results"
+      (let [result (atom nil)]
+        (ui/run-script! v "document.getElementById('t').textContent" (fn [r e] (reset! result [r e])))
+        (wait (fn [] @result))
+        (is (= ["\"Hello\"" nil] @result))
+        (reset! result nil)
+        (ui/run-script! v "no_such_function()" (fn [r e] (reset! result [r e])))
+        (wait (fn [] @result))
+        (is (nil? (first @result)))
+        (is (string? (second @result)) "the error's message")))
+    (testing "navigation can be vetoed"
+      (let [asked (atom [])]
+        (ui/on v :navigation-request (fn [e] (swap! asked conj (:url e))
+                                       (when (string/includes? (:url e) "blocked") (ui/veto e))))
+        (ui/run-script! v "location.href='https://blocked.example/'")
+        (wait (fn [] (seq @asked)))
+        (cocoa/run-for! 0.2)
+        (is (= ["https://blocked.example/"] @asked))
+        (is (= ["about:blank"] @loaded) "it stayed")))
     (ui/close! w)))

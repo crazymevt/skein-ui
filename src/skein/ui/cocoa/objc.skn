@@ -206,6 +206,17 @@ and all of them run on the main thread, which no fiber waits to share."
   [self ptr, sel ptr, p ptr, q ptr, r ns-range])
 (ffi/defcfun ^:blocking send-range-p "objc_msgSend" ptr [self ptr, sel ptr, r ns-range])
 (ffi/defcfun ^:blocking send-llb "objc_msgSend" ptr [self ptr, sel ptr, a i64, b i64, c bool])
+(ffi/defcfun ^:blocking send-plb "objc_msgSend" ptr [self ptr, sel ptr, a ptr, n i64, b bool])
+(ffi/defcfun ^:blocking send-plp "objc_msgSend" ptr [self ptr, sel ptr, a ptr, n u64, b ptr])
+(ffi/defcfun %get-protocol "objc_getProtocol" ptr [name c-string])
+(ffi/defcfun %add-protocol "class_addProtocol" bool [c ptr, p ptr])
+
+(defn add-protocol!
+  "Declare that the class named class-name conforms to the protocol named protocol-name,
+if the runtime knows the protocol."
+  [class-name protocol-name]
+  (let [p (%get-protocol protocol-name)]
+    (when-not (ffi/null? p) (%add-protocol (cls class-name) p))))
 (ffi/defcfun ct-register-fonts-for-url "CTFontManagerRegisterFontsForURL" bool
   [url ptr, scope u32, error ptr])
 (ffi/defcfun cf-error-get-code "CFErrorGetCode" i64 [e ptr])
@@ -217,6 +228,42 @@ and all of them run on the main thread, which no fiber waits to share."
 (ffi/defcstruct block-descriptor (reserved u64) (size u64))
 (ffi/defcstruct block-literal
   (isa ptr) (flags i32) (reserved i32) (invoke ptr) (descriptor ptr))
+
+(ffi/defcstruct token-block-literal
+  (isa ptr) (flags i32) (reserved i32) (invoke ptr) (descriptor ptr) (token u64))
+
+(def ^:private token-block-descriptor (atom nil))
+
+(defn token-block
+  "A block that calls the callback invoke (whose first argument is the block) and carries
+token, an integer (block-token reads it). Free it with ffi/free once it was called and
+nothing holds it."
+  [invoke token]
+  (let [d (or @token-block-descriptor
+              (let [d (ffi/alloc block-descriptor)]
+                (ffi/put-field! d block-descriptor :reserved 0)
+                (ffi/put-field! d block-descriptor :size (ffi/sizeof token-block-literal))
+                (reset! token-block-descriptor d)))
+        b (ffi/alloc token-block-literal)]
+    (ffi/put-field! b token-block-literal :isa (dlsym (dlopen (ffi/null) 1) "_NSConcreteGlobalBlock"))
+    (ffi/put-field! b token-block-literal :flags 0x10000000)   ; BLOCK_IS_GLOBAL
+    (ffi/put-field! b token-block-literal :reserved 0)
+    (ffi/put-field! b token-block-literal :invoke invoke)
+    (ffi/put-field! b token-block-literal :descriptor d)
+    (ffi/put-field! b token-block-literal :token token)
+    b))
+
+(defn block-token
+  "The token a token-block carries."
+  [b]
+  (ffi/field b token-block-literal :token))
+
+(ffi/defcfun-ptr %invoke-long-block void [block ptr, n i64])
+
+(defn invoke-block-with-long!
+  "Call the block b (one taking an integer, as WebKit's decision handlers do) with n."
+  [b n]
+  (%invoke-long-block (ffi/field b block-literal :invoke) b n))
 
 (defn global-block
   "A global block (never freed) that calls the callback invoke, whose first argument is

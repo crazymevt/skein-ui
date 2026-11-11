@@ -15,6 +15,7 @@ and read the real controls."
             [skein.ui.cocoa.objc :as objc]
             [skein.ffi :as ffi]
             [skein.math :as math]
+            [skein.io :as io]
             [skein.string :as string]
             [skein.system :as system]))
 
@@ -4446,3 +4447,234 @@ after leaving full screen."
         (ui/backend-call-later (ui/current-backend)
                                (fn [] (set-slot! w :state-transition false) (settle-state! w))))
       :else (settle-state! w))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Web views: WKWebView, WebKit loaded the first time one is made. A delegate object of
+;;; our own is the view's navigation delegate and its pages' message handler; a script's
+;;; result comes back to a block that carries a token for the script.
+
+(def ^:private webkit-loaded (atom false))
+
+(defn- url-string [url]
+  (when-not (ffi/null? url) (objc/string-of (objc/send url (objc/sel "absoluteString")))))
+
+(defn- error-message [err]
+  (or (when-not (ffi/null? err) (objc/string-of (objc/send err (objc/sel "localizedDescription"))))
+      "the web engine failed"))
+
+(def ^:private web-delegates
+  "A WKWebView's address -> its delegate object."
+  (atom {}))
+
+(def ^:private web-scripts
+  "A script block's token -> [web view, script id, the block]."
+  (atom {}))
+
+(def ^:private web-script-tokens (atom 0))
+
+(defn- json-text
+  "The JSON text of a Foundation object (fragments allowed), or nil for null."
+  [o]
+  (when-not (ffi/null? o)
+    (ffi/with-foreign [err (ffi/alloc ptr 1)]
+      (ffi/put! err ptr (ffi/null) 0)
+      ;; NSJSONWritingFragmentsAllowed 4
+      (let [data (objc/send-plp (objc/cls "NSJSONSerialization")
+                                (objc/sel "dataWithJSONObject:options:error:") o 4 err)]
+        (when (ffi/null? data) (error (error-message (ffi/get err ptr 0))))
+        (let [s (objc/send-pl (objc/alloc "NSString") (objc/sel "initWithData:encoding:") data 4)]
+          (try (objc/string-of s) (finally (objc/release s))))))))
+
+(ffi/defcallback web-script-result-imp void [block ptr, result ptr, failure ptr]
+  (let [token (objc/block-token block)]
+    (when-let [[v id b] (get @web-scripts token)]
+      (swap! web-scripts dissoc token)
+      (let [[json err] (if (ffi/null? failure)
+                         (try [(json-text result) nil]
+                              (catch error e [nil (ex-message e)]))
+                         [nil (error-message failure)])]
+        (ui/web-script-completed! v id json err))
+      ;; WebKit releases the block after this returns: free it once it surely has.
+      (ui/after 5 (fn [] (ffi/free b))))))
+
+(ffi/defcallback web-decide-imp void [self ptr, cmd ptr, web ptr, action ptr, handler ptr]
+  ;; WebKit wants exactly one decision, even when a handler fails.
+  (let [policy (atom 0)]
+    (try
+      (when-let [v (objc/object-for web)]
+        (let [frame (objc/send action (objc/sel "targetFrame"))
+              new-window (ffi/null? frame)
+              url (url-string (objc/send (objc/send action (objc/sel "request")) (objc/sel "URL")))
+              kind (case (objc/send-long action (objc/sel "navigationType"))
+                     0 :link 1 :form 2 :back-forward 3 :reload 4 :form-resubmitted :other)]
+          (when (ui/web-navigation-requested!
+                 v url {:kind kind :new-window new-window
+                        :main-frame (or new-window (objc/send-bool frame (objc/sel "isMainFrame")))})
+            (if new-window
+              ;; A page's new window opens here instead.
+              (ui/after 0 (fn [] (when-not (:destroyed v) (set-slot! v :url url))))
+              (reset! policy 1)))))
+      (finally (objc/invoke-block-with-long! handler @policy)))))
+
+(ffi/defcallback web-started-imp void [self ptr, cmd ptr, web ptr, navigation ptr]
+  (when-let [v (objc/object-for web)] (ui/web-load-started! v)))
+
+(ffi/defcallback web-finished-imp void [self ptr, cmd ptr, web ptr, navigation ptr]
+  (when-let [v (objc/object-for web)]
+    (ui/web-load-finished! v (url-string (objc/send web (objc/sel "URL"))))))
+
+(ffi/defcallback web-failed-imp void [self ptr, cmd ptr, web ptr, navigation ptr, err ptr]
+  ;; -999: a navigation superseded or cancelled on purpose, not a failure.
+  (when-let [v (objc/object-for web)]
+    (when-not (= -999 (objc/send-long err (objc/sel "code")))
+      (ui/web-load-failed! v (error-message err)
+                           (or (objc/string-of (objc/send-p (objc/send err (objc/sel "userInfo"))
+                                                            (objc/sel "objectForKey:")
+                                                            (objc/ns-string "NSErrorFailingURLStringKey")))
+                               (url-string (objc/send web (objc/sel "URL"))))))))
+
+(ffi/defcallback web-terminated-imp void [self ptr, cmd ptr, web ptr]
+  (when-let [v (objc/object-for web)]
+    (ui/web-load-failed! v "the web content process ended" (:current-url v))))
+
+(defn- web-context-message!
+  "A right-click in a trusted page, reported as JSON {x y shift control alt command}."
+  [v text]
+  (let [data (objc/send-l (objc/ns-string text) (objc/sel "dataUsingEncoding:") 4)
+        o (objc/send-plp (objc/cls "NSJSONSerialization") (objc/sel "JSONObjectWithData:options:error:")
+                         data 0 (ffi/null))]
+    (when-not (ffi/null? o)
+      (let [field (fn [k] (objc/send-p o (objc/sel "objectForKey:") (objc/ns-string k)))
+            number (fn [k] (let [n (field k)] (if (ffi/null? n) 0.0 (objc/send-double n (objc/sel "doubleValue")))))
+            flag (fn [k] (let [n (field k)] (and (not (ffi/null? n)) (objc/send-bool n (objc/sel "boolValue")))))
+            x (number "x")
+            y (number "y")
+            mods (set (keep (fn [[k m]] (when (flag k) m))
+                            [["shift" :shift] ["control" :control] ["alt" :alt] ["command" :command]]))
+            e (ui/event-for v :context-request :x x :y y :button :right :click-count 1 :modifiers mods)]
+        (ui/emit! v e)
+        (when (and (not (ui/consumed? e)) (:context-menu v))
+          (ui/popup-menu! (:context-menu v) v x y))))))
+
+(ffi/defcallback web-message-imp void [self ptr, cmd ptr, controller ptr, message ptr]
+  (when-let [v (objc/object-for self)]
+    (let [frame (objc/send message (objc/sel "frameInfo"))
+          source (url-string (objc/send (objc/send frame (objc/sel "request")) (objc/sel "URL")))
+          body (objc/send message (objc/sel "body"))
+          text (if (objc/send-p-bool body (objc/sel "isKindOfClass:") (objc/cls "NSString"))
+                 (objc/string-of body)
+                 (json-text body))
+          main (objc/send-bool frame (objc/sel "isMainFrame"))]
+      (when (ui/web-message-allowed? v source main)
+        (if (= "skeinContext" (objc/string-of (objc/send message (objc/sel "name"))))
+          (when (or (:custom-context-menu v) (:context-menu v)) (web-context-message! v text))
+          (ui/web-message-received! v text source main))))))
+
+(defn- ensure-webkit! []
+  (when-not @webkit-loaded
+    (ffi/load-library {:macos "/System/Library/Frameworks/WebKit.framework/WebKit"})
+    (objc/define-class! "SkeinWebDelegate" "NSObject"
+                        [["webView:decidePolicyForNavigationAction:decisionHandler:" web-decide-imp
+                          "v@:@@@?"]
+                         ["webView:didStartProvisionalNavigation:" web-started-imp "v@:@@"]
+                         ["webView:didFinishNavigation:" web-finished-imp "v@:@@"]
+                         ["webView:didFailProvisionalNavigation:withError:" web-failed-imp "v@:@@@"]
+                         ["webView:didFailNavigation:withError:" web-failed-imp "v@:@@@"]
+                         ["webViewWebContentProcessDidTerminate:" web-terminated-imp "v@:@"]
+                         ["userContentController:didReceiveScriptMessage:" web-message-imp "v@:@@"]])
+    (objc/add-protocol! "SkeinWebDelegate" "WKNavigationDelegate")
+    (objc/add-protocol! "SkeinWebDelegate" "WKScriptMessageHandler")
+    (reset! webkit-loaded true)))
+
+(defmethod ui/backend-web-engine-info [(b cocoa-backend) engine]
+  (ensure-webkit!)
+  (let [bundle (objc/send-p (objc/cls "NSBundle") (objc/sel "bundleWithIdentifier:")
+                            (objc/ns-string "com.apple.WebKit"))]
+    {:engine :webkit
+     :version (when-not (ffi/null? bundle)
+                (objc/string-of (objc/send-p bundle (objc/sel "objectForInfoDictionaryKey:")
+                                             (objc/ns-string "CFBundleVersion"))))
+     :capabilities [:file-loading :html :script-results :messages :navigation-policy
+                    :context-menu]}))
+
+(defn- bridge-script [v]
+  (str "(()=>{const send=v=>window.webkit.messageHandlers.skein.postMessage("
+       "typeof v==='string'?v:JSON.stringify(v));"
+       "Object.defineProperty(window,'skein',{value:Object.freeze({postMessage:send})});"
+       (if (or (:custom-context-menu v) (:context-menu v))
+         (str "document.addEventListener('contextmenu',e=>{e.preventDefault();"
+              "window.webkit.messageHandlers.skeinContext.postMessage(JSON.stringify("
+              "{x:e.clientX,y:e.clientY,shift:e.shiftKey,control:e.ctrlKey,alt:e.altKey,"
+              "command:e.metaKey}));});")
+         "")
+       "})();"))
+
+(defmethod make-native [(v ui/web-view-widget)]
+  (ensure-webkit!)
+  (let [config (objc/new-object "WKWebViewConfiguration")
+        controller (objc/send config (objc/sel "userContentController"))
+        delegate (objc/new-object "SkeinWebDelegate")
+        ;; WKUserScriptInjectionTimeAtDocumentStart 0, main frame only
+        script (objc/send-plb (objc/alloc "WKUserScript") (objc/sel "initWithSource:injectionTime:forMainFrameOnly:")
+                              (objc/ns-string (bridge-script v)) 0 true)]
+    (objc/send-pp-void controller (objc/sel "addScriptMessageHandler:name:") delegate (objc/ns-string "skein"))
+    (objc/send-pp-void controller (objc/sel "addScriptMessageHandler:name:") delegate
+                       (objc/ns-string "skeinContext"))
+    (objc/send-p-void controller (objc/sel "addUserScript:") script)
+    (let [web (objc/send-rp (objc/alloc "WKWebView") (objc/sel "initWithFrame:configuration:")
+                            (objc/rect 0 0 400 300) config)]
+      (objc/send-p-void web (objc/sel "setNavigationDelegate:") delegate)
+      (also-register! delegate v)
+      (swap! web-delegates assoc (ffi/address web) delegate)
+      (objc/release script)
+      (objc/release config)
+      web)))
+
+(defmethod native-natural-size [(v ui/web-view-widget)] [400 300])
+
+(defn- web-ns-url
+  "An NSURL of a URL, or of a file path."
+  [source]
+  (if (ui/web-url? source)
+    (let [u (objc/send-p (objc/cls "NSURL") (objc/sel "URLWithString:") (objc/ns-string source))]
+      (when (ffi/null? u) (error "not a URL:" (pr-str source)))
+      u)
+    (objc/send-p (objc/cls "NSURL") (objc/sel "fileURLWithPath:")
+                 (objc/ns-string (io/absolute-path source)))))
+
+(defmethod ui/backend-web-load [(b cocoa-backend) v kind source base read-access]
+  (let [web (view v)]
+    (if (= kind :html)
+      (let [base-url (if base (web-ns-url base) (ffi/null))]
+        (when (or (ffi/null? base-url) (objc/send-bool base-url (objc/sel "isFileURL")))
+          (set-slot! v :local-document (or (url-string base-url) "about:blank")))
+        (objc/send-pp web (objc/sel "loadHTMLString:baseURL:") (objc/ns-string source) base-url))
+      (let [url (web-ns-url source)]
+        (if (objc/send-bool url (objc/sel "isFileURL"))
+          (let [scope (if read-access (web-ns-url read-access) url)]
+            (set-slot! v :local-document (url-string url))
+            (objc/send-pp web (objc/sel "loadFileURL:allowingReadAccessToURL:") url scope))
+          (objc/send-p web (objc/sel "loadRequest:")
+                       (objc/send-p (objc/cls "NSURLRequest") (objc/sel "requestWithURL:") url)))))))
+
+(defmethod ui/backend-web-run-script [(b cocoa-backend) v script id]
+  (let [token (swap! web-script-tokens inc)
+        block (objc/token-block web-script-result-imp token)]
+    (swap! web-scripts assoc token [v id block])
+    (objc/send-pp-void (view v) (objc/sel "evaluateJavaScript:completionHandler:")
+                       (objc/ns-string script) block)))
+
+(defmethod ui/backend-web-destroy [(b cocoa-backend) v]
+  (let [web (view v)
+        a (ffi/address web)
+        controller (objc/send (objc/send web (objc/sel "configuration")) (objc/sel "userContentController"))]
+    (objc/send-void web (objc/sel "stopLoading"))
+    (objc/send-p-void web (objc/sel "setNavigationDelegate:") (ffi/null))
+    (doseq [n ["skein" "skeinContext"]]
+      (objc/send-p-void controller (objc/sel "removeScriptMessageHandlerForName:") (objc/ns-string n)))
+    ;; Results still to come find no script.
+    (swap! web-scripts (fn [m] (into {} (remove (fn [[_ [x]]] (identical? x v)) m))))
+    (when-let [d (get @web-delegates a)]
+      (objc/unregister! d)
+      (objc/release d)
+      (swap! web-delegates dissoc a))))
