@@ -1,0 +1,233 @@
+(ns examples.gallery
+  "Every standard widget, page by page."
+  (:require [skein.ui :as ui]
+            [skein.time :as time]
+            [examples.registry :refer [define-example]]))
+
+(def ^:private log
+  "The label at the bottom that reports events."
+  (atom nil))
+
+(defn- report! [& parts]
+  (set-slot! @log :text (apply str parts)))
+
+(defn- reporter
+  "A handler that reports what happened, with the event's value if it has one."
+  [what]
+  (fn [e]
+    (if (instance? ui/value-event e)
+      (report! what ": " (pr-str (:value e)))
+      (report! what))))
+
+(defn- section [title & widgets]
+  (ui/frame {:title title} (apply ui/vbox {:spacing 8 :padding 10} widgets)))
+
+(defn- buttons-page []
+  (ui/vbox {:spacing 12 :padding 16 :tab-label "Buttons"}
+           (section "Buttons"
+                    (ui/hbox {:spacing 8}
+                             (ui/button {:label "Push" :on-clicked (reporter "Push clicked")})
+                             (ui/button {:label "Default" :default true :on-clicked (reporter "Default clicked")})
+                             (ui/button {:label "Flat" :style :flat :on-clicked (reporter "Flat clicked")})
+                             (ui/button {:label "Disabled" :enabled false})
+                             (ui/toggle-button {:label "Toggle" :on-toggled (reporter "Toggle")})))
+           (section "Check boxes and radio buttons"
+                    (ui/hbox {:spacing 16}
+                             (ui/vbox {:spacing 6}
+                                      (ui/check-box {:label "Bold" :checked true :on-toggled (reporter "Bold")})
+                                      (ui/check-box {:label "Italic" :on-toggled (reporter "Italic")})
+                                      (ui/check-box {:label "Underline" :enabled false}))
+                             (ui/vbox {:spacing 6}
+                                      (ui/radio-button {:label "Small" :on-toggled (reporter "Small")})
+                                      (ui/radio-button {:label "Medium" :checked true :on-toggled (reporter "Medium")})
+                                      (ui/radio-button {:label "Large" :on-toggled (reporter "Large")}))))
+           (section "Tooltips and fonts"
+                    (ui/hbox {:spacing 12}
+                             (ui/label {:text "Hover over me" :tooltip "This is a tooltip."})
+                             (ui/label {:text "Monospace" :font {:family :monospace}})
+                             (ui/label {:text "Bold" :font {:weight :bold}})
+                             (ui/label {:text "Italic" :font {:italic true}})
+                             (ui/label {:text "Accent" :text-color :accent})
+                             (ui/label {:text "Secondary" :text-color :secondary-text})))))
+
+(defn- text-page []
+  (let [field-label (fn [t] (ui/label {:text t :halign :end :valign :center}))]
+    (ui/vbox {:spacing 12 :padding 16 :tab-label "Text"}
+             (ui/grid {:columns 2 :column-spacing 10 :row-spacing 8}
+                      (field-label "Entry:")
+                      (ui/entry {:placeholder "Type here" :hexpand true :on-changed (reporter "Entry changed")
+                                 :on-activate (reporter "Return in entry")})
+                      (field-label "Password:")
+                      (ui/password-entry {:placeholder "Secret" :on-changed (reporter "Password changed")})
+                      (field-label "Search:")
+                      (ui/search-entry {:on-changed (reporter "Search")})
+                      (field-label "Read only:")
+                      (ui/entry {:text "You can select but not change this" :editable false})
+                      (field-label "Suggestions:")
+                      (ui/combo-entry {:items ["Skein" "Common Lisp" "Scheme" "Clojure" "Racket"]
+                                       :on-changed (reporter "Combo entry")}))
+             (ui/label {:text "Text view:"})
+             (ui/text-view {:text "A multi-line text view with its own scroll bars.\n\nIt wraps long lines at the edge of the view and emits :changed as you type."
+                            :on-changed (reporter "Text view changed")})
+             (ui/label {:text "Labels can wrap. This one is given a width, so its long text flows onto several lines instead of making the window wide."
+                        :wrap true :width 420 :text-color :secondary-text}))))
+
+(defn- ranges-page []
+  (let [progress (ui/progress-bar {:value 0.4})
+        level (ui/label {:text "40%" :font {:family :monospace}})]
+    (ui/vbox {:spacing 12 :padding 16 :tab-label "Ranges"}
+             (section "Slider and progress"
+                      (ui/hbox {:spacing 10}
+                               (ui/slider {:value 40 :max 100 :hexpand true
+                                           :on-changed (fn [e]
+                                                         (set-slot! progress :value (/ (:value e) 100))
+                                                         (set-slot! level :text (str (int (+ 0.5 (:value e))) "%")))})
+                               level)
+                      progress
+                      (ui/slider {:value 50 :max 100 :ticks 11 :snap true :on-changed (reporter "Ticked slider")}))
+             (section "Spin buttons"
+                      (ui/hbox {:spacing 12}
+                               (ui/label {:text "Whole:" :valign :center})
+                               (ui/spin-button {:value 10 :min 0 :max 100 :on-changed (reporter "Spin")})
+                               (ui/label {:text "Decimal:" :valign :center})
+                               (ui/spin-button {:value 2.5 :min 0 :max 10 :step 0.1 :digits 1
+                                                :on-changed (reporter "Decimal spin")})))
+             (section "Busy"
+                      (ui/hbox {:spacing 12}
+                               (ui/spinner {:active true})
+                               (ui/progress-bar {:indeterminate true :hexpand true})))
+             (ui/hbox {:spacing 10}
+                      (ui/slider {:orientation :vertical :value 70 :max 100 :height 120})
+                      (ui/slider {:orientation :vertical :value 30 :max 100 :height 120})
+                      (ui/vbox {:spacing 8 :valign :center}
+                               (ui/label {:text "Vertical sliders, and a color and date picker:"})
+                               (ui/hbox {:spacing 8}
+                                        (ui/color-button {:color "#3a7bd5" :on-changed (reporter "Color")})
+                                        (ui/date-picker {:on-changed (fn [e]
+                                                                       (let [{:keys [year month day]} (time/local-time (:value e))]
+                                                                         (report! (format "Date: %d-%02d-%02d" year month day))))})))))))
+
+(def planets
+  [{:name "Mercury" :kind "Rocky" :moons 0 :distance 0.39}
+   {:name "Venus" :kind "Rocky" :moons 0 :distance 0.72}
+   {:name "Earth" :kind "Rocky" :moons 1 :distance 1.0}
+   {:name "Mars" :kind "Rocky" :moons 2 :distance 1.52}
+   {:name "Jupiter" :kind "Gas giant" :moons 95 :distance 5.2}
+   {:name "Saturn" :kind "Gas giant" :moons 146 :distance 9.54}
+   {:name "Uranus" :kind "Ice giant" :moons 28 :distance 19.2}
+   {:name "Neptune" :kind "Ice giant" :moons 16 :distance 30.06}])
+
+(def languages
+  [["Lisp" ["Common Lisp" ["SBCL"] ["CCL"] ["ECL"]] ["Scheme" ["Racket"] ["Guile"]] ["Clojure"] ["Skein"]]
+   ["ML" ["OCaml"] ["Standard ML"] ["F#"]]])
+
+(defn- lists-page []
+  (ui/paned {:orientation :horizontal :position 180 :tab-label "Lists"}
+            (ui/vbox {:spacing 6 :padding [12 6 12 12]}
+                     (ui/label {:text "List box"})
+                     (ui/list-box {:items (mapv :name planets) :selected-indices [2]
+                                   :on-selection-changed (reporter "List selection")
+                                   :on-row-activated (fn [e] (report! "Activated " (:item e)))})
+                     (ui/combo-box {:items (mapv :name planets) :selected-index 0
+                                    :on-changed (reporter "Combo box")}))
+            (ui/vbox {:spacing 6 :padding [12 12 12 6]}
+                     (ui/label {:text "Table: click a column title to sort"})
+                     (ui/table-view {:items planets
+                                     :columns [(ui/column "Planet" :name {:width 90})
+                                               (ui/column "Kind" :kind {:width 90})
+                                               (ui/column "Moons" :moons {:width 60 :alignment :right})
+                                               (ui/column "Distance (AU)" :distance
+                                                          {:alignment :right :format (fn [x] (format "%.2f" x))})]
+                                     :on-selection-changed (fn [e] (when (:value e) (report! "Table: " (:name (:value e)))))})
+                     (ui/label {:text "Tree"})
+                     (ui/tree-view {:roots languages :children-fn rest :item-label first :height 140
+                                    :on-selection-changed (fn [e] (when (:value e) (report! "Tree: " (first (:value e)))))}))))
+
+(defn- layout-page []
+  (ui/vbox {:spacing 12 :padding 16 :tab-label "Layout"}
+           (ui/label {:text "Boxes share extra space among children with :hexpand; :halign places the rest."})
+           (ui/hbox {:spacing 6}
+                    (ui/button {:label "Start"})
+                    (ui/button {:label "Expands" :hexpand true})
+                    (ui/button {:label "End"}))
+           (ui/hbox {:spacing 6 :homogeneous true}
+                    (ui/button {:label "Homogeneous"})
+                    (ui/button {:label "boxes"})
+                    (ui/button {:label "share equally"}))
+           (ui/hbox {:spacing 6}
+                    (ui/button {:label "Left"})
+                    (ui/spacer {})
+                    (ui/button {:label "A spacer pushes this right"}))
+           (ui/grid {:column-spacing 6 :row-spacing 6}
+                    (ui/button {:label "Grid 0,0" :column 0 :row 0})
+                    (ui/button {:label "Spans two columns" :column 1 :row 0 :column-span 2 :hexpand true})
+                    (ui/button {:label "Spans two rows" :column 0 :row 1 :row-span 2 :vexpand true})
+                    (ui/button {:label "1,1" :column 1 :row 1})
+                    (ui/button {:label "2,1" :column 2 :row 1})
+                    (ui/button {:label "1,2 to 2,2" :column 1 :row 2 :column-span 2}))
+           (ui/scrolled-window {:border true :min-content-height 90 :vexpand true}
+                               (apply ui/vbox {:spacing 4 :padding 8}
+                                      (map (fn [i] (ui/label {:text (str "Scrolled line " (inc i))})) (range 20))))))
+
+(defn- popovers-page []
+  (let [name-field (ui/entry {:text "My workspace"})
+        p (ui/popover {:behavior :transient}
+                      (ui/vbox {:spacing 10}
+                               (ui/label {:text "Workspace settings" :font {:weight :bold}})
+                               (ui/label {:text "Name"})
+                               name-field
+                               (ui/check-box {:label "Show line numbers" :checked true})))
+        button (ui/button {:name :workspace :label "Workspace settings…"})]
+    (ui/add! (ui/content p) (ui/button {:label "Done" :on-clicked (fn [_] (ui/close-surface! p))}))
+    (ui/on button :clicked (fn [_] (ui/show-popover! p button {:focus name-field})))
+    (ui/on p :closed (reporter "Popover closed"))
+    ;; The popover belongs to the page, not to the window's layout.
+    (ui/vbox {:padding 16 :spacing 12 :tab-label "Popovers" :user-data p}
+             (ui/label {:text "A native popover can hold a whole settings form."})
+             button
+             (ui/label {:text "Click outside or press Escape to dismiss it."})
+             (ui/spacer {}))))
+
+(defn- stacks-page []
+  (let [categories (ui/vertical-notebook {:height 140})
+        pages (ui/stack {})
+        switch (ui/button {:label "Switch stack page"})]
+    (ui/add-page! categories (ui/vbox {:spacing 8 :padding 12}
+                                      (ui/label {:text "General settings"})
+                                      (ui/check-box {:label "Restore window on launch"}))
+                  "General")
+    (ui/add-page! categories (ui/vbox {:spacing 8 :padding 12}
+                                      (ui/label {:text "Editor settings"})
+                                      (ui/check-box {:label "Show line numbers" :checked true}))
+                  "Editor")
+    (ui/add-page! pages (ui/label {:text "First stack page"}) "First")
+    (ui/add-page! pages (ui/label {:text "Second stack page, with the largest page's size"}) "Second")
+    (ui/on switch :clicked (fn [_] (set-slot! pages :selected-index (mod (inc (:selected-index pages)) 2))))
+    (ui/vbox {:padding 16 :spacing 12 :tab-label "Pages"} switch pages categories)))
+
+(define-example gallery
+  {:title "Widget Gallery"
+   :description "Every standard widget on a notebook page: buttons, check boxes and radio
+buttons; text fields and a text view; sliders, spin buttons and progress bars; lists, a
+sortable table and a tree in panes; the layout containers; a popover; stacks. The bar at
+the bottom reports each event."
+   :topics [:notebook :frame :paned :scrolled-window :button :toggle-button :check-box
+            :radio-button :entry :password-entry :search-entry :combo-entry :text-view :slider
+            :spin-button :progress-bar :spinner :color-button :date-picker :list-box :combo-box
+            :table-view :column :tree-view :grid :spacer :popover :show-popover! :stack
+            :vertical-notebook]}
+  (reset! log (ui/label {:name :log :text "Use the widgets; their events appear here."
+                         :text-color :secondary-text}))
+  (let [w (ui/window {:title "Widget Gallery" :width 640 :height 520}
+                     (ui/vbox {:spacing 8 :padding 12}
+                              (ui/notebook {:name :pages
+                                            :on-page-changed (fn [e] (report! "Page " (:index e) ": "
+                                                                              (:tab-label (:value e))))}
+                                           (buttons-page) (text-page) (ranges-page) (lists-page)
+                                           (layout-page) (popovers-page) (stacks-page))
+                              (ui/separator {})
+                              @log))]
+    (ui/on w :closed (fn [_] (ui/map-widgets (fn [x] (when (instance? ui/popover-widget (:user-data x))
+                                                       (ui/destroy! (:user-data x))))
+                                             w)))
+    (ui/show! w)))

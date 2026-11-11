@@ -1,0 +1,327 @@
+(ns examples.editor
+  "A plain-text editor with tabs, menus, file dialogs and checks for unsaved changes."
+  (:require [skein.ui :as ui]
+            [skein.io :as io]
+            [skein.string :as string]
+            [skein.system :as system]
+            [skein.time :as time]
+            [examples.registry :refer [define-example]]))
+
+(def ^:private untitled-count (atom 0))
+
+(def ^:dynamic *remember-frames*
+  "Whether editor windows remember their frames in frame-file (tests turn it off)."
+  true)
+
+(defn frame-file
+  "Where an editor window remembers its frame between runs."
+  []
+  (io/path (or (system/home-dir) ".") ".config" "skein-ui" "editor-frame.txt"))
+
+(defclass editor-window [ui/window-widget]
+  "An editor window: a tabbed pane of documents, a status line, menus and a command
+palette."
+  (remember-frame :init false)
+  (tabs :cell :atom :init nil)
+  (status :cell :atom :init nil)
+  (recent-files :cell :atom :init [])
+  (recent-menu :cell :atom :init nil)
+  (palette :cell :atom :init nil)
+  (palette-search :cell :atom :init nil)
+  (palette-list :cell :atom :init nil)
+  (text-size :cell :atom :init 13)
+  (width :cell :atom :init 680)
+  (height :cell :atom :init 460))
+
+(defclass editor-document [ui/text-view-widget]
+  "A document: a text view with its file, whether it changed since it was saved, and the
+dot on its tab that says so."
+  (path :cell :atom :init nil)
+  (modified :cell :atom :init false)
+  (number :init 0)
+  (marker :cell :atom :init nil))
+
+(defn view
+  "The editor's document that shows."
+  [e]
+  (ui/selected-page (:tabs e)))
+
+(defn document-name [doc]
+  (if (:path doc) (io/file-name (:path doc)) (str "Untitled " (:number doc))))
+
+(defn- update-title! [e]
+  (when-let [doc (view e)]
+    (set-slot! e :title (str (document-name doc) (if (:modified doc) " — Edited" "")))))
+
+(defn- update-status! [e]
+  (when-let [doc (view e)]
+    (let [t (:text doc)
+          lines (inc (count (filter (fn [c] (= c \newline)) t)))
+          words (count (remove empty? (string/split (string/replace (string/replace t "\n" " ") "\t" " ") " ")))]
+      (set-slot! (:status e) :text (format "%,d lines, %,d words, %,d characters" lines words (count t))))))
+
+(defn- update-document-tab! [e doc]
+  (set-slot! doc :tab-label (document-name doc))
+  (set-slot! (:marker doc) :visible (:modified doc))
+  (update-title! e))
+
+(defn new-document
+  "A new document in the editor, with text and the path it was read from. Returns it."
+  ([e] (new-document e "" nil))
+  ([e text path]
+   (let [marker (ui/label {:text "•" :text-color :accent :visible false :tooltip "Unsaved changes"})
+         doc (ui/build editor-document
+                       {:number (swap! untitled-count inc) :path path :text text :border false
+                        :font {:family :monospace :size (:text-size e)} :tab-accessory marker}
+                       nil)]
+     (set-slot! doc :marker marker)
+     (set-slot! doc :tab-label (document-name doc))
+     (ui/add! (:tabs e) doc)
+     (ui/on doc :changed (fn [_]
+                           (set-slot! doc :modified true)
+                           (update-document-tab! e doc)
+                           (when (identical? doc (view e)) (update-status! e))))
+     (ui/select-page! (:tabs e) doc)
+     (ui/focus! doc)
+     (update-title! e)
+     (update-status! e)
+     doc)))
+
+(defn save-to-path!
+  "Write the document to path. True if it saved."
+  [e doc path]
+  (when (and path (not (:destroyed doc)) (not (:destroyed e)))
+    (try
+      (io/write-file path (:text doc))
+      (set-slot! doc :path path)
+      (set-slot! doc :modified false)
+      (update-document-tab! e doc)
+      (swap! (cell e :recent-files) (fn [rs] (vec (take 20 (cons path (remove #{path} rs))))))
+      true
+      (catch error c
+        (ui/message-box (str "Couldn't save " (io/file-name path) ".")
+                        {:detail (ex-message c) :type :error :parent e})
+        false))))
+
+(defn save!
+  "Save the document (the one that shows), asking where if it has no file yet or with as."
+  ([e] (save! e (view e) false))
+  ([e doc as]
+   (save-to-path! e doc
+                  (if (or as (nil? (:path doc)))
+                    (ui/choose-file {:mode :save :parent e :name (str (document-name doc) ".txt")})
+                    (:path doc)))))
+
+(defn confirm-discard
+  "True if the document has no unsaved changes, or the user saved or discarded them."
+  [e doc]
+  (or (not (:modified doc))
+      (case (ui/message-box (str "Do you want to save the changes you made to " (document-name doc) "?")
+                            {:detail "Your changes will be lost if you don't save them."
+                             :type :warning :buttons :save-discard-cancel :parent e})
+        :save (save! e doc false)
+        :discard true
+        false)))
+
+(defn confirm-close-all [e]
+  (every? (fn [doc] (confirm-discard e doc)) (vec (:children (:tabs e)))))
+
+(defn open-document-path [e path]
+  (try
+    (let [doc (new-document e (io/read-file path) path)]
+      (swap! (cell e :recent-files) (fn [rs] (vec (take 20 (cons path (remove #{path} rs))))))
+      doc)
+    (catch error c
+      (ui/message-box (str "Couldn't open " (io/file-name path) ".")
+                      {:detail (ex-message c) :type :error :parent e}))))
+
+(defn- item
+  ([label shortcut f] (item label shortcut f {}))
+  ([label shortcut f opts]
+   (ui/menu-item (merge {:label label :shortcut shortcut :on-activate (fn [_] (f))} opts))))
+
+(defn- rebuild-recent-menu! [e]
+  (let [m (:recent-menu e)]
+    (ui/clear! m)
+    (if (seq (:recent-files e))
+      (doseq [path (:recent-files e)]
+        (ui/add! m (item path nil (fn [] (open-document-path e path)))))
+      (ui/add! m (ui/menu-item {:label "No Recent Files" :enabled false})))))
+
+(defn- has-selection? [e]
+  (when-let [doc (view e)] (let [[s z] (ui/text-selection doc)] (< s z))))
+
+(def ^:private show-command-palette!)
+
+(defn- change-font-size! [e delta]
+  (set-slot! e :text-size (max 8 (min 48 (+ (:text-size e) delta))))
+  (set-slot! (view e) :font {:family :monospace :size (:text-size e)}))
+
+(defn- make-menus [e new-editor]
+  (let [recent (ui/menu {:title "Recent Files" :on-opening (fn [_] (rebuild-recent-menu! e))})]
+    (set-slot! e :recent-menu recent)
+    (rebuild-recent-menu! e)
+    (ui/menu-bar {}
+                 (ui/menu {:title "File"}
+                          (item "New Tab" "Primary+N" (fn [] (new-document e)))
+                          (item "New Window" "Primary+Shift+N" (fn [] (new-editor true)))
+                          (item "Open…" "Primary+O"
+                                (fn [] (when-let [path (ui/choose-file {:parent e :filters [["Text" "txt" "md" "skn"]]})]
+                                         (open-document-path e path))))
+                          recent
+                          (ui/menu-separator)
+                          (item "Close Tab" "Primary+W" (fn [] (ui/close-page! (:tabs e) (view e))))
+                          (item "Save" "Primary+S" (fn [] (save! e))
+                                {:enabled-fn (fn [_] (let [doc (view e)] (and doc (or (:modified doc) (nil? (:path doc))))))})
+                          (item "Save As…" "Primary+Shift+S" (fn [] (save! e (view e) true)))
+                          (ui/menu-separator)
+                          (ui/menu-item {:role :close-window :shortcut "Primary+Shift+W"})
+                          (ui/menu-item {:role :quit}))
+                 (ui/menu {:title "Edit"}
+                          (ui/menu-item {:role :undo})
+                          (ui/menu-item {:role :redo})
+                          (ui/menu-separator)
+                          (ui/menu-item {:role :cut :enabled-fn (fn [_] (has-selection? e))})
+                          (ui/menu-item {:role :copy :enabled-fn (fn [_] (has-selection? e))})
+                          (ui/menu-item {:role :paste :enabled-fn (fn [_] (pos? (count (or (ui/clipboard-text) ""))))})
+                          (ui/menu-item {:role :select-all :enabled-fn (fn [_] (and (view e) (pos? (count (:text (view e))))))})
+                          (ui/menu-separator)
+                          (item "Insert Date" "Primary+Shift+D"
+                                (fn [] (let [{:keys [year month day hour minute second]} (time/local-time)]
+                                         (ui/insert-text! (view e) (format "%d-%02d-%02d %02d:%02d:%02d"
+                                                                           year month day hour minute second))))))
+                 (ui/menu {:title "Format"}
+                          (item "Bigger" "Primary+=" (fn [] (change-font-size! e 1)))
+                          (item "Smaller" "Primary+-" (fn [] (change-font-size! e -1)))
+                          (ui/menu-separator)
+                          (ui/check-menu-item {:label "Wrap Lines" :checked true
+                                               :checked-fn (fn [_] (and (view e) (:wrap (view e))))
+                                               :on-activate (fn [ev] (set-slot! (view e) :wrap (:checked (:source ev))))}))
+                 (ui/menu {:title "Help"}
+                          (item "Menu Actions…" nil (fn [] (show-command-palette! e)))
+                          (ui/menu-item {:role :about})))))
+
+;;; The command palette: a popover listing every menu item, to search and run.
+
+(defn- palette-choice-label [{:keys [item path]}]
+  (str (if (and (instance? ui/check-menu-item-widget item) (:checked item)) "✓ " "")
+       (apply str (map (fn [m] (str (:title m) " › ")) (rest path)))
+       (:label item)
+       (let [s (ui/shortcut-label item)] (if (= s "") "" (str "    " s)))
+       (if (ui/validate-menu-item! item) "" "    (unavailable)")))
+
+(defn- refresh-command-palette! [e]
+  (when-let [list (:palette-list e)]
+    (let [query (string/lower-case (:text (:palette-search e)))
+          choices (atom [])]
+      (ui/refresh-menus! (:menu-bar e))
+      (ui/map-menu-items (fn [item path]
+                           (let [c {:item item :path path}]
+                             (when (string/includes? (string/lower-case (palette-choice-label c)) query)
+                               (swap! choices conj c))))
+                         (:menu-bar e))
+      (set-slot! list :items @choices)
+      (set-slot! list :selected-indices (if (seq @choices) [0] [])))))
+
+(defn- run-palette-choice! [e]
+  (when-let [{:keys [item]} (first (ui/selected-items (:palette-list e)))]
+    (when (ui/validate-menu-item! item)
+      (ui/close-surface! (:palette e))
+      (ui/focus! (view e))
+      (ui/activate-menu-item! item))))
+
+(defn- ensure-command-palette [e]
+  (or (:palette e)
+      (let [search (ui/search-entry {:placeholder "Search menu actions…"})
+            list (ui/list-box {:height 240 :item-label palette-choice-label})
+            p (ui/popover {:behavior :transient :width 560}
+                          (ui/vbox {:spacing 8}
+                                   (ui/label {:text "Menu actions" :font {:weight :bold}})
+                                   search list
+                                   (ui/label {:text "↑/↓ choose · Return runs · Escape closes"
+                                              :text-color :secondary-text})))]
+        (set-slot! e :palette p)
+        (set-slot! e :palette-search search)
+        (set-slot! e :palette-list list)
+        (ui/on search :changed (fn [_] (refresh-command-palette! e)))
+        (ui/on list :row-activated (fn [_] (run-palette-choice! e)))
+        (doseq [x [search list]]
+          (ui/on x :key-down
+                 (fn [ev]
+                   (when (empty? (:modifiers ev))
+                     (case (:key ev)
+                       :escape (do (ui/close-surface! p :cancelled) (ui/consume! ev))
+                       :return (do (run-palette-choice! e) (ui/consume! ev))
+                       (:up :down) (let [n (count (:items list))]
+                                     (when (pos? n)
+                                       (set-slot! list :selected-indices
+                                                  [(max 0 (min (dec n) (+ (or (first (:selected-indices list)) 0)
+                                                                          (if (= :up (:key ev)) -1 1))))]))
+                                     (ui/consume! ev))
+                       nil)))))
+        (ui/on p :closed (fn [_] (when-not (:destroyed e) (ui/focus! (view e)))))
+        p)))
+
+(defn- show-command-palette! [e]
+  (let [p (ensure-command-palette e)
+        doc (view e)]
+    (rebuild-recent-menu! e)
+    (set-slot! (:palette-search e) :text "")
+    (refresh-command-palette! e)
+    (ui/show-popover! p doc {:rectangle [(int (/ (nth (or (:allocation doc) [0 0 400 0]) 2) 2)) 6 1 20]
+                             :focus (:palette-search e)})))
+
+(defn new-editor
+  "A new editor window, shown, its frame remembered between runs with remember-frame."
+  ([] (new-editor *remember-frames*))
+  ([remember-frame]
+   (let [n (swap! untitled-count inc)
+         e (ui/build editor-window {:remember-frame remember-frame
+                                    :position [(+ 160 (* 28 (mod n 8))) (+ 120 (* 28 (mod n 8)))]}
+                     nil)
+         tabs (ui/tabbed-pane {})
+         status (ui/label {:text "" :text-color :secondary-text :font {:size 11}})]
+     (set-slot! e :tabs tabs)
+     (set-slot! e :status status)
+     (ui/set-content! e (ui/vbox {:spacing 0} tabs (ui/separator {}) (ui/hbox {:padding 6} status)))
+     (set-slot! e :menu-bar (make-menus e new-editor))
+     (ui/add! (:end (ui/tab-bar tabs))
+              (ui/button {:label "+" :tooltip "New document" :on-clicked (fn [_] (new-document e))}))
+     (ui/on tabs :page-changed (fn [ev] (when (:value ev) (update-title! e) (update-status! e))))
+     (ui/on tabs :page-close-request (fn [ev] (when-not (confirm-discard e (:value ev)) (ui/veto ev))))
+     (ui/on tabs :page-closed (fn [_] (when (empty? (:children tabs)) (new-document e))))
+     (ui/on e :close-request (fn [ev] (when-not (confirm-close-all e) (ui/veto ev))))
+     (ui/add-shortcut! e "Primary+Shift+P" (fn [] (show-command-palette! e)))
+     (ui/on e :closed (fn [_]
+                        (when (:remember-frame e)
+                          (try (io/make-dirs (io/parent (frame-file)))
+                               (io/write-file (frame-file) (ui/window-frame-string e))
+                               (catch error c nil)))
+                        (when-let [p (:palette e)] (ui/destroy! p))))
+     (new-document e)
+     (when (and remember-frame (io/file-exists? (frame-file)))
+       (try (ui/restore-window-frame! e (io/read-file (frame-file))) (catch error c nil)))
+     (ui/show! e)
+     (ui/focus! (view e))
+     e)))
+
+(define-example editor
+  {:title "Text Editor"
+   :description "A tabbed plain-text editor. New Tab or the bar's + button adds a document; drag
+tabs to reorder and use Control-Tab to switch. Each unsaved dot is an ordinary label the
+example gives the tab. Closing a tab asks to save, and Cancel vetoes the close. Recent Files
+is made again as it opens; the Edit items follow the selection and the clipboard.
+Primary+Shift+P opens a palette of the same menu actions. It has a menu bar with keyboard
+shortcuts and the platform's standard Edit and Quit items, opens and saves files with the
+platform's file dialogs, counts words as you type, remembers its window's frame, and asks
+before closing a window with unsaved changes by vetoing :close-request."
+   :topics [:menu-bar :menu :menu-item :check-menu-item :menu-separator :text-view :choose-file
+            :message-box :veto :insert-text! :tabbed-pane :close-page! :tab-accessory :tab-bar
+            :enabled-fn :checked-fn :activate-menu-item! :map-menu-items :shortcut-label
+            :add-shortcut! :popover :search-entry :list-box :window-frame-string]}
+  (ui/on ui/app :quit-request
+         (fn [ev]
+           (when (some (fn [w] (and (instance? editor-window w) (not (confirm-close-all w))))
+                       (ui/windows))
+             (ui/veto ev))))
+  (new-editor))

@@ -18,7 +18,9 @@
             [examples.paint]
             [examples.appearance]
             [examples.web-view]
-            [examples.code-editor]))
+            [examples.code-editor]
+            [examples.gallery]
+            [examples.editor]))
 
 (define-example launcher
   {:title "skein-ui Examples"

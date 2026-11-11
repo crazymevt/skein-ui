@@ -6,12 +6,15 @@
             [skein.system :as system]
             [examples.registry :as registry]
             [examples.launcher]
-            [examples.code-editor]))
+            [examples.code-editor]
+            [examples.editor]))
 
 ;; Every example builds and shows its windows on the headless backend, and a few act as a
 ;; user would on them.
 
-(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend))
+                      ;; The editor's windows mustn't write their frames to the user's home.
+                      (binding [examples.editor/*remember-frames* false] (t))
                       (doseq [w (ui/windows)] (ui/close! w true))))
 
 (defn- run [name]
@@ -167,3 +170,38 @@
           [13 17 {:style :string}] [18 22 {:style :comment}]]
          (examples.code-editor/line-runs "(defn :ok 42 \"hi\" ; no" 0)
          )))
+
+(deftest gallery
+  (let [w (run :gallery)
+        pages (ui/find-widget w :pages)
+        log (fn [] (:text (ui/find-widget w :log)))]
+    (is (= 7 (count (:children pages))))
+    (headless/choose-page! pages 3)
+    (is (= "Page 3: Lists" (log)))
+    (headless/choose-page! pages 5)
+    (headless/click! (ui/find-widget w :workspace))
+    (let [p (:user-data (nth (:children pages) 5))]
+      (is (:shown p))
+      (headless/click-outside! p)
+      (is (= "Popover closed: :dismissed" (log))))))
+
+(deftest editor
+  (let [e (run :editor)
+        tabs (:tabs e)]
+    (is (= 1 (count (:children tabs))))
+    (headless/edit-text! (examples.editor/view e) "Hello world")
+    (is (:visible (:marker (examples.editor/view e))) "the unsaved dot shows")
+    (is (string/ends-with? (:title e) "— Edited"))
+    (is (= "1 lines, 2 words, 11 characters" (:text (:status e))))
+    (testing "closing an edited tab asks; Cancel keeps it"
+      (headless/answer! "Cancel")
+      (is (not (headless/close-tab! tabs (examples.editor/view e))))
+      (is (= 1 (count (:children tabs)))))
+    (testing "the palette lists the menus' items"
+      (headless/press-key! e "Primary+Shift+P")
+      (is (:shown (:palette e)))
+      (is (some (fn [c] (= "New Tab" (:label (:item c)))) (:items (:palette-list e)))))
+    (testing "a new tab"
+      (ui/activate-menu-item! (first (filter (fn [i] (= "New Tab" (:label i)))
+                                             (ui/widgets-in (first (:children (:menu-bar e)))))))
+      (is (= 2 (count (:children tabs)))))))
