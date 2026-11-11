@@ -2686,7 +2686,9 @@ notebook)."
     (doseq [host (surface-hosts c)]
       (let [a (ffi/address host)
             data (or (get @backdrops a) {})
-            data (if (and color (not (:color data))) (assoc data :color (make-backdrop host :color)) data)
+            data (if (and color (not (:color data)))
+                   (assoc data :color (make-backdrop host :color))
+                   data)
             data (if (and (nil? color) (not= role :automatic) (not (:material data))
                           (get surface-materials role))
                    (assoc data :material (make-backdrop host :material))
