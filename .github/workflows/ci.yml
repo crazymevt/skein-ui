@@ -137,7 +137,7 @@ jobs:
         run: |
           # Ubuntu's mirrors sometimes fail to resolve: try a few times.
           for i in 1 2 3; do
-            sudo apt-get update && sudo apt-get install -y libgtk-4-1 xvfb && break
+            sudo apt-get update && sudo apt-get install -y libgtk-4-1 libwebkitgtk-6.0-4 xvfb && break
             sleep 30
           done
           dpkg -s libgtk-4-1 > /dev/null

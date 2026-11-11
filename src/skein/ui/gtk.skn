@@ -90,7 +90,8 @@ with args, a map.")
   [:clicked :activate :changed :toggled :value-changed :resized :selected :switch-page
    :close-request :position :sort :items-changed :pressed :released :motion :enter :leave
    :scroll :key-pressed :key-released :window-key :closed :menu-activate :active
-   :page-reordered :tab-close :mark-set :window-state])
+   :page-reordered :tab-close :mark-set :window-state :load-changed :script-message
+   :context-message :web-terminated])
 
 (defn- kind-of [data] (nth signal-kinds (ffi/address data)))
 
@@ -3716,3 +3717,171 @@ which has it already."
     (when (nil? (:normal-frame w))
       (set-slot! w :normal-frame {:position (:position w) :size [(:width w) (:height w)]}))
     (apply-window-state! w (:state w))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Web views: WebKitGTK 6.0, on Linux. Its user content manager takes a script, injected
+;;; at document start in the top frame, that lets pages call window.skein.postMessage; the
+;;; messages carry no frame, so they are the top frame's, from the view's current URI.
+
+(defn web-available?
+  "True if WebKitGTK 6.0 is installed (web views need it on GTK)."
+  []
+  (boolean (lib/load-webkit!)))
+
+(defn- web-text [p]
+  (lib/owned-string p))
+
+(defn- jsc-json
+  "A JSCValue as JSON text, nil for undefined."
+  [v]
+  (when-not (or (ffi/null? v) (lib/jsc-value-is-undefined v))
+    (web-text (lib/jsc-value-to-json v 0))))
+
+(def ^:private web-script-ids
+  "A script's small id (its callback's user data) -> [web view, the view's script id]."
+  (atom {}))
+
+(def ^:private web-tokens (atom 0))
+
+(ffi/defcallback web-js-imp void [source ptr, result ptr, data ptr]
+  (when-let [[v id] (get @web-script-ids (ffi/address data))]
+    (swap! web-script-ids dissoc (ffi/address data))
+    (ffi/with-foreign [err (ffi/alloc ptr 1)]
+      (ffi/put! err ptr (ffi/null) 0)
+      (let [value (lib/webkit-evaluate-javascript-finish source result err)
+            e (ffi/get err ptr 0)]
+        (if (ffi/null? value)
+          (ui/web-script-completed! v id nil (or (lib/error-text e) "the script failed"))
+          (let [json (jsc-json value)]
+            (lib/g-object-unref value)
+            (ui/web-script-completed! v id json nil)))))))
+
+(ffi/defcallback web-load-failed-imp bool [view ptr, event i32, uri c-string, err ptr, data ptr]
+  ;; WEBKIT_NETWORK_ERROR_CANCELLED 302: a load superseded or stopped on purpose.
+  (when-let [v (lib/object-for view)]
+    (when-not (= 302 (ffi/field err lib/g-error :code))
+      (ui/web-load-failed! v (or (lib/error-text err) "the page failed to load") uri)))
+  true)
+
+(ffi/defcallback web-decide-imp bool [view ptr, decision ptr, type i32, data ptr]
+  ;; WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION 0, NEW_WINDOW_ACTION 1, RESPONSE 2
+  (if (> type 1)
+    false
+    (let [v (lib/object-for view)
+          action (lib/webkit-navigation-decision-action decision)
+          url (lib/webkit-uri-request-uri (lib/webkit-navigation-action-request action))
+          kind (case (lib/webkit-navigation-action-type action)
+                 0 :link 1 :form 2 :back-forward 3 :reload 4 :form-resubmitted :other)
+          new-window (= type 1)
+          allowed (and v (ui/web-navigation-requested! v url {:kind kind :new-window new-window}))]
+      (if (and allowed (not new-window))
+        (lib/webkit-policy-use decision)
+        (lib/webkit-policy-ignore decision))
+      (when (and allowed new-window)
+        ;; A page's new window opens here instead.
+        (ui/after 0 (fn [] (when-not (:destroyed v) (set-slot! v :url url)))))
+      true)))
+
+(defmethod ui/backend-web-engine-info [(b gtk-backend) engine]
+  (when-not (lib/load-webkit!)
+    (error "web views on GTK need WebKitGTK 6.0, which isn't installed"))
+  {:engine :webkitgtk
+   :version (str (lib/webkit-major-version) "." (lib/webkit-minor-version) "."
+                 (lib/webkit-micro-version))
+   :capabilities [:file-loading :html :script-results :messages :navigation-policy :context-menu]})
+
+(defn- web-bridge [v]
+  (str "(()=>{const send=v=>window.webkit.messageHandlers.skein.postMessage("
+       "typeof v==='string'?v:JSON.stringify(v));"
+       "Object.defineProperty(window,'skein',{value:Object.freeze({postMessage:send})});"
+       (if (or (:custom-context-menu v) (:context-menu v))
+         (str "document.addEventListener('contextmenu',e=>{e.preventDefault();"
+              "window.webkit.messageHandlers.skeinContext.postMessage(JSON.stringify("
+              "{x:e.clientX,y:e.clientY,shift:e.shiftKey,control:e.ctrlKey,alt:e.altKey,"
+              "command:e.metaKey}));});")
+         "")
+       "})();"))
+
+(defmethod make-native [(v ui/web-view-widget)]
+  (let [web (owned (lib/webkit-web-view-new))
+        ucm (lib/webkit-get-user-content-manager web)
+        ;; WEBKIT_USER_CONTENT_INJECT_TOP_FRAME 1, WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START 0
+        script (lib/webkit-user-script-new (web-bridge v) 1 0 (ffi/null) (ffi/null))]
+    (lib/webkit-ucm-add-script ucm script)
+    (lib/webkit-user-script-unref script)
+    (also-register! ucm v)
+    (lib/webkit-ucm-register-handler ucm "skein" (ffi/null))
+    (lib/webkit-ucm-register-handler ucm "skeinContext" (ffi/null))
+    (connect! ucm "script-message-received::skein" :script-message signal-arg-imp)
+    (connect! ucm "script-message-received::skeinContext" :context-message signal-arg-imp)
+    (connect! web "load-changed" :load-changed signal-arg-imp)
+    (connect! web "web-process-terminated" :web-terminated signal-arg-imp)
+    (lib/g-signal-connect-data web "load-failed" web-load-failed-imp (ffi/null) (ffi/null) 0)
+    (lib/g-signal-connect-data web "decide-policy" web-decide-imp (ffi/null) (ffi/null) 0)
+    web))
+
+(defmethod native-natural-size [(v ui/web-view-widget)] [400 300])
+
+(defmethod native-signal [(v ui/web-view-widget) (k (= :load-changed)) web arg]
+  ;; WEBKIT_LOAD_STARTED 0, REDIRECTED 1, COMMITTED 2, FINISHED 3
+  (let [event (ffi/address arg)]
+    (cond (= event 0) (ui/web-load-started! v)
+          (= event 3) (ui/web-load-finished! v (lib/webkit-get-uri web))
+          :else nil)))
+
+(defmethod native-signal [(v ui/web-view-widget) (k (= :web-terminated)) web arg]
+  (ui/web-load-failed! v "the web content process ended" (:current-url v)))
+
+(defn- message-text [value]
+  (if (lib/jsc-value-is-string value)
+    (web-text (lib/jsc-value-to-string value))
+    (jsc-json value)))
+
+(defmethod native-signal [(v ui/web-view-widget) (k (= :script-message)) ucm value]
+  (ui/web-message-received! v (or (message-text value) "") (lib/webkit-get-uri (native v)) true))
+
+(defmethod native-signal [(v ui/web-view-widget) (k (= :context-message)) ucm value]
+  ;; {x y shift control alt command}, read without a JSON library: numbers and flags.
+  (when (and (or (:custom-context-menu v) (:context-menu v))
+             (ui/web-message-allowed? v (lib/webkit-get-uri (native v)) true))
+    (let [text (or (message-text value) "")
+          number (fn [k] (let [i (string/index-of text (str "\"" k "\":"))]
+                           (if i
+                             (let [rest-text (subs text (+ i (count k) 3))
+                                   digits (apply str (take-while (fn [c] (or (<= 48 (int c) 57) (= c \.) (= c \-))) rest-text))]
+                               (or (parse-double digits) 0.0))
+                             0.0)))
+          flag (fn [k] (string/includes? text (str "\"" k "\":true")))
+          x (number "x")
+          y (number "y")
+          mods (set (keep (fn [[k m]] (when (flag k) m))
+                          [["shift" :shift] ["control" :control] ["alt" :alt] ["command" :command]]))
+          e (ui/event-for v :context-request :x x :y y :button :right :click-count 1 :modifiers mods)]
+      (ui/emit! v e)
+      (when (and (not (ui/consumed? e)) (:context-menu v))
+        (ui/popup-menu! (:context-menu v) v x y)))))
+
+(defmethod ui/backend-web-load [(b gtk-backend) v kind source base read-access]
+  (let [web (native v)]
+    (if (= kind :html)
+      (let [base-uri (when base (if (ui/web-url? base) base (ui/file-url base)))]
+        (when (or (nil? base-uri) (string/starts-with? base-uri "file:"))
+          (set-slot! v :local-document (or base-uri "about:blank")))
+        (lib/webkit-load-html web source base-uri))
+      (let [uri (if (ui/web-url? source) source (ui/file-url source))]
+        (when (string/starts-with? uri "file:") (set-slot! v :local-document uri))
+        (lib/webkit-load-uri web uri)))))
+
+(defmethod ui/backend-web-run-script [(b gtk-backend) v script id]
+  (let [token (swap! web-tokens inc)]
+    (swap! web-script-ids assoc token [v id])
+    (lib/webkit-evaluate-javascript (native v) script -1 (ffi/null) (ffi/null) (ffi/null)
+                                    web-js-imp (lib/signal-data token))))
+
+(defmethod ui/backend-web-destroy [(b gtk-backend) v]
+  (let [web (native v)
+        ucm (lib/webkit-get-user-content-manager web)]
+    (lib/webkit-stop-loading web)
+    (doseq [n ["skein" "skeinContext"]] (lib/webkit-ucm-unregister-handler ucm n (ffi/null)))
+    (lib/unregister! ucm)
+    (swap! web-script-ids (fn [m] (into {} (remove (fn [[_ [x]]] (identical? x v)) m))))))

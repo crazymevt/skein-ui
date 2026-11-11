@@ -504,3 +504,26 @@
     (is (= :normal (ui/window-state w)))
     (is (= [400 300] [(:width w) (:height w)]))
     (ui/close! w)))
+
+(deftest web-views
+  ;; WebKitGTK 6.0 is Linux's: Linux CI installs it; elsewhere this checks nothing.
+  (when (gtk/web-available?)
+    (let [loaded (atom [])
+          messages (atom [])
+          v (ui/web-view {:html "<html><body><h1 id='t'>Hello</h1><script>window.skein.postMessage({ready:true});</script></body></html>"
+                          :local-messages true
+                          :on-loaded (fn [e] (swap! loaded conj (:value e)))
+                          :on-message (fn [e] (swap! messages conj (:value e)))})
+          w (ui/window {:title "Web" :width 500 :height 400} v)
+          wait (fn [pred] (loop [n 0] (gtk/settle!) (when (and (< n 200) (not (pred))) (sleep 0.05) (recur (inc n)))))]
+      (is (= :webkitgtk (ui/web-engine v)))
+      (ui/show! w)
+      (wait (fn [] (seq @loaded)))
+      (is (= 1 (count @loaded)))
+      (wait (fn [] (seq @messages)))
+      (is (= ["{\"ready\":true}"] @messages))
+      (let [result (atom nil)]
+        (ui/run-script! v "document.getElementById('t').textContent" (fn [r e] (reset! result [r e])))
+        (wait (fn [] @result))
+        (is (= ["\"Hello\"" nil] @result)))
+      (ui/close! w))))

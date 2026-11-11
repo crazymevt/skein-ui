@@ -836,3 +836,67 @@ hasn't placed it."
   "The Skein object the GTK object o stands for, or nil."
   [o]
   (when-not (ffi/null? o) (get @registry (ffi/address o))))
+
+;;; ------------------------------------------------------------------------------------
+;;; WebKitGTK 6.0, for web views: loaded the first time one is made (Linux only)
+
+(def ^:private webkit-loaded (atom nil))
+
+(defn load-webkit!
+  "Load WebKitGTK 6.0 once. True if it loaded."
+  []
+  (when (nil? @webkit-loaded)
+    (reset! webkit-loaded
+            (try (ffi/load-library {:linux ["libwebkitgtk-6.0.so.4" "libwebkitgtk-6.0.so"]})
+                 true
+                 (catch error e false))))
+  @webkit-loaded)
+
+(ffi/defcfun ^:blocking webkit-web-view-new "webkit_web_view_new" ptr [])
+(ffi/defcfun ^:blocking webkit-get-user-content-manager "webkit_web_view_get_user_content_manager"
+  ptr [v ptr])
+(ffi/defcfun ^:blocking webkit-user-script-new "webkit_user_script_new" ptr
+  [source c-string, frames i32, time i32, allow ptr, block ptr])
+(ffi/defcfun ^:blocking webkit-user-script-unref "webkit_user_script_unref" void [s ptr])
+(ffi/defcfun ^:blocking webkit-ucm-add-script "webkit_user_content_manager_add_script" void
+  [m ptr, s ptr])
+(ffi/defcfun ^:blocking webkit-ucm-register-handler
+  "webkit_user_content_manager_register_script_message_handler" bool
+  [m ptr, name c-string, world ptr])
+(ffi/defcfun ^:blocking webkit-ucm-unregister-handler
+  "webkit_user_content_manager_unregister_script_message_handler" void
+  [m ptr, name c-string, world ptr])
+(ffi/defcfun ^:blocking webkit-load-uri "webkit_web_view_load_uri" void [v ptr, uri c-string])
+(ffi/defcfun ^:blocking webkit-load-html "webkit_web_view_load_html" void
+  [v ptr, html c-string, base c-string])
+(ffi/defcfun ^:blocking webkit-get-uri "webkit_web_view_get_uri" c-string [v ptr])
+(ffi/defcfun ^:blocking webkit-stop-loading "webkit_web_view_stop_loading" void [v ptr])
+(ffi/defcfun ^:blocking webkit-evaluate-javascript "webkit_web_view_evaluate_javascript" void
+  [v ptr, script c-string, n i64, world ptr, source ptr, cancellable ptr, callback ptr, data ptr])
+(ffi/defcfun ^:blocking webkit-evaluate-javascript-finish
+  "webkit_web_view_evaluate_javascript_finish" ptr [v ptr, result ptr, error ptr])
+(ffi/defcfun ^:blocking webkit-navigation-decision-action
+  "webkit_navigation_policy_decision_get_navigation_action" ptr [d ptr])
+(ffi/defcfun ^:blocking webkit-navigation-action-request "webkit_navigation_action_get_request"
+  ptr [a ptr])
+(ffi/defcfun ^:blocking webkit-navigation-action-type "webkit_navigation_action_get_navigation_type"
+  i32 [a ptr])
+(ffi/defcfun ^:blocking webkit-uri-request-uri "webkit_uri_request_get_uri" c-string [r ptr])
+(ffi/defcfun ^:blocking webkit-policy-use "webkit_policy_decision_use" void [d ptr])
+(ffi/defcfun ^:blocking webkit-policy-ignore "webkit_policy_decision_ignore" void [d ptr])
+(ffi/defcfun ^:blocking webkit-major-version "webkit_get_major_version" u32 [])
+(ffi/defcfun ^:blocking webkit-minor-version "webkit_get_minor_version" u32 [])
+(ffi/defcfun ^:blocking webkit-micro-version "webkit_get_micro_version" u32 [])
+(ffi/defcfun ^:blocking jsc-value-is-undefined "jsc_value_is_undefined" bool [v ptr])
+(ffi/defcfun ^:blocking jsc-value-is-string "jsc_value_is_string" bool [v ptr])
+(ffi/defcfun ^:blocking jsc-value-to-string "jsc_value_to_string" ptr [v ptr])
+(ffi/defcfun ^:blocking jsc-value-to-json "jsc_value_to_json" ptr [v ptr, indent u32])
+
+(ffi/defcstruct g-error (domain u32) (code i32) (message ptr))
+
+(defn error-text
+  "The message of a GError, or nil."
+  [e]
+  (when-not (ffi/null? e)
+    (let [m (ffi/field e g-error :message)]
+      (when-not (ffi/null? m) (ffi/c-string m)))))
