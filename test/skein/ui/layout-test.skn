@@ -102,8 +102,10 @@
     (is (= [64 16] (ui/preferred-size row)))
     (is (= [0 0 32 16] (bounds a)))
     (is (= [32 0 32 16] (bounds b))))
-  (let [a (text "ab") b (text "abcdef")]
-    (ui/show! (ui/window {:width 32} (ui/hbox {:spacing 0} a b)))
+  (let [a (text "ab") b (text "abcdef")
+        row (ui/hbox {:spacing 0} a b)]
+    ;; A window grows to fit its content, so give the row too little room directly.
+    (ui/allocate row 0 0 32 16)
     (is (= [0 0 8 16] (bounds a)) "too little room: each shrinks in proportion")
     (is (= [8 0 24 16] (bounds b)))))
 

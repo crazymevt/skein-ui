@@ -24,7 +24,9 @@ pixels a character, 16 a line of text, 24 for a field. Calls the core asks to ma
   (clipboard :cell :atom :init nil)
   (log :cell :atom :init [] :doc "Beeps, opened URLs, roles performed and popup menus.")
   (active :cell :atom :init nil :doc "The window with the keyboard.")
-  (dark :cell :atom :init false :doc "Whether the imagined system is in dark mode."))
+  (dark :cell :atom :init false :doc "Whether the imagined system is in dark mode.")
+  (focused :cell :atom :init nil :doc "The widget with the keyboard focus.")
+  (app-icon :cell :atom :init nil))
 
 (defn backend
   "A new headless backend."
@@ -621,3 +623,60 @@ chooser, a path, a vector of paths, or nil to cancel."
   "Put the imagined system in dark mode, or out of it."
   [dark]
   (set-slot! (ui/current-backend) :dark dark))
+
+;;; ------------------------------------------------------------------------------------
+;;; Focus, modal windows and the application
+
+(defmethod ui/backend-focus [(b headless-backend) w]
+  (set-slot! b :focused w))
+
+(defmethod ui/backend-focused-widget [(b headless-backend)]
+  (let [w (:focused b)]
+    (when (and w (not (:destroyed w))) w)))
+
+(defmethod ui/backend-center-window [(b headless-backend) w]
+  (swap! (:native w) assoc :centered true))
+
+(defmethod ui/backend-set-application-icon [(b headless-backend) image]
+  (set-slot! b :app-icon image))
+
+(defmethod ui/backend-run-modal [(b headless-backend) w]
+  ;; The answers given with answer! act as the user: each function is called with the
+  ;; window, until one ends the modal run.
+  (swap! (:native w) assoc :modal-ended false :modal-value nil)
+  (loop []
+    (if (:modal-ended @(:native w))
+      (:modal-value @(:native w))
+      (let [a (next-answer! b :modal {:title (:title w)})]
+        (when-not (fn? a)
+          (error "a modal window's answer is a function of the window, not" (pr-str a)))
+        (a w)
+        (recur)))))
+
+(defmethod ui/backend-end-modal [(b headless-backend) w value]
+  (swap! (:native w) assoc :modal-ended true :modal-value value))
+
+(defn centered?
+  "True if the window was centered on the (imagined) screen."
+  [w]
+  (boolean (:centered @(:native w))))
+
+(defn right-click!
+  "Right-click the widget at x, y, as the user would: it emits :context-request and,
+unless a handler consumes it, shows its :context-menu (logged as a popup menu). Returns
+the event."
+  [w x y]
+  (let [e (ui/event-for w :context-request :x x :y y :button :right :click-count 1)]
+    (ui/emit! w e)
+    (when (and (not (ui/consumed? e)) (:context-menu w))
+      (ui/popup-menu! (:context-menu w) w x y))
+    e))
+
+(defn key-down!
+  "Press the key described by the shortcut string s in the widget, as the user would: it
+emits :key-down. Returns the event, which a handler may have consumed."
+  [w s]
+  (let [[key mods] (ui/parse-shortcut s)
+        e (ui/event-for w :key-down :key key :modifiers mods :text (if (char? key) (str key) ""))]
+    (ui/emit! w e)
+    e))

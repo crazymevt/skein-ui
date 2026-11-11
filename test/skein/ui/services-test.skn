@@ -76,11 +76,11 @@
     (testing "a canvas emits :resize when its size changes"
       (let [sizes (atom [])
             c (ui/canvas {:on-resize (fn [e] (swap! sizes conj [(:width e) (:height e)]))})
-            w (ui/window {:width 50 :height 40} c)]
+            w (ui/window {:width 150 :height 120} c)]
         (ui/show! w)
-        (headless/resize! w 60 40)
-        (headless/resize! w 60 40)
-        (is (= [[50 40] [60 40]] @sizes))))))
+        (headless/resize! w 160 120)
+        (headless/resize! w 160 120)
+        (is (= [[150 120] [160 120]] @sizes))))))
 
 (deftest menus-and-shortcuts
   (let [log (atom [])

@@ -1,0 +1,122 @@
+(ns skein.ui.parity-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]))
+
+;; The parts of LGT that skein-ui gained before its examples were ported (part A of step 6
+;; of M2.14, D-097): fonts, colors, focus, input events, user data, windows' options and
+;; events, modal runs, dialogs of the program's own and the application.
+
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)))
+
+(deftest fonts-colors-and-user-data
+  (let [l (ui/label {:text "Big" :font {:size 22 :weight :bold} :text-color :red
+                     :background "#eeeeee" :user-data {:id 7}})]
+    (is (= {:size 22 :weight :bold} (headless/native-property l :font)))
+    (is (= :red (headless/native-property l :text-color)))
+    (is (= {:id 7} (:user-data l)))
+    (set-slot! l :font :monospace)
+    (is (= :monospace (headless/native-property l :font)))))
+
+(deftest blocking-handlers
+  (let [seen (atom 0)
+        b (ui/button {:label "Go" :on-clicked (fn [e] (swap! seen inc))})]
+    (ui/with-handlers-blocked [b :clicked]
+      (headless/click! b))
+    (ui/with-handlers-blocked [b]
+      (headless/click! b))
+    (is (= 0 @seen))
+    (headless/click! b)
+    (is (= 1 @seen))))
+
+(deftest walking-widgets-and-focus
+  (let [a (ui/entry {}) b (ui/entry {}) l (ui/label {})
+        box (ui/vbox {} a l b)]
+    (is (= [a b] (ui/widgets-of-type box ui/entry-widget)))
+    (let [seen (atom [])]
+      (ui/map-widgets (fn [w] (swap! seen conj w)) box)
+      (is (= [box a l b] @seen)))
+    (ui/focus! b)
+    (is (identical? b (ui/focused-widget)))
+    (ui/clear! box)
+    (is (empty? (:children box)))
+    (is (headless/destroyed? a))
+    (is (nil? (ui/focused-widget)) "a destroyed widget has no focus")))
+
+(deftest input-events-on-controls
+  (let [keys (atom [])
+        e (ui/entry {:on-key-down (fn [ev] (swap! keys conj (:key ev))
+                                    (when (= (:key ev) :up) (ui/consume! ev)))})]
+    (is (not (ui/consumed? (headless/key-down! e "a"))))
+    (is (ui/consumed? (headless/key-down! e "Up")))
+    (is (= [\a :up] @keys)))
+  (let [menu (ui/menu {:title "Edit"} (ui/menu-item {:label "Copy"}))
+        l (ui/list-box {:items ["a"] :context-menu menu})]
+    (headless/right-click! l 5 5)
+    (is (= :popup-menu (first (last (headless/backend-log)))))
+    (ui/on l :context-request (fn [ev] (ui/consume! ev)))
+    (headless/right-click! l 5 5)
+    (is (= 1 (count (filter (fn [x] (= :popup-menu (first x))) (headless/backend-log))))
+        "a consumed request shows no menu")))
+
+(deftest windows
+  (let [events (atom [])
+        w (ui/window {:title "W" :position [10 20] :resizable false
+                      :on-shown (fn [e] (swap! events conj :shown))
+                      :on-closed (fn [e] (swap! events conj :closed))}
+                     (ui/label {:text "abcd"}))]
+    (is (= false (headless/native-property w :resizable)))
+    (is (= [10 20] (headless/native-property w :position)))
+    (ui/show! w)
+    (is (not (headless/centered? w)) "a window with a :position isn't centered")
+    (is (= [32 16] (:min-size w)))
+    (is (some (fn [x] (identical? x w)) (ui/windows)))
+    (ui/hide! w)
+    (is (not (headless/shown? w)))
+    (is (not (some (fn [x] (identical? x w)) (ui/windows))))
+    (ui/show! w)
+    (testing "a window grows to fit its content"
+      (set-slot! (ui/content w) :text "abcdefgh")
+      (headless/run-pending!)
+      (is (= 64 (:width w))))
+    (ui/close! w)
+    (is (= [:shown :shown :closed] @events)))
+  (let [w (ui/window {} (ui/label {}))]
+    (ui/show! w)
+    (is (headless/centered? w))
+    (ui/close! w)))
+
+(deftest modal-windows-and-dialogs
+  (let [w (ui/window {:title "Modal"} (ui/label {}))]
+    (headless/answer! (fn [win] (ui/end-modal! win 42)))
+    (is (= 42 (ui/run-modal w)))
+    (ui/close! w))
+  (let [name (ui/entry {})
+        d (ui/dialog {:title "Rename" :buttons [:cancel :ok]} name)
+        tries (atom 0)]
+    (is (identical? (:parent name) (:content-area d)) "children go in the content area")
+    (is (= ["Cancel" "OK"] (mapv :label (:children (:button-box d)))) "OK last, as macOS has it")
+    (ui/on d :response (fn [e] (when (and (= :ok (:value e)) (empty? (:text name)))
+                                 (swap! tries inc)
+                                 (ui/veto e))))
+    (headless/answer! (fn [win] (headless/click! (last (:children (:button-box win)))))
+                      (fn [win] (headless/type-text! name "New")
+                        (headless/click! (last (:children (:button-box win))))))
+    (is (= :ok (ui/run-dialog d)))
+    (is (= 1 @tries) "the first OK was vetoed: the name was empty")
+    (is (headless/destroyed? d)))
+  (let [d (ui/dialog {:buttons [:cancel :ok]})]
+    (headless/answer! (fn [win] (ui/close! win)))
+    (is (= :close (ui/run-dialog d)))))
+
+(deftest the-application
+  (is (= "Skein" (:name ui/app)))
+  (let [veto? (atom true)
+        id (ui/on ui/app :quit-request (fn [e] (when @veto? (ui/veto e))))]
+    (is (not (ui/quit!)))
+    (reset! veto? false)
+    (is (ui/quit!))
+    (ui/off ui/app :quit-request id))
+  (let [img (ui/image-from-pixels 1 1 (make-array u8 4))]
+    (ui/set-application-icon! img)
+    (is (identical? img (:icon ui/app)))))

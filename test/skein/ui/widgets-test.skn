@@ -175,5 +175,6 @@
     (is (= [0 40] @seen))
     (set-slot! s :horizontal-policy :never)
     (headless/run-pending!)
-    (is (= [150 300] (headless/scroll-extent s)) ":never makes the content as wide as the view")
+    (is (= [208 300] (headless/scroll-extent s))
+        ":never makes the view as wide as the content, and the window grows to fit it")
     (is (thrown-with-msg? error "holds one widget" (ui/add! s (ui/label {}))))))

@@ -110,6 +110,51 @@ title, adds around its content.")
 (defgeneric backend-image-size [backend path]
   "The [width height] in pixels of the image in the file at path.")
 
+(defgeneric backend-focus [backend widget]
+  "Give the widget's native control the keyboard focus.")
+
+(defmethod backend-focus [(b backend) widget]
+  nil)
+
+(defgeneric backend-focused-widget [backend]
+  "The widget whose native control has the keyboard focus in the active window, or nil.")
+
+(defmethod backend-focused-widget [(b backend)]
+  nil)
+
+(defgeneric backend-center-window [backend window]
+  "Put the window in the middle of the screen.")
+
+(defmethod backend-center-window [(b backend) window]
+  nil)
+
+(defgeneric backend-run-modal [backend window]
+  "Run the event loop until backend-end-modal is called for the window, keeping the other
+windows from the user. Returns the value backend-end-modal was given.")
+
+(defgeneric backend-end-modal [backend window value]
+  "Make backend-run-modal return value for the window.")
+
+(defgeneric backend-set-application-icon [backend image]
+  "Show image (or the default for nil) as the application's icon, such as its Dock icon.")
+
+(defmethod backend-set-application-icon [(b backend) image]
+  nil)
+
+(defgeneric backend-install-menu-bar [backend menu-bar]
+  "Use menu-bar (or nil) as the application's menu bar while no window with one of its
+own is active.")
+
+(defmethod backend-install-menu-bar [(b backend) menu-bar]
+  nil)
+
+(defgeneric backend-dialog-button-order [backend]
+  "Where the platform puts a dialog's affirmative buttons (OK, Save): :affirmative-last
+(macOS, GNOME) or :affirmative-first (Windows).")
+
+(defmethod backend-dialog-button-order [(b backend)]
+  :affirmative-last)
+
 (defgeneric backend-run-loop [backend]
   "Run the native event loop until backend-quit-loop.")
 
@@ -125,9 +170,11 @@ title, adds around its content.")
 ;;; Events
 
 (defclass event []
-  "The superclass of events: what happened (signal, such as :clicked) to source."
+  "The superclass of events: what happened (signal, such as :clicked) to source, and
+when (:time, milliseconds since 1970)."
   (source :init nil)
-  (signal :init nil))
+  (signal :init nil)
+  (time :init (time/epoch-millis)))
 
 (defclass action-event [event]
   "Something was activated: a button clicked, a menu item chosen, Return in an entry.")
@@ -224,6 +271,11 @@ what it types; :repeat is true when it auto-repeats."
   (text :init "")
   (repeat :init false))
 
+(defclass text-input-event [input-event]
+  "Text is about to be typed into a widget (:text): one character, or several from an
+input method. A handler that calls consume! keeps it from being inserted."
+  (text :init ""))
+
 (defclass vetoable-event [event]
   "An event a handler can refuse with veto, such as a window being asked to close."
   (vetoed :cell :atom :init false))
@@ -247,8 +299,10 @@ what it types; :repeat is true when it auto-repeats."
 ;;; Objects, properties and signals
 
 (defclass emitter []
-  "Anything that emits events to handlers: widgets, windows, menus and timers."
-  (handlers :cell :atom :init {}))
+  "Anything that emits events to handlers: widgets, windows, menus, timers and the
+application."
+  (handlers :cell :atom :init {})
+  (blocked :cell :atom :init {} :doc "signal (or :all) -> how many with-handlers-blocked block it."))
 
 (defclass ui-object [emitter]
   "Anything with a native counterpart: widgets, windows and menus."
@@ -257,6 +311,7 @@ what it types; :repeat is true when it auto-repeats."
   (parent :cell :atom :init nil)
   (children :cell :atom :init [])
   (destroyed :cell :atom :init false)
+  (user-data :cell :atom :init nil :doc "Anything a program wants to keep with the object.")
   (size-cache :cell :atom :init nil :doc "The preferred size, until invalidate-size!.")
   (allocation :cell :atom :init nil
               :doc "[x y width height], where layout put it in its container."))
@@ -435,8 +490,26 @@ connected. Returns an id that off takes."
 event's signal. Specialize it to react to events in a subclass.")
 
 (defmethod handle-event [(o emitter) e]
-  (doseq [[_ f] (get (:handlers o) (:signal e))]
-    (f e)))
+  (let [blocked (:blocked o)]
+    (when-not (or (pos? (get blocked :all 0)) (pos? (get blocked (:signal e) 0)))
+      (doseq [[_ f] (get (:handlers o) (:signal e))]
+        (f e)))))
+
+(defn call-with-handlers-blocked
+  "Call f with object's handlers for the signals (all of them, if signals is empty) not
+called. with-handlers-blocked is usually clearer."
+  [object signals f]
+  (let [ks (if (seq signals) signals [:all])
+        change! (fn [d] (update-slot! object :blocked
+                                      (fn [m] (reduce (fn [m k] (update m k (fnil + 0) d)) m ks))))]
+    (change! 1)
+    (try (f) (finally (change! -1)))))
+
+(defmacro with-handlers-blocked
+  "Run body with object's handlers for the signals (all its signals if none are given)
+not called: (with-handlers-blocked [entry :changed] (set-slot! entry :text \"\"))."
+  [[object & signals] & body]
+  `(call-with-handlers-blocked ~object [~@signals] (fn [] ~@body)))
 
 (defn emit!
   "Emit event (made with its :source and :signal) on object: handle-event gets it.
@@ -519,6 +592,38 @@ Returns w."
   [root name]
   (first (filter (fn [w] (= name (:name w))) (widgets-in root))))
 
+(defn widgets-of-type
+  "Every widget in root, root included, that is an instance of class."
+  [root class]
+  (filterv (fn [w] (instance? class w)) (widgets-in root)))
+
+(defn map-widgets
+  "Call (f w) on root and every widget inside it, parents before children."
+  [f root]
+  (doseq [w (widgets-in root)] (f w))
+  root)
+
+(defn clear!
+  "Destroy all of container's children. Returns it."
+  [container]
+  (doseq [c (:children container)]
+    (remove! container c)
+    (destroy! c))
+  container)
+
+(defn focus!
+  "Give the widget the keyboard focus. Returns it."
+  [w]
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-focus b w))))
+  w)
+
+(defn focused-widget
+  "The widget that has the keyboard focus in the active window, or nil."
+  []
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-focused-widget b)))))
+
 ;;; Building widgets
 
 (defn- signal-option
@@ -541,6 +646,16 @@ handlers) and add the children to it. Constructors call this."
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Widgets
+
+(def input-signals
+  "The keyboard and mouse signals of text views, entries, lists, tables, trees and
+canvases. Handlers and handle-event methods see each event before the native control
+does, and can consume! it to replace what the control would do: :key-down and :key-up
+(key events), :text-input (text about to be typed), :mouse-down and :mouse-up (mouse
+events), and :context-request (a right-click, before the :context-menu shows; consume!
+it to show none)."
+  {:key-down key-event :key-up key-event :text-input text-input-event
+   :mouse-down mouse-event :mouse-up mouse-event :context-request mouse-event})
 
 (defclass widget [ui-object]
   "The superclass of widgets: what windows and containers hold. Its layout options:
@@ -565,12 +680,14 @@ place it in a grid; :tab-label names its page in a notebook."
   (row :cell :atom :init nil)
   (column-span :cell :atom :init 1)
   (row-span :cell :atom :init 1)
-  (tab-label :cell :atom :init nil :doc "In a notebook, the text on its page's tab."))
+  (tab-label :cell :atom :init nil :doc "In a notebook, the text on its page's tab.")
+  (font :cell :atom :init nil :doc "Its font (a font designator), or nil for the platform's.")
+  (context-menu :cell :atom :init nil :doc "A menu shown when the user right-clicks it, or nil."))
 
-(declare-widget! widget {:properties [:visible :enabled :tooltip]
+(declare-widget! widget {:properties [:visible :enabled :tooltip :font :context-menu]
                          :layout [:visible :hexpand :vexpand :expand :halign :valign :margin
                                   :width :height :column :row :column-span :row-span
-                                  :tab-label]})
+                                  :tab-label :font]})
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Layout
@@ -961,21 +1078,109 @@ the end."
   [0 0])
 
 ;;; ------------------------------------------------------------------------------------
+;;; The application
+
+(defclass application [emitter]
+  "The running program; there is one, application. It emits :quit-request (a
+vetoable-event) when asked to quit, :started when run! starts the event loop, and
+:reopen when, on macOS, the user clicks its Dock icon with no window open."
+  (name :cell :atom :init "Skein" :doc "Its name, in its menus and About box.")
+  (version :cell :atom :init nil)
+  (icon :cell :atom :init nil :doc "The image shown as its icon, or nil for the default.")
+  (menu-bar :cell :atom :init nil :doc "The menu bar while no window with its own is active.")
+  (quit-on-last-window-closed :cell :atom :init true
+                              :doc "Whether run! returns when the last window closes.")
+  (running :cell :atom :init false))
+
+(declare-widget! application {:signals {:quit-request vetoable-event :started event
+                                        :reopen event}})
+
+(def app
+  "The application object. Connect to its signals with on; change its :name, :version,
+:icon and :menu-bar with set-slot! (set-application-icon! and set-application-menu-bar!
+show them)."
+  (make application))
+
+(defn set-application-icon!
+  "Show image as the application's icon (its Dock icon on macOS); nil for the default."
+  [image]
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-set-application-icon b image))))
+  (set-slot! app :icon image))
+
+(defn set-application-menu-bar!
+  "Use menu-bar while no window with a menu bar of its own is active (on macOS, the menu
+bar at the top of the screen)."
+  [menu-bar]
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-install-menu-bar b menu-bar))))
+  (set-slot! app :menu-bar menu-bar))
+
+(defn run!
+  "Run the event loop until quit!, or, unless :keep-alive, until the last window closes.
+opts: :name (the application's), :quit-on-last-window-closed (true), :keep-alive (false;
+true keeps running with no window open, as a REPL session wants). Call it on the main
+thread."
+  ([] (run! {}))
+  ([opts]
+   (when (contains? opts :name) (set-slot! app :name (:name opts)))
+   (set-slot! app :quit-on-last-window-closed
+              (and (get opts :quit-on-last-window-closed true) (not (:keep-alive opts))))
+   (set-slot! app :running true)
+   (try
+     (let [b (current-backend)]
+       (backend-call-later b (fn [] (emit! app (event-for app :started))))
+       (backend-run-loop b))
+     (finally (set-slot! app :running false)))
+   nil))
+
+(defn quit!
+  "Ask the application to quit: it emits :quit-request and, unless a handler vetoes, run!
+returns. Windows stay open. True if it quits."
+  []
+  (when-not (vetoed? (emit! app (event-for app :quit-request)))
+    (backend-quit-loop (current-backend))
+    true))
+
+;;; ------------------------------------------------------------------------------------
 ;;; Windows
 
 (defclass window-widget [ui-object]
   "A top-level window, holding one widget. It emits :close-request (a close-event, which
-veto refuses) when asked to close."
+veto refuses) when asked to close, and :closed once it closed; :shown when shown,
+:resize (a resize-event) when its content area gets a new size, :activated and
+:deactivated as it gets and loses the keyboard, and :moved (a value-event with [x y])."
   (title :cell :atom :init "")
   (width :cell :atom :init nil :doc "The width of its content area; nil to fit the content.")
   (height :cell :atom :init nil :doc "The height of its content area; nil to fit the content.")
+  (min-size :cell :atom :init [0 0] :doc "The least content size: the content's natural size.")
+  (position :cell :atom :init nil
+            :doc "Its top left corner on the screen, [x y], or nil to center it when first shown.")
+  (resizable :cell :atom :init true :doc "Whether the user can resize it.")
+  (closable :cell :atom :init true :doc "Whether it has a close button.")
   (shown :cell :atom :init false)
   (menu-bar :cell :atom :init nil :doc "The window's menu bar, or nil.")
   (shortcuts :cell :atom :init [] :doc "The window's own shortcuts (add-shortcut!)."))
 
-(declare-widget! window-widget {:properties [:title :width :height :menu-bar]
+(declare-widget! window-widget {:properties [:title :width :height :menu-bar :min-size
+                                             :position :resizable :closable]
                                 :layout [:width :height]
-                                :signals {:close-request close-event :key-down key-event}})
+                                :signals {:close-request close-event :closed event
+                                          :shown event :resize resize-event
+                                          :activated event :deactivated event
+                                          :moved value-event :key-down key-event}})
+
+(def ^:private open-windows
+  "The windows made and not yet closed, oldest first."
+  (atom []))
+
+(defmethod initialize :after [(w window-widget)]
+  (swap! open-windows conj w))
+
+(defn windows
+  "The windows that are shown, oldest first."
+  []
+  (filterv :shown @open-windows))
 
 (defn window
   "A window: (window {:title \"Hello\" :menu-bar (menu-bar {} ...)} content)."
@@ -989,43 +1194,118 @@ veto refuses) when asked to close."
   true)
 
 (defmethod update-layout! [(w window-widget)]
-  (when-let [c (content w)]
-    (let [[cw ch] (outer-size c)]
+  ;; The window grows when its content no longer fits.
+  (let [[cw ch] (if-let [c (content w)] (outer-size c) [0 0])]
+    (when (not= [cw ch] (:min-size w)) (set-slot! w :min-size [cw ch]))
+    (when (and (:width w) (< (:width w) cw)) (set-slot! w :width cw))
+    (when (and (:height w) (< (:height w) ch)) (set-slot! w :height ch))
+    (when-let [c (content w)]
       (allocate-in-cell c 0 0 (or (:width w) cw) (or (:height w) ch)))))
 
-(defn show!
-  "Show the window, at its content's natural size unless it has :width and :height.
-Returns it."
+(defn center!
+  "Put the window in the middle of the screen. Returns it."
   [w]
-  (let [[cw ch] (if-let [c (content w)] (outer-size c) [0 0])]
-    (when (nil? (:width w)) (set-slot! w :width cw))
-    (when (nil? (:height w)) (set-slot! w :height ch)))
-  (update-layout! w)
   (let [b (current-backend)]
-    (in-ui (fn [] (backend-show b w))))
-  (set-slot! w :shown true)
+    (in-ui (fn [] (backend-center-window b w))))
   w)
 
-(defn close!
-  "Ask the window to close: it emits :close-request, and closes unless a handler vetoes
-it. True if it closed."
+(defn show!
+  "Show the window and make it the active one. The first time, it gets its content's
+natural size unless it has :width and :height, and is centered unless it has a
+:position. Returns it."
   [w]
-  (let [e (emit! w (event-for w :close-request))]
-    (if (vetoed? e)
-      false
-      (let [b (current-backend)]
-        (in-ui (fn [] (backend-close b w)))
-        (set-slot! w :shown false)
-        (destroy! w)
-        true))))
+  (let [first-time (nil? (:width w))
+        [cw ch] (if-let [c (content w)] (outer-size c) [0 0])]
+    (when (nil? (:width w)) (set-slot! w :width cw))
+    (when (nil? (:height w)) (set-slot! w :height ch))
+    (update-layout! w)
+    (let [b (current-backend)]
+      (when (and first-time (nil? (:position w)))
+        (in-ui (fn [] (backend-center-window b w))))
+      (in-ui (fn [] (backend-show b w))))
+    (set-slot! w :shown true)
+    (emit! w (event-for w :shown))
+    w))
+
+(defn hide!
+  "Take the window off the screen without closing it; show! brings it back."
+  [w]
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-close b w))))
+  (set-slot! w :shown false)
+  w)
+
+(def ^:private modal-windows (atom []))
+
+(defn modal?
+  "True while the window runs modally (run-modal)."
+  [w]
+  (boolean (some (fn [m] (identical? m w)) @modal-windows)))
+
+(defn end-modal!
+  "Make run-modal of the window return value."
+  ([w] (end-modal! w nil))
+  ([w value]
+   (when (modal? w)
+     (let [b (current-backend)]
+       (in-ui (fn [] (backend-end-modal b w value)))))
+   nil))
+
+(defn- window-closed! [w]
+  (when (modal? w) (end-modal! w nil))
+  (swap! open-windows (fn [ws] (filterv (fn [x] (not (identical? x w))) ws)))
+  (emit! w (event-for w :closed))
+  (destroy! w)
+  (when (and (:running app) (:quit-on-last-window-closed app) (empty? (windows)))
+    (backend-quit-loop (current-backend))))
+
+(defn close!
+  "Ask the window to close, as its close button does: it emits :close-request, and
+unless a handler vetoes (or with force), it closes, emits :closed and is destroyed. True
+if it closed."
+  ([w] (close! w false))
+  ([w force]
+   (if (and (not force) (vetoed? (emit! w (event-for w :close-request))))
+     false
+     (let [b (current-backend)]
+       (in-ui (fn [] (backend-close b w)))
+       (set-slot! w :shown false)
+       (window-closed! w)
+       true))))
+
+(defn run-modal
+  "Show the window and run the event loop until end-modal! is called for it, keeping the
+other windows from the user. Returns the value given to end-modal!."
+  [w]
+  (show! w)
+  (swap! modal-windows conj w)
+  (try
+    (let [b (current-backend)]
+      (in-ui (fn [] (backend-run-modal b w))))
+    (finally
+      (swap! modal-windows (fn [ms] (filterv (fn [m] (not (identical? m w))) ms))))))
 
 (defn resized-by-user!
   "Backends call this when the user resized the window's content area to width by
-height: it lays the window out at once."
+height: it lays the window out at once and emits :resize."
   [w width height]
-  (sync-property! w :width width)
-  (sync-property! w :height height)
-  (update-layout! w))
+  (when (not= [width height] [(:width w) (:height w)])
+    (sync-property! w :width width)
+    (sync-property! w :height height)
+    (update-layout! w)
+    (emit! w (event-for w :resize :width width :height height))))
+
+(defn activated-by-user!
+  "Backends call this when the window became (active true) or stopped being the active
+window."
+  [w active]
+  (emit! w (event-for w (if active :activated :deactivated))))
+
+(defn moved-by-user!
+  "Backends call this when the user moved the window's top left corner to x, y."
+  [w x y]
+  (sync-property! w :position [x y])
+  (emit! w (event-for w :moved :value [x y])))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Images
@@ -1061,9 +1341,12 @@ RGBA pixels (image-from-pixels)."
   (text :cell :atom :init "")
   (alignment :cell :atom :init :left :doc "How lines line up: :left, :center or :right.")
   (wrap :cell :atom :init false :doc "Whether long text wraps (set :width to say where).")
-  (selectable :cell :atom :init false :doc "Whether the user can select and copy the text."))
+  (selectable :cell :atom :init false :doc "Whether the user can select and copy the text.")
+  (text-color :cell :atom :init nil :doc "The text's color (a color designator), or nil.")
+  (background :cell :atom :init nil :doc "A background color, or nil for none."))
 
-(declare-widget! label-widget {:properties [:text :alignment :wrap :selectable]
+(declare-widget! label-widget {:properties [:text :alignment :wrap :selectable :text-color
+                                            :background]
                                :layout [:text :wrap]})
 
 (defn label
@@ -1082,7 +1365,8 @@ RGBA pixels (image-from-pixels)."
 
 (declare-widget! entry-widget {:properties [:text :placeholder :editable :alignment :width-chars]
                                :layout [:width-chars]
-                               :signals {:changed value-event :activate action-event}})
+                               :signals (merge input-signals
+                                               {:changed value-event :activate action-event})})
 
 (defn entry
   "An entry: (entry {:placeholder \"Your name\" :on-changed f})."
@@ -1361,17 +1645,96 @@ text) when the user types or chooses, and :activate on Return."
   ([opts] (build image-view-widget opts nil)))
 
 ;;; ------------------------------------------------------------------------------------
-;;; Running
+;;; Dialogs of the program's own
 
-(defn run!
-  "Run the backend's event loop until quit!."
-  []
-  (backend-run-loop (current-backend)))
+(def response-labels
+  "Responses whose buttons get a standard label."
+  {:ok "OK" :cancel "Cancel" :yes "Yes" :no "No" :close "Close" :apply "Apply" :save "Save"
+   :discard "Don't Save" :help "Help" :open "Open" :delete "Delete" :retry "Retry"})
 
-(defn quit!
-  "Make run! return."
-  []
-  (backend-quit-loop (current-backend)))
+(defn- response-label [r]
+  (or (get response-labels r) (string/capitalize (string/replace (name r) "-" " "))))
+
+(def ^:private affirmative #{:ok :yes :save :apply :open :delete :retry})
+(def ^:private dismissive #{:cancel :no :close})
+
+(defclass response-event [value-event vetoable-event]
+  "A dialog's button was clicked: :value is its response. veto keeps the dialog open,
+for example when what the user typed isn't valid.")
+
+(defclass dialog-widget [window-widget]
+  "A window with a row of buttons along the bottom that the user answers. Its children
+go in its content area, a vbox. run-dialog shows it modally and returns the response of
+the button clicked; it emits :response (a response-event) as one is clicked."
+  (buttons :init [:cancel :ok]
+           :doc "Its buttons: responses such as :ok, or [label response]; the platform orders them.")
+  (resizable :cell :atom :init false)
+  (response :cell :atom :init nil :doc "The response that closed it, or :close.")
+  (content-area :cell :atom :init nil)
+  (button-box :cell :atom :init nil))
+
+(declare-widget! dialog-widget {:signals {:response response-event}})
+
+(def ^:dynamic *dialog-itself*
+  "True while a dialog adds its own parts, rather than the program's to its content area."
+  false)
+
+(defmethod add! :around [(d dialog-widget) child]
+  (if (or *dialog-itself* (nil? (:content-area d)))
+    (call-next-method)
+    (add! (:content-area d) child)))
+
+(def ^:private respond!)
+
+(defmethod initialize :after [(d dialog-widget)]
+  (let [area (build box-widget {:orientation :vertical :spacing 8 :hexpand true :vexpand true}
+                    nil)
+        row (build box-widget {:orientation :horizontal :spacing 8 :halign :end} nil)
+        top (build box-widget {:orientation :vertical :spacing 16 :margin [16 20]} nil)
+        specs (mapv (fn [b] (if (vector? b) b [(response-label b) b])) (:buttons d))
+        yes (filterv (fn [[_ r]] (contains? affirmative r)) specs)
+        others (filterv (fn [[_ r]] (not (contains? affirmative r))) specs)
+        ordered (if (= :affirmative-first (backend-dialog-button-order (current-backend)))
+                  (into yes others)
+                  (into others yes))]
+    (doseq [[label response] ordered]
+      (let [b (build button-widget {:label label :width 80
+                                    :default (contains? affirmative response)
+                                    :cancel (contains? dismissive response)}
+                     nil)]
+        (on b :clicked (fn [_] (respond! d response)))
+        (add! row b)))
+    (binding [*dialog-itself* true]
+      (add! d top)
+      (add! top area)
+      (add! top row))
+    (set-slot! d :content-area area)
+    (set-slot! d :button-box row)))
+
+(defn dialog
+  "A dialog: (dialog {:title \"Rename\" :buttons [:cancel :ok]} (entry {:name :new-name}))."
+  [opts & children]
+  (build dialog-widget opts children))
+
+(defn respond!
+  "Answer the dialog with response, as its button would: it emits :response and, unless a
+handler vetoes, closes (ending run-dialog)."
+  [d response]
+  (let [e (emit! d (event-for d :response :value response))]
+    (when-not (vetoed? e)
+      (set-slot! d :response response)
+      (if (modal? d)
+        (end-modal! d response)
+        (close! d true)))))
+
+(defn run-dialog
+  "Show the dialog modally and return the response of the button that closed it, or
+:close if the user closed its window. The dialog is closed afterwards."
+  [d]
+  (set-slot! d :response :close)
+  (let [result (run-modal d)]
+    (when-not (:destroyed d) (close! d true))
+    (or result (:response d) :close)))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Colors and fonts
@@ -1531,7 +1894,7 @@ value-event with the text) as the user edits."
   (vexpand :cell :atom :init true))
 
 (declare-widget! text-view-widget {:properties [:text :editable :wrap :border :placeholder]
-                                   :signals {:changed value-event}})
+                                   :signals (merge input-signals {:changed value-event})})
 
 (defn text-view
   "A text view: (text-view {:text \"Notes\" :on-changed f})."
@@ -1592,8 +1955,9 @@ when the user double-clicks a row or presses Return on it."
 
 (declare-widget! list-box-widget {:properties [:icon-fn :selection-mode :selected-indices
                                                :border :alternating]
-                                  :signals {:selection-changed selection-event
-                                            :row-activated item-event}})
+                                  :signals (merge input-signals
+                                                  {:selection-changed selection-event
+                                                   :row-activated item-event})})
 
 (defn list-box
   "A list box: (list-box {:items [\"One\" \"Two\"] :on-selection-changed f})."
@@ -1759,9 +2123,11 @@ events) when the user opens or closes an item."
 (declare-widget! tree-view-widget {:properties [:roots :item-label :icon-fn :columns :headers
                                                 :selection-mode :selection :expanded]
                                    :layout [:columns]
-                                   :signals {:selection-changed selection-event
-                                             :row-activated item-event
-                                             :expanded item-event :collapsed item-event}})
+                                   :signals (merge input-signals
+                                                   {:selection-changed selection-event
+                                                    :row-activated item-event
+                                                    :expanded item-event
+                                                    :collapsed item-event})})
 
 (defn tree-view
   "A tree: (tree-view {:roots [root] :children-fn :children})."
@@ -2115,7 +2481,8 @@ methods on handle-event, to make a custom widget. Coordinates start at its top l
 
 (declare-widget! canvas-widget
                  {:properties [:focusable :background]
-                  :signals {:draw draw-event :resize resize-event
+                  :signals {:draw draw-event :resize resize-event :text-input text-input-event
+                            :context-request mouse-event
                             :mouse-down mouse-event :mouse-up mouse-event
                             :mouse-move mouse-event :mouse-drag mouse-event
                             :mouse-enter mouse-event :mouse-leave mouse-event
