@@ -759,7 +759,11 @@ the change isn't taken for the user's."
    :system-cyan "systemCyanColor" :system-blue "systemBlueColor"
    :system-indigo "systemIndigoColor" :system-purple "systemPurpleColor"
    :system-pink "systemPinkColor" :system-brown "systemBrownColor"
-   :system-gray "systemGrayColor"})
+   :system-gray "systemGrayColor"
+   ;; Surfaces are drawn with materials; as plain colors they are the nearest ones, as on GTK.
+   :sidebar-background "windowBackgroundColor" :content-background "textBackgroundColor"
+   :status-background "windowBackgroundColor" :toolbar-background "windowBackgroundColor"
+   :activity-background "windowBackgroundColor" :popover-background "windowBackgroundColor"})
 
 (defn ns-color
   "An autoreleased NSColor for the color designator d (nil for nil): a system color

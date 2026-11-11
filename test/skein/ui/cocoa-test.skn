@@ -577,3 +577,14 @@
         (is (= ["https://blocked.example/"] @asked))
         (is (= ["about:blank"] @loaded) "it stayed")))
     (ui/close! w)))
+
+(deftest every-system-color
+  ;; Regression: the surface colors had no NSColor, and painting a canvas's
+  ;; :background :content-background crashed.
+  (doseq [c ui/system-colors]
+    (is (not (ffi/null? (cocoa/ns-color c))) (str c)))
+  (let [c (ui/canvas {:width 50 :height 50 :background :content-background})
+        w (ui/window {:width 100 :height 100} c)]
+    (ui/show! w)
+    (is (some? (cocoa/draw-into-image! c 25 25)) "it paints")
+    (ui/close! w true)))
