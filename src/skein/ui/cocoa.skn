@@ -117,6 +117,7 @@ button the mouse button, event the NSEvent.")
             width (int (math/round width))
             height (int (math/round height))]
         (when (not= [width height] [(:width w) (:height w)])
+          (ui/dismiss-popups! w :dismissed nil)
           (ui/resized-by-user! w width height))))))
 
 (ffi/defcallback text-changed-imp void [self ptr, cmd ptr, note ptr]
@@ -231,6 +232,12 @@ consumed it (defined below).")
         (when-let [w (objc/object-for win)]
           (ui/notify-appearance-changed! w))))))
 
+(def ^:private popover-closed!
+  "A popover closed natively (defined below).")
+
+(ffi/defcallback popover-closed-imp void [self ptr, cmd ptr, note ptr]
+  (popover-closed! (objc/send note (objc/sel "object"))))
+
 (def ^:private tab-mouse!
   "Handle a mouse event in a tab's button (defined below).")
 
@@ -318,7 +325,8 @@ consumed it (defined below).")
                        ["splitViewDidResizeSubviews:" selection-imp "v@:@"]
                        ["boundsDidChange:" selection-imp "v@:@"]
                        ["tabView:didSelectTabViewItem:" tab-selected-imp "v@:@@"]
-                       ["menuNeedsUpdate:" menu-opening-imp "v@:@"]])
+                       ["menuNeedsUpdate:" menu-opening-imp "v@:@"]
+                       ["popoverDidClose:" popover-closed-imp "v@:@"]])
   (objc/define-class! "SkeinFlippedView" "NSView"
                       [["isFlipped" yes-imp "B@:"]
                        ["viewDidChangeEffectiveAppearance" appearance-imp "v@:"]])
@@ -2520,7 +2528,12 @@ a widget with input signals other than a canvas, which handles its own."
                   (and (printable? text) (not (contains? modifiers :command))
                        (emit-input! w :text-input :text text :modifiers modifiers))))))
         (1 2 3 4 25 26)
-        (let [loc (objc/send-point e (objc/sel "locationInWindow"))
+        (let [_ (when (contains? #{1 3 25} type)
+                  ;; A click in a window closes its completion popups (one in the popup
+                  ;; is in the popup's own panel).
+                  (when-let [w (objc/object-for window)]
+                    (when (instance? ui/window-widget w) (ui/dismiss-popups! w :dismissed nil))))
+              loc (objc/send-point e (objc/sel "locationInWindow"))
               point {:x (ffi/field loc objc/ns-point :x) :y (ffi/field loc objc/ns-point :y)}
               frame-view (objc/send (objc/send window (objc/sel "contentView"))
                                     (objc/sel "superview"))
@@ -2567,6 +2580,7 @@ a widget with input signals other than a canvas, which handles its own."
                                   {:x (f64 x) :y (f64 (- (screen-height) y))})))))
 
 (defn- window-moved! [w]
+  (ui/dismiss-popups! w :dismissed nil)
   (when-not (quiet?)
     (let [[x y _ h] (objc/rect-vec (objc/send-rect (view w) (objc/sel "frame")))
           pos [(int (math/round x)) (int (math/round (- (screen-height) (+ y h))))]]
@@ -3295,3 +3309,199 @@ let go, as the user would."
   [page]
   (objc/send-p-void (:close (header-of (:parent page) page)) (objc/sel "performClick:")
                     (ffi/null)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Popovers and completion popups: a surface's view is a flipped view inside its shell,
+;;; an NSPopover (through a view controller) or a non-activating borderless NSPanel.
+
+(def ^:private shells
+  "A surface's view address -> its NSPopover or NSPanel."
+  (atom {}))
+
+(def ^:private closing
+  "The addresses of the popovers the program is closing, whose delegate notice isn't the
+user's doing."
+  (atom #{}))
+
+(defn- shell-of [s] (get @shells (ffi/address (view s))))
+
+(defmethod make-native [(s ui/surface-widget)]
+  (let [host (flipped-view)
+        shell (if (instance? ui/popover-widget s)
+                (let [p (objc/new-object "NSPopover")
+                      controller (objc/new-object "NSViewController")]
+                  (objc/send-p-void controller (objc/sel "setView:") host)
+                  (objc/send-p-void p (objc/sel "setContentViewController:") controller)
+                  (objc/send-p-void p (objc/sel "setDelegate:")
+                                    (:text-delegate (ui/current-backend)))
+                  (objc/send-b-void p (objc/sel "setAnimates:") false)
+                  (objc/release controller)
+                  p)
+                ;; borderless (0) and non-activating (128), buffered (2)
+                (let [panel (objc/send-rllb (objc/alloc "NSPanel")
+                                            (objc/sel "initWithContentRect:styleMask:backing:defer:")
+                                            (objc/rect 0 0 100 100) 128 2 false)]
+                  (objc/send-b-void panel (objc/sel "setReleasedWhenClosed:") false)
+                  (objc/send-p-void panel (objc/sel "setContentView:") host)
+                  (objc/send-b-void panel (objc/sel "setHidesOnDeactivate:") true)
+                  (objc/send-b-void panel (objc/sel "setHasShadow:") true)
+                  (objc/send-b-void panel (objc/sel "setBecomesKeyOnlyIfNeeded:") true)
+                  panel))]
+    (also-register! shell s)
+    (swap! shells assoc (ffi/address host) shell)
+    host))
+
+(defmethod ui/backend-destroy :before [(b cocoa-backend) (s ui/surface-widget)]
+  (when-let [shell (shell-of s)]
+    (when (instance? ui/popover-widget s)
+      (objc/send-p-void shell (objc/sel "setDelegate:") (ffi/null)))
+    (objc/unregister! shell)
+    (swap! shells dissoc (ffi/address (view s)))
+    (objc/release shell)))
+
+(def ^:private place-panel!
+  "Put a shown completion popup by its anchor (defined below).")
+
+(defmethod set-native [(s ui/surface-widget) (p (= :size)) size]
+  (when-let [[w h] size]
+    (objc/send-z-void (view s) (objc/sel "setFrameSize:") {:width (f64 w) :height (f64 h)})
+    (objc/send-z-void (shell-of s) (objc/sel "setContentSize:") {:width (f64 w) :height (f64 h)})
+    (when (and (instance? ui/completion-popup-widget s) (:shown s))
+      (place-panel! s (:owner s) (:anchor s)))))
+
+(defmethod set-native [(s ui/popover-widget) (p (= :behavior)) v]
+  (objc/send-l-void (shell-of s) (objc/sel "setBehavior:")
+                    (case v :application-defined 0 :semi-transient 2 1)))
+
+(defn- flipped? [v] (objc/send-bool v (objc/sel "isFlipped")))
+
+(defn- anchor-rect
+  "The rectangle [x y width height] from the top left of the widget's view, in that view's
+own coordinates."
+  [w [x y width height]]
+  (let [v (view w)
+        [_ _ _ vh] (objc/rect-vec (objc/send-rect v (objc/sel "bounds")))]
+    (objc/rect x (if (flipped? v) y (- vh y height)) width height)))
+
+(defmethod ui/backend-show-popover [(b cocoa-backend) p widget rectangle edge]
+  (let [shell (shell-of p)
+        v (view widget)]
+    ;; NSRectEdge: MinX 0, MinY 1, MaxX 2, MaxY 3; the bottom is MaxY in a flipped view.
+    (objc/send-p-void shell (objc/sel "setAppearance:") (objc/send v (objc/sel "effectiveAppearance")))
+    (objc/send-rpl-void shell (objc/sel "showRelativeToRect:ofView:preferredEdge:")
+                        (anchor-rect widget rectangle) v
+                        (case edge :left 0 :right 2
+                              :top (if (flipped? v) 1 3)
+                              (if (flipped? v) 3 1)))))
+
+(defmethod ui/backend-close-popover [(b cocoa-backend) p]
+  (let [shell (shell-of p)
+        a (ffi/address shell)]
+    (swap! closing conj a)
+    (try (objc/send-void shell (objc/sel "close"))
+         (finally (swap! closing disj a)))))
+
+(defn- popover-closed! [shell]
+  (when-not (contains? @closing (ffi/address shell))
+    (when-let [p (objc/object-for shell)]
+      (ui/surface-closed! p :dismissed))))
+
+(defn- text-view-or-view [w]
+  (if (instance? ui/text-view-widget w) (text-view-of w) (view w)))
+
+(defmethod ui/backend-caret-rectangle [(b cocoa-backend) w position]
+  ;; NSTextInputClient gives a screen rectangle: through the window to the widget's view.
+  (objc/call-with-pool
+   (fn []
+     (let [tv (text-view-or-view w)
+           win (objc/send tv (objc/sel "window"))
+           screen-rect (objc/send-rangep-rect tv (objc/sel "firstRectForCharacterRange:actualRange:")
+                                              {:location position :length 0} (ffi/null))
+           window-rect (objc/send-r-rect win (objc/sel "convertRectFromScreen:") screen-rect)
+           v (view w)
+           [x y width height] (objc/rect-vec (objc/send-rp-rect v (objc/sel "convertRect:fromView:")
+                                                                window-rect (ffi/null)))
+           [_ _ _ vh] (objc/rect-vec (objc/send-rect v (objc/sel "bounds")))]
+       (mapv (fn [n] (int (math/round n)))
+             [x (if (flipped? v) y (- vh y height)) (max 1 width) height])))))
+
+(defn- place-panel! [s widget anchor]
+  (let [v (view widget)
+        owner (objc/send v (objc/sel "window"))
+        shell (shell-of s)]
+    (when (and (not (ffi/null? owner)) (objc/send-bool owner (objc/sel "isVisible")))
+      (let [rectangle (if (vector? anchor)
+                        anchor
+                        (ui/backend-caret-rectangle (ui/current-backend) widget
+                                                    (if (= anchor :caret)
+                                                      (ui/caret-position widget)
+                                                      anchor)))
+            window-rect (objc/send-rp-rect v (objc/sel "convertRect:toView:")
+                                           (anchor-rect widget rectangle) (ffi/null))
+            [ax ay aw ah] (objc/rect-vec (objc/send-r-rect owner (objc/sel "convertRectToScreen:")
+                                                           window-rect))
+            screen (let [sc (objc/send owner (objc/sel "screen"))]
+                     (if (ffi/null? sc) (objc/send (objc/cls "NSScreen") (objc/sel "mainScreen")) sc))
+            [sx sy sw sh] (objc/rect-vec (objc/send-rect screen (objc/sel "visibleFrame")))
+            ;; From the top: y grows downward as place-popup expects.
+            [x y _] (ui/place-popup [ax (- (+ ay ah)) aw ah] (:size s) [sx (- (+ sy sh)) sw sh])
+            parent (objc/send shell (objc/sel "parentWindow"))]
+        (objc/send-p-void shell (objc/sel "setAppearance:")
+                          (objc/send v (objc/sel "effectiveAppearance")))
+        (when-not (ffi/null? parent)
+          (objc/send-p-void parent (objc/sel "removeChildWindow:") shell))
+        (objc/send-point-void shell (objc/sel "setFrameTopLeftPoint:") {:x (f64 x) :y (f64 (- y))})
+        (objc/send-pl owner (objc/sel "addChildWindow:ordered:") shell 1)   ; NSWindowAbove
+        (objc/send-p-void shell (objc/sel "orderFront:") (ffi/null))))))
+
+(def ^:private placements
+  "A completion popup's view address -> the number of its latest placement."
+  (atom {}))
+
+(def ^:private placement-count (atom 0))
+
+(defmethod ui/backend-show-panel [(b cocoa-backend) s widget anchor]
+  ;; A text view tells of a change before its selection moves: place the popup at the
+  ;; caret on the next turn of the loop; a newer placement makes this one stale.
+  (let [token (swap! placement-count inc)
+        a (ffi/address (view s))]
+    (swap! placements assoc a token)
+    (ui/backend-call-later b (fn []
+                               (when (and (= token (get @placements a)) (:shown s)
+                                          (not (:destroyed s)) (not (:destroyed widget)))
+                                 (place-panel! s widget anchor))))))
+
+(defmethod ui/backend-close-panel [(b cocoa-backend) s]
+  (swap! placements dissoc (ffi/address (view s)))
+  (let [shell (shell-of s)
+        parent (objc/send shell (objc/sel "parentWindow"))]
+    (when-not (ffi/null? parent)
+      (objc/send-p-void parent (objc/sel "removeChildWindow:") shell))
+    (objc/send-p-void shell (objc/sel "orderOut:") (ffi/null))))
+
+(defn native-surface-shown?
+  "True if the popover's NSPopover or the completion popup's NSPanel is shown."
+  [s]
+  (let [shell (shell-of s)]
+    (if (instance? ui/popover-widget s)
+      (objc/send-bool shell (objc/sel "isShown"))
+      (objc/send-bool shell (objc/sel "isVisible")))))
+
+(defn native-panel-frame
+  "The completion popup's panel frame on the screen, [x y width height] from the top left
+of the main screen."
+  [s]
+  (let [[x y w h] (objc/rect-vec (objc/send-rect (shell-of s) (objc/sel "frame")))]
+    (mapv (fn [n] (int (math/round n))) [x (- (screen-height) y h) w h])))
+
+(defn native-screen-rect
+  "Where the rectangle [x y width height] in the widget is on the screen, [x y width
+height] from the top left of the main screen."
+  [w rectangle]
+  (let [v (view w)
+        win (objc/send v (objc/sel "window"))
+        [x y rw rh] (objc/rect-vec
+                     (objc/send-r-rect win (objc/sel "convertRectToScreen:")
+                                       (objc/send-rp-rect v (objc/sel "convertRect:toView:")
+                                                          (anchor-rect w rectangle) (ffi/null))))]
+    (mapv (fn [n] (int (math/round n))) [x (- (screen-height) y rh) rw rh])))

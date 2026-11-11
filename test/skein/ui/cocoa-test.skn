@@ -402,3 +402,41 @@
       (is (identical? a (last (:children q))))
       (is (:selected (cocoa/native-tab a))))
     (ui/close! w)))
+
+(deftest popovers-and-completion-popups
+  (let [closed (atom [])
+        name (ui/entry {})
+        b (ui/button {:label "Settings"})
+        v (ui/text-view {:text "ab\ncd"})
+        p (ui/popover {:on-closed (fn [e] (swap! closed conj (:value e)))}
+                      (ui/vbox {} (ui/label {:text "Name"}) name))
+        w (ui/window {:title "Popovers" :width 400 :height 300} (ui/vbox {} b v))]
+    (ui/show! w)
+    (testing "a popover"
+      (ui/show-popover! p b {:focus name})
+      (is (cocoa/native-surface-shown? p))
+      (is (= (:size p) (vec (take-last 2 (cocoa/native-frame p)))))
+      (ui/close-surface! p)
+      (is (not (cocoa/native-surface-shown? p)))
+      (is (= [:closed] @closed)))
+    (testing "a completion popup under the caret"
+      (let [c (ui/completion-popup {})]
+        (ui/focus! v)
+        (ui/set-text-selection! v 4 4)
+        (let [[x y cw ch] (ui/caret-rectangle v)]
+          (is (< 0 ch 30))
+          (is (< y 40) "on the second line"))
+        (ui/show-completion-popup! c v {:items ["cab" "car" "cat"]})
+        (cocoa/run-for! 0.1)
+        (is (cocoa/native-surface-shown? c))
+        (let [[px py pw ph] (cocoa/native-panel-frame c)
+              [cx cy _ ch] (cocoa/native-screen-rect v (ui/caret-rectangle v))]
+          (is (= (:size c) [pw ph]))
+          (is (= cx px) "lined up with the caret")
+          (is (<= (+ cy ch) py (+ cy ch 4)) "just below it"))
+        (is (identical? v (ui/focused-widget)) "the view keeps the keyboard")
+        (cocoa/send-key! v \x)
+        (is (cocoa/native-surface-shown? c))
+        (ui/close-surface! c)
+        (is (not (cocoa/native-surface-shown? c)))))
+    (ui/close! w)))

@@ -186,6 +186,12 @@ and all of them run on the main thread, which no fiber waits to share."
   [self ptr, sel ptr, type u64, location ns-point, flags u64, time f64, window i64,
    context ptr, chars ptr, plain ptr, repeat bool, code u16])
 (ffi/defcfun dlsym "dlsym" ptr [handle ptr, name c-string])
+(ffi/defcfun ^:blocking send-rpl-void "objc_msgSend" void
+  [self ptr, sel ptr, r ns-rect, p ptr, n u64])
+(ffi/defcfun ^:blocking send-rangep-rect "objc_msgSend" ns-rect
+  [self ptr, sel ptr, r ns-range, p ptr])
+(ffi/defcfun ^:blocking send-r-rect "objc_msgSend" ns-rect [self ptr, sel ptr, r ns-rect])
+(ffi/defcfun ^:blocking send-rp-rect "objc_msgSend" ns-rect [self ptr, sel ptr, r ns-rect, p ptr])
 
 ;;; Blocks: a global block whose invoke function is a Skein callback, for the AppKit
 ;;; methods that take one (Apple's block ABI).
