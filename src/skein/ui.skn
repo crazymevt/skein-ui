@@ -4417,6 +4417,9 @@ units each).")
   (group :cell :atom :init [])
   (group-depth :cell :atom :init 0)
   (undoing :cell :atom :init false)
+  (mergeable :cell :atom :init false
+             :doc "Whether the last change recorded was typing or deleting, which the next
+may join.")
   (views :cell :atom :init [] :doc "The code views showing it.")
   (mirror :cell :atom :init nil :doc "The id of its :changed handler that updates the views."))
 
@@ -4551,8 +4554,9 @@ that keep their own."
   (when-not (or (:undoing b) *suppress-history* (not (pos? (:history-limit b))))
     (set-slot! b :redo-stack ())
     (let [edit [start removed inserted]
-          merged (when (and merge (seq (:undo-stack b)))
+          merged (when (and merge (:mergeable b) (seq (:undo-stack b)))
                    (merge-edit (first (:undo-stack b)) edit))]
+      (set-slot! b :mergeable (boolean merge))
       (cond (pos? (:group-depth b)) (update-slot! b :group conj edit)
             merged (update-slot! b :undo-stack (fn [st] (conj (rest st) merged)))
             :else (update-slot! b :undo-stack
@@ -4561,8 +4565,8 @@ that keep their own."
 (defn replace-buffer-range!
   "Replace the buffer's characters from start to end with text, record the change for
 undo!, and emit :changed. With merge, the change joins the previous one in the history
-when it continues it, as typing a word or deleting with Backspace does, so undo! takes them
-back together. Returns the end of the new text."
+when that was made with merge too and this continues it, as typing a word or deleting with
+Backspace does, so undo! takes them back together. Returns the end of the new text."
   ([b start end text] (replace-buffer-range! b start end text false))
   ([b start end text merge]
    (check-range b start end)
@@ -4652,6 +4656,7 @@ back together. Returns the end of the new text."
 (defn clear-history!
   "Forget the buffer's undo and redo history. Returns the buffer."
   [b]
+  (set-slot! b :mergeable false)
   (set-slot! b :undo-stack ())
   (set-slot! b :redo-stack ())
   b)
@@ -4680,6 +4685,7 @@ last."
 [start end] of the text it restored, or nil with nothing to undo.")
 
 (defmethod undo! [(b text-buffer)]
+  (set-slot! b :mergeable false)
   (when-let [record (first (:undo-stack b))]
     (update-slot! b :undo-stack rest)
     (update-slot! b :redo-stack conj record)
@@ -4690,6 +4696,7 @@ last."
 buffer, returns [start end] of the new text, or nil.")
 
 (defmethod redo! [(b text-buffer)]
+  (set-slot! b :mergeable false)
   (when-let [record (first (:redo-stack b))]
     (update-slot! b :redo-stack rest)
     (update-slot! b :undo-stack conj record)

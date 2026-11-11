@@ -46,6 +46,11 @@
     (is (not (ui/can-undo? b)))
     (ui/redo! b)
     (is (= "abcd" (ui/buffer-text b)))
+    (ui/insert-into-buffer! b 4 "!")
+    (ui/replace-buffer-range! b 5 5 "?" true)
+    (ui/undo! b)
+    (is (= "abcd!" (ui/buffer-text b)) "typing doesn't join a program's change")
+    (ui/undo! b)
     (ui/with-undo-group [b]
       (ui/delete-buffer-range! b 0 1)
       (ui/insert-into-buffer! b 0 "X"))
