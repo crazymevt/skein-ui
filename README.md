@@ -7,10 +7,10 @@ programs look and behave the way their users expect.
 ```clojure
 (ns hello.main
   (:require [skein.ui :as ui]
-            [skein.ui.headless :as headless]))
+            [skein.ui.cocoa :as cocoa]))
 
 (defn -main [& args]
-  (ui/use-backend! (headless/backend))
+  (ui/use-backend! (cocoa/backend))
   (let [name (ui/entry {:placeholder "Your name"})
         w (ui/window {:title "Hello"}
             (ui/vbox {:spacing 8}
@@ -18,7 +18,9 @@ programs look and behave the way their users expect.
               name
               (ui/button {:label "Greet"
                           :on-clicked (fn [e] (println "Hello," (:text name)))})))]
-    (ui/show! w)))
+    (ui/on w :close-request (fn [e] (ui/quit!)))
+    (ui/show! w)
+    (ui/run!)))
 ```
 
 - **Widgets** are made by functions that take an option map and children:
@@ -46,8 +48,13 @@ This is Skein's milestone M2.14 (its D-090 and D-097), a port of the design of L
 Common Lisp toolkit. It has LGT's widgets except the web view: labels, buttons, toggles,
 check boxes, radio buttons, entries, text views, sliders, spin buttons, progress bars,
 spinners, combo boxes, list boxes, sortable tables, trees, images, color and date
-pickers, frames, notebooks, split panes, scrolled windows and canvases, on the headless
-backend, for tests. The Cocoa, Win32 and GTK 4 backends come next.
+pickers, frames, notebooks, split panes, scrolled windows and canvases.
+
+- **Backends:** `skein.ui.cocoa` (AppKit, on macOS) and `skein.ui.headless` (no screen,
+  for tests). Win32 and GTK 4 come next.
+- **Threads:** AppKit runs on the main thread, where `-main` and `ui/run!` run. Widgets
+  can be made and changed from any fiber: the call is handed to the main thread, which
+  the backend wakes from the event loop.
 
 ## Using it
 
