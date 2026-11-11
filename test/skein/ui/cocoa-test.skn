@@ -241,3 +241,55 @@
     (cocoa/send-mouse! c 1 30 40)
     (is (= [[30.0 40.0 :left]] @clicks) "flipped: from the top left")
     (ui/close! w)))
+
+(deftest menus
+  (let [log (atom [])
+        save (ui/menu-item {:label "Save" :shortcut "Primary+Shift+S"
+                            :on-activate (fn [e] (swap! log conj :save))})
+        wrap (ui/check-menu-item {:label "Wrap"})
+        quit (ui/menu-item {:role :quit :on-activate (fn [e] (swap! log conj :quit))})
+        about (ui/menu-item {:role :about})
+        settings (ui/menu-item {:role :preferences})
+        file (ui/menu {:title "File"} save (ui/menu-separator) quit)
+        bar (ui/menu-bar {} file (ui/menu {:title "Edit"} wrap) (ui/menu {:title "Help"} about settings))]
+    (is (= ["" "File" "Edit" "Help"] (cocoa/menu-titles bar)) "the application menu first")
+    (is (= ["Save" ""] (cocoa/menu-titles file)) "Quit moved to the application menu")
+    (is (= ["About" "" "Settings…" "" "Hide" "Hide Others" "Show All" "" "Quit"]
+           (cocoa/app-menu-titles bar)))
+    (is (= ["s" (+ 0x20000 0x100000)] (cocoa/key-equivalent save)))
+    (cocoa/choose-menu-item-natively! save)
+    (cocoa/choose-menu-item-natively! wrap)
+    (cocoa/choose-menu-item-natively! quit)
+    (is (= [:save :quit] @log))
+    (is (:checked wrap))
+    (set-slot! save :label "Save All")
+    (is (= ["Save All" ""] (cocoa/menu-titles file)))
+    (set-slot! file :title "Document")
+    (is (= ["" "Document" "Edit" "Help"] (cocoa/menu-titles bar)))
+    (is (= "⇧⌘S" (ui/shortcut-label save)))))
+
+(deftest dialogs
+  (cocoa/answer-next-dialog! "Don't Save")
+  (is (= :discard (ui/message-box "Save changes?" {:buttons :save-discard-cancel})))
+  (cocoa/answer-next-dialog! "Ada")
+  (is (= "Ada" (ui/prompt-text "Your name?")))
+  (cocoa/answer-next-dialog! nil)
+  (is (nil? (ui/prompt-text "Your name?")))
+  (cocoa/answer-next-dialog! nil)
+  (is (nil? (ui/choose-file {:filters [["Text" "txt"]]}))))
+
+(deftest timers-and-the-clipboard
+  (let [ticks (atom [])
+        once (ui/after 0.05 (fn [] (swap! ticks conj :once)))
+        often (ui/every 0.04 (fn [] (swap! ticks conj :often)))]
+    (cocoa/run-for! 0.3)
+    (ui/stop-timer! often)
+    (is (= 1 (count (filter #{:once} @ticks))))
+    (is (<= 3 (count (filter #{:often} @ticks))))
+    (is (not (ui/timer-running? once))))
+  (let [saved (ui/clipboard-text)]
+    (ui/set-clipboard-text! "from skein-ui")
+    (is (= "from skein-ui" (ui/clipboard-text)))
+    (when saved (ui/set-clipboard-text! saved)))
+  (is (instance? ui/color (ui/system-color :accent)))
+  (is (boolean? (ui/dark-mode?))))

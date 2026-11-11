@@ -195,6 +195,34 @@ button the mouse button, event the NSEvent.")
     (let [[signal button] (get input-selectors (objc/sel-name cmd))]
       (native-input w signal button event))))
 
+(def ^:private install-menu-bar!
+  "Make the window's menu bar the application's main menu (defined below).")
+
+(def ^:private auto-answer!
+  "Answer the modal dialog that is open, for tests (defined below).")
+
+(ffi/defcallback key-window-imp void [self ptr, cmd ptr, note ptr]
+  (when-let [w (objc/object-for (objc/send note (objc/sel "object")))]
+    (install-menu-bar! w)))
+
+(ffi/defcallback menu-opening-imp void [self ptr, cmd ptr, menu ptr]
+  (when-let [m (objc/object-for menu)]
+    (ui/menu-opening! m)))
+
+(ffi/defcallback timer-fired-imp void [self ptr, cmd ptr, timer ptr]
+  (when-let [t (objc/object-for timer)]
+    (when-not (:repeat t)
+      ;; A one-shot NSTimer is done: forget it (the core drops its handle).
+      (objc/unregister! timer)
+      (objc/release timer))
+    (ui/timer-fired! t)))
+
+(ffi/defcallback quit-imp void [self ptr, cmd ptr, sender ptr]
+  (ui/quit!))
+
+(ffi/defcallback auto-answer-imp void [self ptr, cmd ptr, arg ptr]
+  (auto-answer!))
+
 (defn- note-item
   "The item an outline view notification is about."
   [note]
@@ -225,7 +253,10 @@ button the mouse button, event the NSEvent.")
 (defn- define-classes! []
   (objc/define-class! "SkeinWaker" "NSObject" [["drain:" drain-imp "v@:@"]])
   (objc/define-class! "SkeinTarget" "NSObject" [["action:" action-imp "v@:@"]
-                                                ["doubleAction:" double-action-imp "v@:@"]])
+                                                ["doubleAction:" double-action-imp "v@:@"]
+                                                ["timerFired:" timer-fired-imp "v@:@"]
+                                                ["quitAction:" quit-imp "v@:@"]
+                                                ["autoAnswer:" auto-answer-imp "v@:@"]])
   (objc/define-class! "SkeinDataSource" "NSObject"
                       [["numberOfRowsInTableView:" row-count-imp "q@:@"]
                        ["tableView:objectValueForTableColumn:row:" cell-value-imp "@@:@@q"]
@@ -241,14 +272,16 @@ button the mouse button, event the NSEvent.")
                        ["outlineViewItemDidCollapse:" item-collapsed-imp "v@:@"]])
   (objc/define-class! "SkeinWindowDelegate" "NSObject"
                       [["windowShouldClose:" should-close-imp "B@:@"]
-                       ["windowDidResize:" did-resize-imp "v@:@"]])
+                       ["windowDidResize:" did-resize-imp "v@:@"]
+                       ["windowDidBecomeKey:" key-window-imp "v@:@"]])
   (objc/define-class! "SkeinTextDelegate" "NSObject"
                       [["controlTextDidChange:" text-changed-imp "v@:@"]
                        ["textDidChange:" text-changed-imp "v@:@"]
                        ["comboBoxSelectionDidChange:" selection-imp "v@:@"]
                        ["splitViewDidResizeSubviews:" selection-imp "v@:@"]
                        ["boundsDidChange:" selection-imp "v@:@"]
-                       ["tabView:didSelectTabViewItem:" tab-selected-imp "v@:@@"]])
+                       ["tabView:didSelectTabViewItem:" tab-selected-imp "v@:@@"]
+                       ["menuNeedsUpdate:" menu-opening-imp "v@:@"]])
   (objc/define-class! "SkeinFlippedView" "NSView" [["isFlipped" yes-imp "B@:"]])
   (objc/define-class! "SkeinCanvasView" "NSView"
                       (into [["isFlipped" yes-imp "B@:"]
@@ -1500,7 +1533,8 @@ down through the open ones."
         size (f64 (or (:size f) (objc/send-double (objc/cls "NSFont") (objc/sel "systemFontSize"))))
         weight (case (:weight f) :light -0.4 :medium 0.23 :semibold 0.3 :bold 0.4 0.0)
         base (cond (= :system (:family f))
-                   (objc/send-dd (objc/cls "NSFont") (objc/sel "systemFontOfSize:weight:") size weight)
+                   (objc/send-dd (objc/cls "NSFont") (objc/sel "systemFontOfSize:weight:")
+                                 size weight)
                    (= :monospace (:family f))
                    (objc/send-dd (objc/cls "NSFont") (objc/sel "monospacedSystemFontOfSize:weight:")
                                  size weight)
@@ -1646,12 +1680,14 @@ down through the open ones."
             key (or (get named-keys code)
                     (when (seq chars) (first (string/lower-case chars))))]
         (ui/emit! c (ui/event-for c signal :key key :modifiers mods
-                                  :text (or (objc/string-of (objc/send e (objc/sel "characters"))) "")
+                                  :text (or (objc/string-of (objc/send e (objc/sel "characters")))
+                                            "")
                                   :repeat (and (= signal :key-down)
                                                (objc/send-bool e (objc/sel "isARepeat"))))))
       (let [p (objc/send-point-p n (objc/sel "convertPoint:fromView:")
                                  (let [w (objc/send-point e (objc/sel "locationInWindow"))]
-                                   {:x (ffi/field w objc/ns-point :x) :y (ffi/field w objc/ns-point :y)})
+                                   {:x (ffi/field w objc/ns-point :x)
+                                    :y (ffi/field w objc/ns-point :y)})
                                  (ffi/null))
             x (ffi/field p objc/ns-point :x)
             y (ffi/field p objc/ns-point :y)]
@@ -1661,11 +1697,400 @@ down through the open ones."
                       (ui/event-for c :scroll :x x :y y :modifiers mods
                                     :delta-x (objc/send-double e (objc/sel "scrollingDeltaX"))
                                     :delta-y (objc/send-double e (objc/sel "scrollingDeltaY"))
-                                    :precise (objc/send-bool e (objc/sel "hasPreciseScrollingDeltas")))
+                                    :precise (objc/send-bool
+                                              e (objc/sel "hasPreciseScrollingDeltas")))
                       (ui/event-for c signal :x x :y y :button button :modifiers mods
-                                    :click-count (if (or (= signal :mouse-down) (= signal :mouse-up))
+                                    :click-count (if (or (= signal :mouse-down)
+                                                         (= signal :mouse-up))
                                                    (objc/send-long e (objc/sel "clickCount"))
                                                    0))))))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Menus: NSMenu and NSMenuItem. A window's menu bar is the application's main menu
+;;; while the window has the keyboard; its first menu is the application menu, which gets
+;;; the items with the :about, :preferences and :quit roles.
+
+(def ^:private command-mask 0x100000)
+(def ^:private option-mask 0x80000)
+
+(defn- add-item! [menu item] (objc/send-p-void menu (objc/sel "addItem:") item))
+
+(defn- new-menu-item
+  "A new NSMenuItem, owned."
+  [title action key mask target]
+  (let [item (objc/send-ppp (objc/alloc "NSMenuItem")
+                            (objc/sel "initWithTitle:action:keyEquivalent:")
+                            (objc/ns-string title) (objc/sel action) (objc/ns-string key))]
+    (when target (objc/send-p-void item (objc/sel "setTarget:") target))
+    (objc/send-l-void item (objc/sel "setKeyEquivalentModifierMask:") mask)
+    item))
+
+(defn- new-menu
+  "A new NSMenu, owned, whose items we enable."
+  [title]
+  (let [m (objc/send-p (objc/alloc "NSMenu") (objc/sel "initWithTitle:") (objc/ns-string title))]
+    (objc/send-b-void m (objc/sel "setAutoenablesItems:") false)
+    (objc/send-p-void m (objc/sel "setDelegate:") (:text-delegate (ui/current-backend)))
+    m))
+
+(defmethod make-native [(bar ui/menu-bar-widget)]
+  (let [b (ui/current-backend)
+        main (new-menu "")
+        app-item (objc/new-object "NSMenuItem")
+        app (new-menu "App")]
+    (doseq [[title action key mask] [["Hide" "hide:" "h" command-mask]
+                                     ["Hide Others" "hideOtherApplications:" "h"
+                                      (+ command-mask option-mask)]
+                                     ["Show All" "unhideAllApplications:" "" 0]]]
+      (let [i (new-menu-item title action key mask nil)]
+        (add-item! app i)
+        (objc/release i)))
+    (add-item! app (objc/send (objc/cls "NSMenuItem") (objc/sel "separatorItem")))
+    (let [q (new-menu-item "Quit" "quitAction:" "q" command-mask (:target b))]
+      (add-item! app q)
+      (objc/release q))
+    (objc/send-p-void app-item (objc/sel "setTitle:") (objc/ns-string ""))
+    (objc/send-p-void app-item (objc/sel "setSubmenu:") app)
+    (objc/release app)
+    (add-item! main app-item)
+    (objc/release app-item)
+    main))
+
+(defmethod make-native [(m ui/menu-widget)] (new-menu ""))
+
+(defmethod make-native [(item ui/menu-item-widget)]
+  (new-menu-item "" "action:" "" 0 (:target (ui/current-backend))))
+
+(defmethod make-native [(s ui/menu-separator-widget)]
+  (objc/retain (objc/send (objc/cls "NSMenuItem") (objc/sel "separatorItem"))))
+
+(defn- bar-of
+  "The menu bar the menu object is in, or nil."
+  [o]
+  (first (filter (fn [p] (instance? ui/menu-bar-widget p))
+                 (take-while some? (iterate :parent o)))))
+
+(defn- app-menu [bar]
+  (objc/send (objc/send-l (view bar) (objc/sel "itemAtIndex:") 0) (objc/sel "submenu")))
+
+(defn- items-of [menu]
+  (let [items (objc/send menu (objc/sel "itemArray"))]
+    (mapv (fn [i] (objc/send-l items (objc/sel "objectAtIndex:") i))
+          (range (objc/send-long items (objc/sel "count"))))))
+
+(defn- detach-item! [item]
+  (let [menu (objc/send item (objc/sel "menu"))]
+    (when-not (ffi/null? menu)
+      (objc/send-p-void menu (objc/sel "removeItem:") item))))
+
+(defn- place-in-app-menu!
+  "Put the menu item with an application role in the bar's application menu, where macOS
+has it: About first, Settings after it, Quit last, in place of the default Quit."
+  [bar item]
+  (let [app (app-menu bar)
+        n (view item)
+        insert! (fn [x i] (objc/send-pl app (objc/sel "insertItem:atIndex:") x i))
+        separator (fn [] (objc/send (objc/cls "NSMenuItem") (objc/sel "separatorItem")))]
+    (detach-item! n)
+    (case (:role item)
+      :about (do (insert! (separator) 0) (insert! n 0))
+      :preferences (let [after-about (if (some (fn [i] (= :about (:role (objc/object-for i))))
+                                               (items-of app))
+                                       2 0)]
+                     (insert! (separator) after-about)
+                     (insert! n after-about))
+      :quit (do (doseq [i (items-of app)]
+                  (when (= "quitAction:" (objc/sel-name (objc/send i (objc/sel "action"))))
+                    (objc/send-p-void app (objc/sel "removeItem:") i)))
+                (add-item! app n)))))
+
+(def ^:private app-roles #{:about :preferences :quit})
+
+(defn- place-app-items! [bar m]
+  (ui/map-menu-items (fn [item _] (when (contains? app-roles (:role item))
+                                    (place-in-app-menu! bar item)))
+                     m))
+
+(defn- add-to-menu!
+  "Put child's NSMenuItem (a submenu's, for a menu) in the NSMenu of parent."
+  [parent child]
+  (if (instance? ui/menu-widget child)
+    (let [item (objc/new-object "NSMenuItem")]
+      (objc/send-p-void item (objc/sel "setTitle:") (objc/ns-string (or (:title child) "")))
+      (objc/send-p-void item (objc/sel "setSubmenu:") (view child))
+      (add-item! (view parent) item)
+      (objc/release item)
+      (when-let [bar (bar-of parent)] (place-app-items! bar child)))
+    (if-let [bar (when (contains? app-roles (:role child)) (bar-of parent))]
+      (place-in-app-menu! bar child)
+      (add-item! (view parent) (view child)))))
+
+(defmethod ui/backend-add-child [(b cocoa-backend) (parent ui/menu-bar-widget) child]
+  (add-to-menu! parent child))
+
+(defmethod ui/backend-add-child [(b cocoa-backend) (parent ui/menu-widget) child]
+  (add-to-menu! parent child))
+
+(defn- remove-from-menu! [parent child]
+  (if (instance? ui/menu-widget child)
+    (let [i (objc/send-p-long (view parent) (objc/sel "indexOfItemWithSubmenu:") (view child))]
+      (when (>= i 0) (objc/send-l-void (view parent) (objc/sel "removeItemAtIndex:") i)))
+    (detach-item! (view child))))
+
+(defmethod ui/backend-remove-child [(b cocoa-backend) (parent ui/menu-bar-widget) child]
+  (remove-from-menu! parent child))
+
+(defmethod ui/backend-remove-child [(b cocoa-backend) (parent ui/menu-widget) child]
+  (remove-from-menu! parent child))
+
+(defmethod set-native [(m ui/menu-widget) (p (= :title)) v]
+  (let [n (view m)
+        super (objc/send n (objc/sel "supermenu"))]
+    (objc/send-p-void n (objc/sel "setTitle:") (objc/ns-string (or v "")))
+    (when-not (ffi/null? super)
+      (let [i (objc/send-p-long super (objc/sel "indexOfItemWithSubmenu:") n)]
+        (when (>= i 0)
+          (objc/send-p-void (objc/send-l super (objc/sel "itemAtIndex:") i) (objc/sel "setTitle:")
+                            (objc/ns-string (or v ""))))))))
+
+(defmethod set-native [(item ui/menu-item-widget) (p (= :label)) v]
+  (set-string! item "setTitle:" v))
+
+(defmethod set-native [(item ui/menu-item-widget) (p (= :enabled)) v]
+  (set-bool! item "setEnabled:" v))
+
+(defmethod set-native [(item ui/check-menu-item-widget) (p (= :checked)) v]
+  (set-long! item "setState:" (if v 1 0)))
+
+(def ^:private key-equivalents
+  "The characters AppKit's key equivalents use for named keys."
+  {:return "\r" :escape "\u001b" :tab "\t" :backspace "\b" :delete "" :space " "
+   :up "" :down "" :left "" :right "" :home "" :end ""
+   :page-up "" :page-down "" :f1 "" :f2 "" :f3 ""
+   :f4 "" :f5 "" :f6 "" :f7 "" :f8 "" :f9 ""
+   :f10 "" :f11 "" :f12 ""})
+
+(defn- modifier-mask [mods]
+  (reduce + 0 (keep {:shift 0x20000 :control 0x40000 :alt 0x80000 :command 0x100000} mods)))
+
+(defmethod set-native [(item ui/menu-item-widget) (p (= :shortcut)) s]
+  (let [[key mods] (if s (ui/parse-shortcut s) [nil #{}])]
+    (set-string! item "setKeyEquivalent:" (cond (nil? key) ""
+                                                (char? key) (str key)
+                                                :else (get key-equivalents key "")))
+    (set-long! item "setKeyEquivalentModifierMask:" (modifier-mask mods))))
+
+(defmethod native-action [(item ui/menu-item-widget) sender]
+  (ui/activate-menu-item! item))
+
+(defn- install-menu-bar! [w]
+  (when-let [bar (:menu-bar w)]
+    (objc/send-p-void (:app (ui/current-backend)) (objc/sel "setMainMenu:") (view bar))))
+
+(defmethod set-native [(w ui/window-widget) (p (= :menu-bar)) bar]
+  (when (objc/send-bool (view w) (objc/sel "isKeyWindow"))
+    (install-menu-bar! w)))
+
+(defmethod ui/backend-popup-menu [(b cocoa-backend) m widget x y]
+  (objc/send-ppointp-bool (view m) (objc/sel "popUpMenuPositioningItem:atLocation:inView:")
+                          (ffi/null) {:x (f64 x) :y (f64 y)} (view widget)))
+
+(def ^:private role-actions
+  {:undo "undo:" :redo "redo:" :cut "cut:" :copy "copy:" :paste "paste:" :delete "delete:"
+   :select-all "selectAll:" :minimize "performMiniaturize:" :zoom "performZoom:"
+   :fullscreen "toggleFullScreen:"})
+
+(defmethod ui/backend-perform-role [(b cocoa-backend) role]
+  (when-let [action (get role-actions role)]
+    ;; To the first responder: the focused field, else the key window.
+    (objc/send-ppp-bool (:app b) (objc/sel "sendAction:to:from:") (objc/sel action) (ffi/null)
+                        (ffi/null))))
+
+(defmethod ui/backend-active-window [(b cocoa-backend)]
+  (objc/object-for (objc/send (:app b) (objc/sel "keyWindow"))))
+
+(defmethod ui/backend-shortcut-label [(b cocoa-backend) shortcut]
+  (let [[key mods] (ui/parse-shortcut shortcut)
+        symbols (apply str (keep (fn [[m s]] (when (contains? mods m) s))
+                                 [[:control "⌃"] [:alt "⌥"] [:shift "⇧"] [:command "⌘"]]))
+        key-label (if (char? key)
+                    (string/upper-case (str key))
+                    (get {:return "↩" :escape "⎋" :tab "⇥" :backspace "⌫" :delete "⌦"
+                          :left "←" :right "→" :up "↑" :down "↓" :space "Space"}
+                         key (string/upper-case (name key))))]
+    (str symbols key-label)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Dialogs: NSAlert and the open and save panels, run modally
+
+(def ^:private next-answer
+  "For tests: what the next dialog answers (answer-next-dialog!), or nil."
+  (atom nil))
+
+(def ^:private open-dialog
+  "The modal dialog that is open: {:kind :alert, :prompt or :panel, :object, :field}."
+  (atom nil))
+
+(defn- run-modal [kind o field]
+  (let [b (ui/current-backend)]
+    (reset! open-dialog {:kind kind :object o :field field})
+    (when (some? @next-answer)
+      (objc/send-ppdp-void (:target b) (objc/sel "performSelector:withObject:afterDelay:inModes:")
+                           (objc/sel "autoAnswer:") (ffi/null) 0.05 (:modes b)))
+    (try (objc/send-long o (objc/sel "runModal"))
+         (finally (reset! open-dialog nil)))))
+
+(defn- items-of-array [a]
+  (mapv (fn [i] (objc/send-l a (objc/sel "objectAtIndex:") i))
+        (range (objc/send-long a (objc/sel "count")))))
+
+(defn- click-button! [alert i]
+  (objc/send-p-void (objc/send-l (objc/send alert (objc/sel "buttons"))
+                                 (objc/sel "objectAtIndex:") i)
+                    (objc/sel "performClick:") (ffi/null)))
+
+(defn- auto-answer! []
+  (let [{answer :answer} @next-answer
+        {:keys [kind object field]} @open-dialog]
+    (reset! next-answer nil)
+    (case kind
+      :alert (let [titles (mapv (fn [b] (objc/string-of (objc/send b (objc/sel "title"))))
+                                (items-of-array (objc/send object (objc/sel "buttons"))))]
+               (click-button! object (if (integer? answer) answer (or (index-of titles answer) 0))))
+      :prompt (if (nil? answer)
+                (click-button! object 1)
+                (do (objc/send-p-void field (objc/sel "setStringValue:") (objc/ns-string answer))
+                    (click-button! object 0)))
+      :panel (objc/send-p-void object (objc/sel "cancel:") (ffi/null))
+      nil)))
+
+(defmethod ui/backend-message-box [(b cocoa-backend) parent message detail type labels]
+  (let [alert (objc/new-object "NSAlert")]
+    (objc/send-p-void alert (objc/sel "setMessageText:") (objc/ns-string message))
+    (when detail (objc/send-p-void alert (objc/sel "setInformativeText:") (objc/ns-string detail)))
+    ;; NSAlertStyleWarning 0, Informational 1, Critical 2
+    (objc/send-l-void alert (objc/sel "setAlertStyle:") (case type :warning 0 :error 2 1))
+    (doseq [l labels] (objc/send-p alert (objc/sel "addButtonWithTitle:") (objc/ns-string l)))
+    (let [r (run-modal :alert alert nil)
+          i (- r 1000)]
+      (objc/release alert)
+      (when (< -1 i (count labels)) i))))
+
+(defmethod ui/backend-prompt-text [(b cocoa-backend) parent message detail default ok cancel]
+  (let [alert (objc/new-object "NSAlert")
+        field (init-frame "NSTextField")]
+    (objc/send-r-void field (objc/sel "setFrame:") (objc/rect 0 0 260 24))
+    (objc/send-p-void field (objc/sel "setStringValue:") (objc/ns-string default))
+    (objc/send-p-void alert (objc/sel "setMessageText:") (objc/ns-string message))
+    (when detail (objc/send-p-void alert (objc/sel "setInformativeText:") (objc/ns-string detail)))
+    (objc/send-p alert (objc/sel "addButtonWithTitle:") (objc/ns-string ok))
+    (objc/send-p alert (objc/sel "addButtonWithTitle:") (objc/ns-string cancel))
+    (objc/send-p-void alert (objc/sel "setAccessoryView:") field)
+    (objc/send-p-void (objc/send alert (objc/sel "window")) (objc/sel "setInitialFirstResponder:")
+                      field)
+    (let [r (run-modal :prompt alert field)
+          text (when (= r 1000) (objc/string-of (objc/send field (objc/sel "stringValue"))))]
+      (objc/release field)
+      (objc/release alert)
+      text)))
+
+(defmethod ui/backend-choose-file [(b cocoa-backend) parent opts]
+  (let [mode (:mode opts)
+        panel (objc/send (objc/cls (if (= mode :save) "NSSavePanel" "NSOpenPanel"))
+                         (objc/sel (if (= mode :save) "savePanel" "openPanel")))]
+    (when (not= mode :save)
+      (objc/send-b-void panel (objc/sel "setCanChooseFiles:") (= mode :open))
+      (objc/send-b-void panel (objc/sel "setCanChooseDirectories:") (= mode :directory))
+      (objc/send-b-void panel (objc/sel "setAllowsMultipleSelection:") (boolean (:multiple opts))))
+    (when (and (= mode :save) (:name opts))
+      (objc/send-p-void panel (objc/sel "setNameFieldStringValue:") (objc/ns-string (:name opts))))
+    (when-let [t (:title opts)]
+      (objc/send-p-void panel (objc/sel "setMessage:") (objc/ns-string t)))
+    (when-let [d (:directory opts)]
+      (objc/send-p-void panel (objc/sel "setDirectoryURL:")
+                        (objc/send-p (objc/cls "NSURL") (objc/sel "fileURLWithPath:")
+                                     (objc/ns-string d))))
+    (when-let [extensions (seq (mapcat rest (:filters opts)))]
+      (objc/send-p-void panel (objc/sel "setAllowedFileTypes:")
+                        (reduce (fn [a e] (objc/send-p a (objc/sel "arrayByAddingObject:")
+                                                       (objc/ns-string e)))
+                                (objc/send (objc/cls "NSArray") (objc/sel "array"))
+                                extensions)))
+    (when (= 1 (run-modal :panel panel nil))
+      (let [path (fn [url] (objc/string-of (objc/send url (objc/sel "path"))))]
+        (if (= mode :save)
+          [(path (objc/send panel (objc/sel "URL")))]
+          (mapv path (items-of-array (objc/send panel (objc/sel "URLs")))))))))
+
+(defmethod ui/backend-show-about [(b cocoa-backend) info]
+  (let [d (objc/send (objc/cls "NSMutableDictionary") (objc/sel "dictionary"))
+        put! (fn [k v] (objc/send-pp-void d (objc/sel "setObject:forKey:") v (objc/ns-string k)))]
+    (when (:name info) (put! "ApplicationName" (objc/ns-string (:name info))))
+    (when (:version info) (put! "ApplicationVersion" (objc/ns-string (:version info))))
+    (when (:copyright info) (put! "Copyright" (objc/ns-string (:copyright info))))
+    (when-let [credits (seq (remove nil? [(:comments info) (:website info)]))]
+      (put! "Credits" (objc/autorelease
+                       (objc/send-p (objc/alloc "NSAttributedString") (objc/sel "initWithString:")
+                                    (objc/ns-string (string/join "\n" credits))))))
+    (when (:icon info) (put! "ApplicationIcon" (ns-image (:icon info))))
+    (objc/send-p-void (:app b) (objc/sel "orderFrontStandardAboutPanelWithOptions:") d)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Timers, the clipboard and the system
+
+(def ^:private run-loop-modes
+  ["kCFRunLoopDefaultMode" "NSModalPanelRunLoopMode" "NSEventTrackingRunLoopMode"])
+
+(defmethod ui/backend-start-timer [(b cocoa-backend) t]
+  (let [timer (objc/retain
+               (objc/send-dpppb (objc/cls "NSTimer")
+                                (objc/sel "timerWithTimeInterval:target:selector:userInfo:repeats:")
+                                (f64 (:interval t)) (:target b) (objc/sel "timerFired:")
+                                (ffi/null) (boolean (:repeat t))))
+        run-loop (objc/send (objc/cls "NSRunLoop") (objc/sel "mainRunLoop"))]
+    (doseq [mode run-loop-modes]
+      (objc/send-pp-void run-loop (objc/sel "addTimer:forMode:") timer (objc/ns-string mode)))
+    (objc/register! timer t)))
+
+(defmethod ui/backend-stop-timer [(b cocoa-backend) t timer]
+  (objc/send-void timer (objc/sel "invalidate"))
+  (objc/unregister! timer)
+  (objc/release timer))
+
+(defn- pasteboard []
+  (objc/send (objc/cls "NSPasteboard") (objc/sel "generalPasteboard")))
+
+(def ^:private text-type "public.utf8-plain-text")
+
+(defmethod ui/backend-clipboard-text [(b cocoa-backend)]
+  (objc/string-of (objc/send-p (pasteboard) (objc/sel "stringForType:")
+                               (objc/ns-string text-type))))
+
+(defmethod ui/backend-set-clipboard-text [(b cocoa-backend) s]
+  (objc/send-long (pasteboard) (objc/sel "clearContents"))
+  (objc/send-pp-bool (pasteboard) (objc/sel "setString:forType:") (objc/ns-string s)
+                     (objc/ns-string text-type)))
+
+(defmethod ui/backend-beep [(b cocoa-backend)]
+  (objc/ns-beep))
+
+(defmethod ui/backend-open-url [(b cocoa-backend) url]
+  (objc/send-p-bool (objc/send (objc/cls "NSWorkspace") (objc/sel "sharedWorkspace"))
+                    (objc/sel "openURL:")
+                    (objc/send-p (objc/cls "NSURL") (objc/sel "URLWithString:")
+                                 (objc/ns-string url))))
+
+(defmethod ui/backend-system-color [(b cocoa-backend) name]
+  (color-of (ns-color name)))
+
+(defmethod ui/backend-dark-mode? [(b cocoa-backend)]
+  (let [names (reduce (fn [a n] (objc/send-p a (objc/sel "arrayByAddingObject:")
+                                             (objc/ns-string n)))
+                      (objc/send (objc/cls "NSArray") (objc/sel "array"))
+                      ["NSAppearanceNameAqua" "NSAppearanceNameDarkAqua"])]
+    (= "NSAppearanceNameDarkAqua"
+       (objc/string-of (objc/send-p (objc/send (:app b) (objc/sel "effectiveAppearance"))
+                                    (objc/sel "bestMatchFromAppearancesWithNames:") names)))))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; For tests: the real controls, read and acted on
@@ -1816,13 +2241,15 @@ string value."
   [w]
   (let [tv (table-of w)]
     (objc/send-pp-void tv (objc/sel "sendAction:to:")
-                       (objc/send tv (objc/sel "doubleAction")) (objc/send tv (objc/sel "target")))))
+                       (objc/send tv (objc/sel "doubleAction"))
+                       (objc/send tv (objc/sel "target")))))
 
 (defn click-column-title!
   "Tell a table's delegate its column at index was clicked, as AppKit does."
   [t index]
   (let [tv (table-of t)]
-    (objc/send-pp-void (objc/send tv (objc/sel "delegate")) (objc/sel "tableView:didClickTableColumn:")
+    (objc/send-pp-void (objc/send tv (objc/sel "delegate"))
+                       (objc/sel "tableView:didClickTableColumn:")
                        tv (objc/send-l (objc/send tv (objc/sel "tableColumns"))
                                        (objc/sel "objectAtIndex:") index))))
 
@@ -1863,3 +2290,48 @@ the view (from the top left), as AppKit does for a click."
            type {:x (ffi/field p objc/ns-point :x) :y (ffi/field p objc/ns-point :y)} 0 0.0
            (objc/send-long win (objc/sel "windowNumber")) (ffi/null) 0 1 1.0)]
     (objc/send-p-void n (objc/sel (if (= type 1) "mouseDown:" "mouseUp:")) e)))
+
+(defn answer-next-dialog!
+  "For tests: make the next modal dialog answer by itself, as the user clicking would: a
+message box clicks the button with the label (or index) answer; a text prompt types the
+text answer and clicks OK, or clicks Cancel for nil; a file chooser is cancelled."
+  [answer]
+  (reset! next-answer {:answer answer})
+  nil)
+
+(defn run-for!
+  "Run the main thread's run loop for seconds, so timers fire, outside ui/run!."
+  [seconds]
+  (objc/call-with-pool
+   (fn []
+     (objc/send-p-void (objc/send (objc/cls "NSRunLoop") (objc/sel "currentRunLoop"))
+                       (objc/sel "runUntilDate:")
+                       (objc/send-d (objc/cls "NSDate") (objc/sel "dateWithTimeIntervalSinceNow:")
+                                    (f64 seconds))))))
+
+(defn menu-titles
+  "The titles of the items of a menu bar's or menu's NSMenu."
+  [m]
+  (objc/call-with-pool
+   (fn [] (mapv (fn [i] (objc/string-of (objc/send i (objc/sel "title")))) (items-of (view m))))))
+
+(defn app-menu-titles
+  "The titles of the items of a menu bar's application menu."
+  [bar]
+  (objc/call-with-pool
+   (fn [] (mapv (fn [i] (objc/string-of (objc/send i (objc/sel "title"))))
+                (items-of (app-menu bar))))))
+
+(defn key-equivalent
+  "A menu item's key equivalent and modifier mask, [string mask]."
+  [item]
+  (objc/call-with-pool
+   (fn [] [(objc/string-of (objc/send (view item) (objc/sel "keyEquivalent")))
+           (objc/send-long (view item) (objc/sel "keyEquivalentModifierMask"))])))
+
+(defn choose-menu-item-natively!
+  "Choose the menu item as AppKit does for a click: its menu performs it."
+  [item]
+  (let [menu (objc/send (view item) (objc/sel "menu"))
+        i (objc/send-p-long menu (objc/sel "indexOfItem:") (view item))]
+    (objc/send-l-void menu (objc/sel "performActionForItemAtIndex:") i)))
