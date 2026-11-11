@@ -179,6 +179,8 @@ and all of them run on the main thread, which no fiber waits to share."
 (ffi/defcfun ns-beep "NSBeep" void [])
 (ffi/defcfun ^:blocking send-lp "objc_msgSend" ptr [self ptr, sel ptr, n u64, p ptr])
 (ffi/defcfun ^:blocking send-pt "objc_msgSend" ptr [self ptr, sel ptr, p ns-point])
+(ffi/defcfun ^:blocking send-plp-void "objc_msgSend" void [self ptr, sel ptr, a ptr, n i64, b ptr])
+(ffi/defcfun ^:blocking send-l-double "objc_msgSend" f64 [self ptr, sel ptr, n i64])
 (ffi/defcfun dlopen "dlopen" ptr [path ptr, mode i32])
 (ffi/defcfun ^:blocking send-key-event "objc_msgSend" ptr
   [self ptr, sel ptr, type u64, location ns-point, flags u64, time f64, window i64,

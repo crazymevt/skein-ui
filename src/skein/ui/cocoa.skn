@@ -221,6 +221,16 @@ button the mouse button, event the NSEvent.")
   "Emit an NSEvent as the input signals of the widget it is for; true if a handler
 consumed it (defined below).")
 
+(ffi/defcallback appearance-imp void [self ptr, cmd ptr]
+  ;; A window's content view sees the system switch between light and dark.
+  (when (objc/responds? self "window")
+    (let [win (objc/send self (objc/sel "window"))]
+      (when (and (not (ffi/null? win))
+                 (= (ffi/address self)
+                    (ffi/address (objc/send win (objc/sel "contentView")))))
+        (when-let [w (objc/object-for win)]
+          (ui/notify-appearance-changed! w))))))
+
 (ffi/defcallback monitor-imp ptr [block ptr, event ptr]
   (if (route-input! event) (ffi/null) event))
 
@@ -303,7 +313,9 @@ consumed it (defined below).")
                        ["boundsDidChange:" selection-imp "v@:@"]
                        ["tabView:didSelectTabViewItem:" tab-selected-imp "v@:@@"]
                        ["menuNeedsUpdate:" menu-opening-imp "v@:@"]])
-  (objc/define-class! "SkeinFlippedView" "NSView" [["isFlipped" yes-imp "B@:"]])
+  (objc/define-class! "SkeinFlippedView" "NSView"
+                      [["isFlipped" yes-imp "B@:"]
+                       ["viewDidChangeEffectiveAppearance" appearance-imp "v@:"]])
   (objc/define-class! "SkeinCanvasView" "NSView"
                       (into [["isFlipped" yes-imp "B@:"]
                              ["drawRect:" draw-imp "v@:{CGRect={CGPoint=dd}{CGSize=dd}}"]
@@ -2578,3 +2590,160 @@ consumed it."
   [w]
   (let [[x y _ h] (objc/rect-vec (objc/send-rect (view w) (objc/sel "frame")))]
     [(int (math/round x)) (int (math/round (- (screen-height) (+ y h))))]))
+
+;;; ------------------------------------------------------------------------------------
+;;; Appearance, control sizes, surfaces and palettes
+
+(defn- ns-appearance
+  "The NSAppearance for :light or :dark, or null to inherit (:inherit, :system)."
+  [a]
+  (case a
+    :light (objc/send-p (objc/cls "NSAppearance") (objc/sel "appearanceNamed:")
+                        (objc/ns-string "NSAppearanceNameAqua"))
+    :dark (objc/send-p (objc/cls "NSAppearance") (objc/sel "appearanceNamed:")
+                       (objc/ns-string "NSAppearanceNameDarkAqua"))
+    (ffi/null)))
+
+(defmethod set-native [(w ui/widget) (p (= :appearance)) a]
+  (objc/send-p-void (view w) (objc/sel "setAppearance:") (ns-appearance a)))
+
+(defmethod set-native [(w ui/window-widget) (p (= :appearance)) a]
+  (objc/send-p-void (view w) (objc/sel "setAppearance:") (ns-appearance a)))
+
+(defn- dark-appearance? [appearance]
+  (let [names (reduce (fn [a n] (objc/send-p a (objc/sel "arrayByAddingObject:")
+                                              (objc/ns-string n)))
+                      (objc/send (objc/cls "NSArray") (objc/sel "array"))
+                      ["NSAppearanceNameAqua" "NSAppearanceNameDarkAqua"])]
+    (= "NSAppearanceNameDarkAqua"
+       (objc/string-of (objc/send-p appearance (objc/sel "bestMatchFromAppearancesWithNames:")
+                                    names)))))
+
+(defmethod ui/backend-widget-appearance [(b cocoa-backend) w]
+  (objc/call-with-pool
+   (fn [] (if (dark-appearance? (objc/send (view w) (objc/sel "effectiveAppearance")))
+            :dark
+            :light))))
+
+(defmethod ui/backend-color-in-appearance [(b cocoa-backend) name w]
+  ;; Resolve the dynamic NSColor with the widget's appearance as the current one.
+  (objc/call-with-pool
+   (fn []
+     (let [old (objc/send (objc/cls "NSAppearance") (objc/sel "currentAppearance"))]
+       (objc/send-p-void (objc/cls "NSAppearance") (objc/sel "setCurrentAppearance:")
+                         (objc/send (view w) (objc/sel "effectiveAppearance")))
+       (try (color-of (ns-color name))
+            (finally (objc/send-p-void (objc/cls "NSAppearance") (objc/sel "setCurrentAppearance:")
+                                       old)))))))
+
+(defmethod set-native [(w ui/widget) (p (= :control-size)) size]
+  (let [n (font-target w)]
+    (when (objc/responds? n "setControlSize:")
+      (let [code (case size :small 1 :mini 2 :large 3 0)]
+        (objc/send-l-void n (objc/sel "setControlSize:") code)
+        (when (and (nil? (:font w)) (objc/responds? n "setFont:"))
+          (objc/send-p-void n (objc/sel "setFont:")
+                            (objc/send-d (objc/cls "NSFont") (objc/sel "systemFontOfSize:")
+                                         (objc/send-l-double (objc/cls "NSFont")
+                                                             (objc/sel "systemFontSizeForControlSize:")
+                                                             code))))))))
+
+(def ^:private surface-materials
+  "A surface role -> the NSVisualEffectMaterial that draws it."
+  {:window 12 :sidebar 7 :content 18 :status 12 :toolbar 3 :activity 7 :popover 6})
+
+(def ^:private backdrops
+  "A host view's address -> {:color an NSBox, :material an NSVisualEffectView}, behind a
+container's children."
+  (atom {}))
+
+(defn- surface-hosts
+  "The views a container's surface is drawn in: where its children go (each page of a
+notebook)."
+  [c]
+  (if (instance? ui/notebook-widget c)
+    (mapv (fn [page] (objc/send (view page) (objc/sel "superview"))) (:children c))
+    [(container-view c)]))
+
+(defn- make-backdrop [host kind]
+  (let [v (objc/send-r (objc/alloc (if (= kind :material) "NSVisualEffectView" "NSBox"))
+                       (objc/sel "initWithFrame:") (objc/send-rect host (objc/sel "bounds")))]
+    (when (= kind :color)
+      (objc/send-l-void v (objc/sel "setBoxType:") 4)         ; NSBoxCustom
+      (objc/send-l-void v (objc/sel "setTitlePosition:") 0)
+      (objc/send-d-void v (objc/sel "setCornerRadius:") 0.0)
+      (objc/send-d-void v (objc/sel "setBorderWidth:") 0.0)
+      (objc/send-b-void v (objc/sel "setTransparent:") false))
+    (objc/send-l-void v (objc/sel "setAutoresizingMask:") 18)  ; width and height sizable
+    ;; Behind the container's children: NSWindowBelow, relative to none.
+    (objc/send-plp-void host (objc/sel "addSubview:positioned:relativeTo:") v -1 (ffi/null))
+    (objc/release v)
+    v))
+
+(defn- refresh-surface! [c]
+  (let [role (:surface c)
+        color (ui/container-fill c)]
+    (doseq [host (surface-hosts c)]
+      (let [a (ffi/address host)
+            data (or (get @backdrops a) {})
+            data (if (and color (not (:color data))) (assoc data :color (make-backdrop host :color)) data)
+            data (if (and (nil? color) (not= role :automatic) (not (:material data))
+                          (get surface-materials role))
+                   (assoc data :material (make-backdrop host :material))
+                   data)]
+        (when-let [box (:color data)]
+          (when color (objc/send-p-void box (objc/sel "setFillColor:") (ns-color color)))
+          (objc/send-b-void box (objc/sel "setHidden:") (nil? color)))
+        (when-let [m (:material data)]
+          (objc/send-l-void m (objc/sel "setMaterial:") (get surface-materials role 12))
+          (objc/send-l-void m (objc/sel "setBlendingMode:")
+                            (if (contains? #{:sidebar :activity :window} role) 0 1))
+          (objc/send-l-void m (objc/sel "setState:") 0)
+          (objc/send-b-void m (objc/sel "setHidden:") (boolean (or color (= role :automatic)))))
+        (swap! backdrops assoc a data)))))
+
+(defmethod set-native [(c ui/container-widget) (p (= :surface)) v] (refresh-surface! c))
+(defmethod set-native [(c ui/container-widget) (p (= :background)) v] (refresh-surface! c))
+
+(defmethod ui/backend-add-child :after [(b cocoa-backend) (c ui/notebook-widget) child]
+  (refresh-surface! c))
+
+(defmethod set-native [(w ui/window-widget) (p (= :background)) v]
+  (objc/send-p-void (view w) (objc/sel "setBackgroundColor:")
+                    (ns-color (or (ui/container-fill w) :window-background))))
+
+(defn- palette-ns-color
+  "An NSColor of the designator as the widget shows it: a palette's color, or else the
+platform's dynamic one."
+  [w d]
+  (if (and (keyword? d) (ui/palette-color w d)) (ns-color (ui/widget-color w d)) (ns-color d)))
+
+(defmethod ui/backend-apply-palette [(b cocoa-backend) w]
+  (cond
+    (instance? ui/label-widget w)
+    (objc/send-p-void (view w) (objc/sel "setTextColor:")
+                      (palette-ns-color w (or (:text-color w) :text)))
+    (instance? ui/entry-widget w)
+    (do (objc/send-p-void (view w) (objc/sel "setTextColor:") (palette-ns-color w :text))
+        (when (ui/palette-color w :background)
+          (objc/send-b-void (view w) (objc/sel "setDrawsBackground:") true)
+          (objc/send-p-void (view w) (objc/sel "setBackgroundColor:")
+                            (palette-ns-color w :background))))
+    (instance? ui/text-view-widget w)
+    (let [tv (text-view-of w)]
+      (objc/send-p-void tv (objc/sel "setTextColor:") (palette-ns-color w :text))
+      (objc/send-p-void tv (objc/sel "setBackgroundColor:") (palette-ns-color w :background))
+      (objc/send-p-void tv (objc/sel "setInsertionPointColor:") (palette-ns-color w :caret)))
+    (or (instance? ui/list-box-widget w) (instance? ui/tree-view-widget w))
+    (objc/send-p-void (table-of w) (objc/sel "setBackgroundColor:")
+                      (palette-ns-color w :control-background))
+    (instance? ui/container-widget w) (refresh-surface! w)
+    (instance? ui/window-widget w)
+    (objc/send-p-void (view w) (objc/sel "setBackgroundColor:")
+                      (ns-color (or (ui/container-fill w) :window-background)))
+    :else nil))
+
+(defn has-material?
+  "True if a container's surface is drawn by a visual effect view."
+  [c]
+  (some (fn [host] (some? (:material (get @backdrops (ffi/address host))))) (surface-hosts c)))

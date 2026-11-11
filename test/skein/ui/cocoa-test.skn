@@ -317,3 +317,29 @@
       (ui/after 0.1 (fn [] (ui/end-modal! w 42)))
       (is (= 42 (ui/run-modal w)))
       (ui/close! w))))
+
+(deftest appearance-and-surfaces
+  (let [changes (atom [])
+        l (ui/label {:text "x"})
+        side (ui/vbox {:surface :sidebar :palette {:text "#ff0000"}} l)
+        c (ui/canvas {:on-appearance-changed (fn [e] (swap! changes conj (:value e)))})
+        w (ui/window {:title "Look"} (ui/hbox {} side c))]
+    (ui/show! w)
+    ;; From light, whichever mode the system is in.
+    (set-slot! w :appearance :light)
+    (reset! changes [])
+    (set-slot! w :appearance :dark)
+    (is (= :dark (ui/effective-appearance c)))
+    (is (= [:dark] @changes))
+    (set-slot! w :appearance :light)
+    (is (= :light (ui/effective-appearance c)))
+    (testing "colors resolve in the widget's appearance"
+      (let [light (ui/system-color :window-background c)]
+        (set-slot! side :appearance :dark)
+        (is (= :dark (ui/effective-appearance l)))
+        (is (not= light (ui/system-color :window-background l)))))
+    (is (= (ui/rgb 1 0 0) (ui/system-color :text l)) "the sidebar's palette")
+    (is (cocoa/has-material? side) "the sidebar surface is a visual effect view")
+    (ui/close! w))
+  (is (< (first (ui/preferred-size (ui/button {:label "Go" :control-size :mini})))
+         (first (ui/preferred-size (ui/button {:label "Go"}))))))
