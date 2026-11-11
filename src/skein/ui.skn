@@ -557,15 +557,24 @@ specialize it (:before) to check or place the child.")
   (invalidate-size! parent)
   child)
 
+(defgeneric removed-from! [parent child index]
+  "Called after child, which was at index, was taken out of parent: containers specialize
+it to choose another page. The default does nothing.")
+
+(defmethod removed-from! [parent child index]
+  nil)
+
 (defn remove!
   "Take child out of its container parent. Returns child."
   [parent child]
-  (update-slot! parent :children (fn [cs] (vec (remove (fn [c] (identical? c child)) cs))))
-  (set-slot! child :parent nil)
-  (let [b (current-backend)]
-    (in-ui (fn [] (backend-remove-child b parent child))))
-  (invalidate-size! parent)
-  child)
+  (let [index (index-of (:children parent) child)]
+    (update-slot! parent :children (fn [cs] (vec (remove (fn [c] (identical? c child)) cs))))
+    (set-slot! child :parent nil)
+    (let [b (current-backend)]
+      (in-ui (fn [] (backend-remove-child b parent child))))
+    (invalidate-size! parent)
+    (when index (removed-from! parent child index))
+    child))
 
 (defn content
   "The one widget in a window or frame, or nil."
@@ -687,7 +696,12 @@ place it in a grid; :tab-label names its page in a notebook."
   (row :cell :atom :init nil)
   (column-span :cell :atom :init 1)
   (row-span :cell :atom :init 1)
-  (tab-label :cell :atom :init nil :doc "In a notebook, the text on its page's tab.")
+  (tab-label :cell :atom :init nil
+             :doc "In a notebook or stack, its page's name; in a tabbed pane, a string or a widget.")
+  (tab-tooltip :cell :atom :init nil :doc "In a tabbed pane, its tab's tooltip, or nil.")
+  (tab-icon :cell :atom :init nil :doc "In a tabbed pane, an image beside its tab's label, or nil.")
+  (tab-closable :cell :atom :init true :doc "In a tabbed pane, whether its tab has a close button.")
+  (tab-accessory :cell :atom :init nil :doc "In a tabbed pane, a widget beside its tab's label.")
   (font :cell :atom :init nil :doc "Its font (a font designator), or nil for the platform's.")
   (context-menu :cell :atom :init nil :doc "A menu shown when the user right-clicks it, or nil.")
   (appearance :cell :atom :init :inherit
@@ -702,7 +716,8 @@ place it in a grid; :tab-label names its page in a notebook."
                          :signals {:appearance-changed value-event}
                          :layout [:visible :hexpand :vexpand :expand :halign :valign :margin
                                   :width :height :column :row :column-span :row-span
-                                  :tab-label :font :control-size]})
+                                  :tab-label :tab-tooltip :tab-icon :tab-closable
+                                  :tab-accessory :font :control-size]})
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Layout
@@ -2338,11 +2353,15 @@ selection-event with the page) when the user picks another tab."
   [n]
   (get (:children n) (:selected-index n)))
 
+(def ^:private tab-page-changed!
+  "What a page's tab field change does in a tabbed pane (defined below).")
+
 (defmethod property-changed :after [(w widget) property value]
   (when (and (= property :tab-label) (instance? notebook-widget (:parent w)) (realized? w))
     (let [b (current-backend)
           n (:parent w)]
-      (in-ui (fn [] (backend-set-page-label b n w value))))))
+      (in-ui (fn [] (backend-set-page-label b n w value)))))
+  (tab-page-changed! w property value))
 
 (defmethod measure [(n notebook-widget)]
   (let [[dw dh] (backend-decoration-size (current-backend) n)
@@ -2499,6 +2518,467 @@ Returns it."
 point x, y is at the top left. Returns the event."
   [s x y]
   (emit! s (event-for s :scrolled :value [x y])))
+
+;;; ------------------------------------------------------------------------------------
+;;; Stacks: one page shown at a time
+
+(defn- page-size
+  "A page's outer size as if it were shown: a stack measures its hidden pages too."
+  [w]
+  (if (:visible w)
+    (outer-size w)
+    (let [[mw mh] (measure w)
+          [top right bottom left] (sides (:margin w))]
+      [(+ (max (int (math/ceil mw)) (or (:width w) 0)) left right)
+       (+ (max (int (math/ceil mh)) (or (:height w) 0)) top bottom)])))
+
+(defclass stack-widget [container-widget]
+  "A container showing one of its children, its pages, at a time, sized for the largest.
+It emits :page-changed (a selection-event with the page) when another page shows."
+  (selected-index :cell :atom :init 0 :doc "The index of the page shown, or nil for none.")
+  (hexpand :cell :atom :init true)
+  (vexpand :cell :atom :init true))
+
+(declare-widget! stack-widget {:layout [:selected-index] :signals {:page-changed selection-event}})
+
+(defn stack
+  "A stack: (stack {:selected-index 0} (vbox {:tab-label \"One\"} ...) ...)."
+  [opts & children]
+  (build stack-widget opts children))
+
+(defn- show-stack-page! [s]
+  (doseq [[i p] (map-indexed vector (:children s))]
+    (let [v (= i (:selected-index s))]
+      (when (not= v (:visible p)) (set-slot! p :visible v)))))
+
+(defmethod property-changed :after [(s stack-widget) property value]
+  (when (= property :selected-index)
+    (when-not (or (nil? value) (and (integer? value) (< -1 value (count (:children s)))))
+      (error "no page" (pr-str value) "in the stack"))
+    (show-stack-page! s)
+    (emit! s (event-for s :page-changed :index value :value (when value (get (:children s) value))))))
+
+(defmethod add! :after [(s stack-widget) child]
+  (when (nil? (:tab-label child)) (set-slot! child :tab-label "Page"))
+  (show-stack-page! s))
+
+(defmethod removed-from! [(s stack-widget) child index]
+  (set-slot! child :visible true)
+  (let [n (count (:children s))
+        i (:selected-index s)
+        next (cond (zero? n) nil
+                   (nil? i) nil
+                   (= i index) (min index (dec n))
+                   (> i index) (dec i)
+                   :else i)]
+    (if (= next i)
+      (show-stack-page! s)
+      (set-slot! s :selected-index next))))
+
+(defmethod measure [(s stack-widget)]
+  (let [sizes (map page-size (:children s))]
+    [(reduce max 0 (map first sizes)) (reduce max 0 (map second sizes))]))
+
+(defmethod arrange [(s stack-widget) width height]
+  (when-let [p (get (:children s) (:selected-index s))]
+    (allocate-in-cell p 0 0 width height)))
+
+(defgeneric select-page! [container page]
+  "Show page, a page of the notebook, stack or tabbed pane. Returns page.")
+
+(defmethod select-page! [container page]
+  (let [i (index-of (:children container) page)]
+    (when (nil? i) (error "not a page of the container"))
+    (set-slot! container :selected-index i)
+    page))
+
+(defclass vertical-notebook-widget [stack-widget]
+  "A stack with a list of its pages' names on the left to choose one: :page-list, a list
+box it owns, and :sidebar-width, the list's width."
+  (sidebar-width :cell :atom :init 150)
+  (page-list :cell :atom :init nil))
+
+(declare-widget! vertical-notebook-widget {:layout [:sidebar-width]})
+
+(defn vertical-notebook
+  "A vertical notebook: (vertical-notebook {} (vbox {:tab-label \"General\"} ...) ...)."
+  [opts & children]
+  (build vertical-notebook-widget opts children))
+
+(defn- update-page-list! [n]
+  (when-let [l (:page-list n)]
+    (with-handlers-blocked [l :selection-changed]
+      (set-slot! l :items (vec (:children n)))
+      (set-slot! l :selected-indices (if (:selected-index n) [(:selected-index n)] [])))))
+
+(defmethod initialize :after [(n vertical-notebook-widget)]
+  (let [l (build list-box-widget {:item-label (fn [page] (str (or (:tab-label page) "")))
+                                  :hexpand false}
+                 nil)]
+    (set-slot! n :page-list l)
+    (set-slot! l :parent n)
+    (let [b (current-backend)]
+      (in-ui (fn [] (backend-add-child b n l))))
+    (on l :selection-changed (fn [e] (when (:index e) (set-slot! n :selected-index (:index e)))))))
+
+(defmethod add! :after [(n vertical-notebook-widget) child]
+  (update-page-list! n))
+
+(defmethod removed-from! :after [(n vertical-notebook-widget) child index]
+  (update-page-list! n))
+
+(defmethod property-changed :after [(n vertical-notebook-widget) property value]
+  (when (= property :selected-index) (update-page-list! n)))
+
+(defmethod destroy! :before [(n vertical-notebook-widget)]
+  (when-let [l (:page-list n)] (destroy! l)))
+
+(defmethod measure [(n vertical-notebook-widget)]
+  (let [[w h] (call-next-method)]
+    [(+ w (:sidebar-width n) 12) (max h 120)]))
+
+(defmethod arrange [(n vertical-notebook-widget) width height]
+  (let [side (min width (:sidebar-width n))]
+    (when-let [l (:page-list n)] (allocate l 0 0 side height))
+    (when-let [p (get (:children n) (:selected-index n))]
+      (allocate-in-cell p (+ side 12) 0 (max 0 (- width side 12)) height))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Tabbed panes: tabs the user closes, reorders and drags between panes
+
+(defclass page-close-event [selection-event vetoable-event]
+  "A page (:value, at :index) is about to close; veto keeps it open.")
+
+(defclass page-move-event [selection-event]
+  "A page (:value) moved from :old-index to :index."
+  (old-index :init nil))
+
+(defclass page-drop-event [selection-event vetoable-event]
+  "A page (:value) of another pane (:from) is moving to :index of this one; veto in
+:page-drop-request refuses it."
+  (from :init nil))
+
+(defclass tab-context-event [mouse-event]
+  "A right-click on a tab: :page is its page, :index its index, :x and :y the point in
+the tab bar. consume! it after showing a menu of your own."
+  (page :init nil)
+  (index :init nil))
+
+(defgeneric backend-tab-update [backend pane page]
+  "Show the page's tab as its tab fields say: label (a string or widget), tooltip, icon,
+closability and accessory.")
+
+(defmethod backend-tab-update [(b backend) pane page]
+  nil)
+
+(defgeneric backend-tab-move [backend pane page old-index index]
+  "Move the page's tab from old-index to index.")
+
+(defmethod backend-tab-move [(b backend) pane page old-index index]
+  nil)
+
+(defgeneric backend-tab-reveal [backend pane page]
+  "Scroll the tab bar so the page's tab shows.")
+
+(defmethod backend-tab-reveal [(b backend) pane page]
+  nil)
+
+(defgeneric backend-tab-at-point [backend pane x y]
+  "The page whose tab is at x, y in the pane's tab bar, or nil.")
+
+(defmethod backend-tab-at-point [(b backend) pane x y]
+  nil)
+
+(defclass tab-bar-widget [container-widget]
+  "A tabbed pane's tab bar: the platform draws its tabs; its :start and :end boxes hold
+the program's widgets. Its pane owns it."
+  (pane :init nil)
+  (start :cell :atom :init nil)
+  (end :cell :atom :init nil)
+  (vexpand :cell :atom :init false))
+
+(defclass tabbed-pane-widget [notebook-widget]
+  "A notebook whose tabs the user can close, reorder and drag to other panes of its
+window with the same :drag-group. Each page's tab shows its :tab-label (a string or a
+widget), :tab-icon, :tab-tooltip, a close button unless :tab-closable is false, and its
+:tab-accessory. It emits :page-close-request (vetoable), :page-closed, :page-moved,
+:page-drop-request (vetoable), :page-received and :tab-context-request, and
+:page-changed when another page shows."
+  (selected-index :cell :atom :init nil)
+  (reorderable :cell :atom :init true :doc "Whether the user can drag tabs to reorder them.")
+  (drag-group :cell :atom :init nil
+              :doc "Panes of a window with the same drag group (not nil) trade dragged tabs.")
+  (tab-bar :cell :atom :init nil))
+
+(declare-widget! tabbed-pane-widget
+                 {:properties [:reorderable :drag-group]
+                  :signals {:page-close-request page-close-event :page-closed selection-event
+                            :page-moved page-move-event :page-drop-request page-drop-event
+                            :page-received page-drop-event
+                            :tab-context-request tab-context-event}})
+
+(defn tabbed-pane
+  "A tabbed pane: (tabbed-pane {:drag-group :docs} (text-view {:tab-label \"Notes\"}) ...)."
+  [opts & children]
+  (build tabbed-pane-widget opts children))
+
+(defn tab-bar
+  "The tabbed pane's tab bar, whose :start and :end boxes hold the program's widgets."
+  [pane]
+  (:tab-bar pane))
+
+(defmethod initialize :after [(pane tabbed-pane-widget)]
+  (when-not (contains? #{:top :bottom} (:tab-position pane))
+    (error "a tabbed pane's tabs are at the :top or :bottom"))
+  (let [bar (build tab-bar-widget {:pane pane} nil)
+        start (build box-widget {:orientation :horizontal :spacing 4} nil)
+        end (build box-widget {:orientation :horizontal :spacing 4} nil)]
+    (set-slot! bar :parent pane)
+    (set-slot! pane :tab-bar bar)
+    (let [b (current-backend)]
+      (in-ui (fn [] (backend-add-child b pane bar))))
+    (add! bar start)
+    (add! bar end)
+    (set-slot! bar :start start)
+    (set-slot! bar :end end)))
+
+(defn- tab-widgets [page]
+  (filterv (fn [w] (instance? widget w)) [(:tab-label page) (:tab-accessory page)]))
+
+(defn tab-title
+  "A page's tab name as text: its label, or a widget label's text or tooltip."
+  [pane page]
+  (let [l (:tab-label page)]
+    (cond (nil? l) ""
+          (string? l) l
+          (instance? widget l) (or (:tab-tooltip page) (:text l) (:label l) "Tab")
+          :else (str l))))
+
+(defn- update-tab! [pane page]
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-tab-update b pane page))))
+  (invalidate-size! (:tab-bar pane)))
+
+(defmethod add! :around [(pane tabbed-pane-widget) page]
+  (if (instance? tab-bar-widget page)
+    (call-next-method)
+    (do
+      (when (and (instance? widget (:tab-label page))
+                 (identical? (:tab-label page) (:tab-accessory page)))
+        (error "a tab's label and accessory are different widgets"))
+      (doseq [w (tab-widgets page)]
+        (when (:parent w) (error "the tab's widget is in a container already")))
+      (let [first-page (empty? (:children pane))]
+        (call-next-method)
+        (doseq [w (tab-widgets page)] (add! (:tab-bar pane) w))
+        (update-tab! pane page)
+        (when first-page (set-slot! pane :selected-index 0))
+        page))))
+
+(defmethod add! :before [(pane tabbed-pane-widget) page]
+  (when (and (nil? (:tab-label page)) (not (instance? tab-bar-widget page)))
+    (set-slot! page :tab-label (str "Page " (inc (count (:children pane)))))))
+
+(defmethod property-changed :after [(pane tabbed-pane-widget) property value]
+  (when (= property :selected-index)
+    (when-not (or (and (nil? value) (empty? (:children pane)))
+                  (and (integer? value) (< -1 value (count (:children pane)))))
+      (error "no tab" (pr-str value) "in the tabbed pane"))
+    (let [b (current-backend)
+          page (when value (get (:children pane) value))]
+      (when page (in-ui (fn [] (backend-tab-reveal b pane page))))
+      (emit! pane (event-for pane :page-changed :index value :value page)))))
+
+(def ^:private tab-page-changed!
+  (fn [w property value]
+    ;; A page's tab fields show in its tabbed pane's tab.
+    (when (and (contains? #{:tab-label :tab-tooltip :tab-icon :tab-closable :tab-accessory}
+                          property)
+               (instance? tabbed-pane-widget (:parent w)))
+      (update-tab! (:parent w) w))))
+
+(defn- check-page [pane page]
+  (when-not (index-of (:children pane) page)
+    (error "not a page of the tabbed pane")))
+
+(defmethod removed-from! [(pane tabbed-pane-widget) page index]
+  (doseq [w (tab-widgets page)]
+    (remove! (:tab-bar pane) w)
+    (destroy! w))
+  (when (instance? widget (:tab-label page)) (set-slot! page :tab-label "Tab"))
+  (set-slot! page :tab-accessory nil)
+  (let [n (count (:children pane))
+        i (:selected-index pane)
+        next (cond (zero? n) nil
+                   (= i index) (min index (dec n))
+                   (and i (> i index)) (dec i)
+                   :else i)]
+    (when (not= next i)
+      (set-slot! pane :selected-index next))))
+
+(defn close-page!
+  "Ask to close the page: the pane emits :page-close-request and, unless a handler vetoes
+(or with force), takes the page out, destroys it and emits :page-closed. True if it
+closed."
+  ([pane page] (close-page! pane page false))
+  ([pane page force]
+   (check-page pane page)
+   (let [index (index-of (:children pane) page)]
+     (when (or force
+               (not (vetoed? (emit! pane (event-for pane :page-close-request :index index
+                                                    :value page)))))
+       (remove! pane page)
+       (destroy! page)
+       (emit! pane (event-for pane :page-closed :index index :value page))
+       true))))
+
+(defn move-page!
+  "Move the page to index, keeping the page shown, and emit :page-moved. Returns page."
+  [pane page index]
+  (check-page pane page)
+  (when-not (and (integer? index) (< -1 index (count (:children pane))))
+    (error "no tab" (pr-str index) "in the tabbed pane"))
+  (let [old (index-of (:children pane) page)
+        shown (get (:children pane) (:selected-index pane))]
+    (when (not= old index)
+      (let [others (vec (remove (fn [p] (identical? p page)) (:children pane)))]
+        (set-slot! pane :children (vec (concat (subvec others 0 index) [page]
+                                               (subvec others index)))))
+      (sync-property! pane :selected-index (index-of (:children pane) shown))
+      (let [b (current-backend)]
+        (in-ui (fn [] (backend-tab-move b pane page old index))))
+      (invalidate-size! (:tab-bar pane))
+      (emit! pane (event-for pane :page-moved :old-index old :index index :value page)))
+    page))
+
+(defn transfer-page!
+  "Move the page from its tabbed pane into pane, at index (the end by default), keeping
+its tab's label, tooltip, icon and closability (a widget label becomes its text, an
+accessory is dropped), and show it unless select is false. pane emits :page-received.
+Returns page."
+  ([page pane] (transfer-page! page pane nil true))
+  ([page pane index select]
+   (let [from (:parent page)]
+     (when-not (instance? tabbed-pane-widget from) (error "not a page of a tabbed pane"))
+     (when (identical? from pane) (error "already a page of that pane"))
+     (let [title (tab-title from page)]
+       (when (instance? widget (:tab-label page)) (set-slot! page :tab-label title)))
+     (set-slot! page :tab-accessory nil)
+     (remove! from page)
+     (add! pane page)
+     (let [last-index (dec (count (:children pane)))
+           index (if index (max 0 (min index last-index)) last-index)]
+       (move-page! pane page index)
+       (when select (select-page! pane page))
+       (emit! pane (event-for pane :page-received :index index :value page :from from))
+       page))))
+
+(defn page-drop-target?
+  "True if a tab dragged from the pane from may be dropped on pane."
+  [pane from]
+  (boolean (and (instance? tabbed-pane-widget pane) (not (identical? pane from))
+                (not (:destroyed pane)) (:drag-group from)
+                (= (:drag-group pane) (:drag-group from))
+                (identical? (layout-root pane) (layout-root from)))))
+
+(defn page-dropped-by-user!
+  "Backends call this when the user dropped page, a tab of another pane, on pane at
+index: pane emits :page-drop-request and, unless a handler vetoes, the page moves. True
+if it moved."
+  [page pane index]
+  (let [from (:parent page)]
+    (boolean
+     (when (and (instance? tabbed-pane-widget from) (page-drop-target? pane from)
+                (not (vetoed? (emit! pane (event-for pane :page-drop-request :index index
+                                                     :value page :from from)))))
+       (transfer-page! page pane index true)))))
+
+(defn page-moved-by-user!
+  "Backends call this when the user dragged the page's tab to index in its pane."
+  [pane page index]
+  (move-page! pane page index))
+
+(defn tab-at-point
+  "The page whose tab is at x, y in the pane's tab bar, or nil."
+  [pane x y]
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-tab-at-point b pane x y)))))
+
+(def popup-menu!
+  "Show a menu at a point in a widget (defined with the menus, below).")
+
+(defn tab-context-requested!
+  "Backends call this for a right-click at x, y in the pane's tab bar: it emits
+:tab-context-request for the tab there, and shows the bar's :context-menu unless a
+handler consumed it."
+  [pane x y modifiers]
+  (let [page (tab-at-point pane x y)
+        e (when page (event-for pane :tab-context-request :page page
+                                :index (index-of (:children pane) page) :x x :y y
+                                :button :right :modifiers modifiers))]
+    (when e (emit! pane e))
+    (when (and (not (and e (consumed? e))) (:context-menu (:tab-bar pane)))
+      (popup-menu! (:context-menu (:tab-bar pane)) (:tab-bar pane) x y))))
+
+(defn- tabbed-ancestor [w]
+  (first (filter (fn [o] (instance? tabbed-pane-widget o)) (take-while some? (iterate :parent w)))))
+
+(defn handle-tab-key
+  "Switch the pane's page for Control-Tab or Control-Shift-Tab, or Command-Shift-[ or ];
+true (consuming the key event) if it did. It runs for the pane's widgets by itself."
+  [pane e]
+  (let [mods (set (:modifiers e))
+        key (:key e)
+        direction (cond (and (= key :tab) (contains? mods :control)
+                             (every? #{:control :shift} mods))
+                        (if (contains? mods :shift) -1 1)
+                        (and (contains? mods :command) (contains? mods :shift)
+                             (every? #{:command :shift} mods) (contains? #{\[ \] \{ \}} key))
+                        (if (contains? #{\[ \{} key) -1 1))
+        n (count (:children pane))]
+    (when (and direction (= :key-down (:signal e)) (not (consumed? e)) (pos? n))
+      (set-slot! pane :selected-index (mod (+ (or (:selected-index pane) 0) direction) n))
+      (consume! e)
+      true)))
+
+(defmethod handle-event :around [(w widget) (e key-event)]
+  (let [pane (tabbed-ancestor w)]
+    (when-not (and pane (handle-tab-key pane e))
+      (call-next-method))))
+
+(defmethod measure [(bar tab-bar-widget)]
+  (let [[sw sh] (outer-size (:start bar))
+        [ew eh] (outer-size (:end bar))
+        [nw nh] (let [b (current-backend)] (in-ui (fn [] (backend-natural-size b bar))))]
+    [(+ sw ew nw) (max nh (+ 8 sh) (+ 8 eh))]))
+
+(defmethod arrange [(bar tab-bar-widget) width height]
+  (let [[sw _] (outer-size (:start bar))
+        [ew _] (outer-size (:end bar))
+        sw (min width sw)
+        ew (min (- width sw) ew)]
+    (allocate-in-cell (:start bar) 0 0 sw height)
+    (allocate-in-cell (:end bar) (- width ew) 0 ew height)))
+
+(defgeneric backend-tab-page-area [backend pane width height]
+  "The [width height] of the area the pane's pages get in a pane of width by height.")
+
+(defmethod backend-tab-page-area [(b backend) pane width height]
+  [width (max 0 (- height (last (outer-size (:tab-bar pane)))))])
+
+(defmethod measure [(pane tabbed-pane-widget)]
+  (let [[bw bh] (outer-size (:tab-bar pane))
+        sizes (map outer-size (:children pane))]
+    [(max bw (reduce max 0 (map first sizes))) (+ bh (reduce max 0 (map second sizes)))]))
+
+(defmethod arrange [(pane tabbed-pane-widget) width height]
+  (let [bar (:tab-bar pane)
+        [_ bh] (outer-size bar)
+        bh (min height bh)]
+    (allocate bar 0 (if (= :bottom (:tab-position pane)) (- height bh) 0) width bh)
+    (let [[pw ph] (let [b (current-backend)] (in-ui (fn [] (backend-tab-page-area b pane width height))))]
+      (doseq [p (:children pane)]
+        (allocate-in-cell p 0 0 pw ph)))))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Canvases and drawing

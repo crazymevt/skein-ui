@@ -705,3 +705,73 @@ emits :key-down. Returns the event, which a handler may have consumed."
   "The colors the widget's native control was given by palettes, by role."
   [w]
   (:palette-colors @(:native w)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Stacks and tabbed panes
+
+(defn- tab-width
+  "How wide the headless tab of page is: its title, icon and close button."
+  [pane page]
+  (+ 24 (* char-width (count (ui/tab-title pane page)))
+     (if (:tab-icon page) 20 0)
+     (if (:tab-closable page) 20 0)
+     (if-let [a (:tab-accessory page)] (+ 6 (first (ui/outer-size a))) 0)))
+
+(defmethod natural-size [(bar ui/tab-bar-widget)]
+  (let [pane (:pane bar)]
+    [(reduce + 0 (map (fn [p] (tab-width pane p)) (:children pane))) 28]))
+
+(defmethod ui/backend-tab-update [(b headless-backend) pane page]
+  (swap! (:native page) assoc :tab {:label (ui/tab-title pane page) :tooltip (:tab-tooltip page)
+                                    :icon (:tab-icon page) :closable (:tab-closable page)
+                                    :accessory (:tab-accessory page)}))
+
+(defmethod ui/backend-tab-move [(b headless-backend) pane page old index]
+  (update-slot! b :log conj [:tab-move old index]))
+
+(defmethod ui/backend-tab-reveal [(b headless-backend) pane page]
+  (swap! (:native pane) assoc :revealed page))
+
+(defmethod ui/backend-tab-at-point [(b headless-backend) pane x y]
+  ;; Tabs sit side by side from the left of the bar.
+  (loop [left 0 pages (:children pane)]
+    (when-let [p (first pages)]
+      (let [w (tab-width pane p)]
+        (if (< x (+ left w)) p (recur (+ left w) (rest pages)))))))
+
+(defn tab
+  "What the page's headless tab shows: {:label :tooltip :icon :closable :accessory}."
+  [page]
+  (:tab @(:native page)))
+
+(defn tab-x
+  "The x of the middle of the page's tab in its pane's tab bar."
+  [pane page]
+  (+ (reduce + 0 (map (fn [p] (tab-width pane p))
+                      (take (index-of (:children pane) page) (:children pane))))
+     (quot (tab-width pane page) 2)))
+
+(defn click-tab!
+  "Click the page's tab, as the user would: the pane shows it."
+  [pane page]
+  (ui/page-changed-by-user! pane (index-of (:children pane) page)))
+
+(defn close-tab!
+  "Click the close button of the page's tab, as the user would. True if it closed."
+  [pane page]
+  (ui/close-page! pane page))
+
+(defn drag-tab!
+  "Drag the page's tab to index in its own pane, as the user would."
+  [pane page index]
+  (ui/page-moved-by-user! pane page index))
+
+(defn drop-tab!
+  "Drag the page's tab and drop it on pane at index, as the user would. True if it moved."
+  [page pane index]
+  (ui/page-dropped-by-user! page pane index))
+
+(defn right-click-tab!
+  "Right-click the page's tab, as the user would."
+  [pane page]
+  (ui/tab-context-requested! pane (tab-x pane page) 10 #{}))

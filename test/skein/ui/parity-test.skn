@@ -157,3 +157,82 @@
   (is (thrown-with-msg? error "a window's" (ui/label {:appearance :system})))
   (is (thrown-with-msg? error "surface role" (ui/vbox {:surface :ceiling})))
   (is (thrown-with-msg? error "palette role" (ui/label {:palette {:sky "#0000ff"}}))))
+
+(deftest stacks
+  (let [seen (atom [])
+        a (ui/label {:text "abcd" :tab-label "A"})
+        b (ui/label {:text "abcdefgh"})
+        s (ui/stack {:on-page-changed (fn [e] (swap! seen conj (:index e)))} a b)]
+    (is (= "Page" (:tab-label b)))
+    (is (= [true false] (mapv :visible [a b])))
+    (is (= [64 16] (ui/preferred-size s)) "sized for the largest page, shown or not")
+    (ui/select-page! s b)
+    (is (= [false true] (mapv :visible [a b])))
+    (is (= [1] @seen) "a stack emits :page-changed for any change")
+    (ui/remove! s b)
+    (is (= 0 (:selected-index s)))
+    (is (:visible a))
+    (is (thrown-with-msg? error "no page" (set-slot! s :selected-index 5))))
+  (let [g (ui/label {:text "general" :tab-label "General"})
+        o (ui/label {:text "other" :tab-label "Other"})
+        n (ui/vertical-notebook {:sidebar-width 100} g o)
+        l (:page-list n)]
+    (is (= ["General" "Other"] (mapv (fn [i] (ui/item-text l i)) (range 2))))
+    (headless/select-rows! l [1])
+    (is (= 1 (:selected-index n)))
+    (is (= [1] (:selected-indices l)))
+    (ui/show! (ui/window {} n))
+    (is (= [0 0 100 (nth (headless/bounds n) 3)] (headless/bounds l)))
+    (is (= 112 (first (headless/bounds o))) "the page beside the list")))
+
+(deftest tabbed-panes
+  (let [seen (atom [])
+        note (fn [e] (swap! seen conj [(:signal e) (:index e)]))
+        a (ui/text-view {:tab-label "Notes" :tab-tooltip "Your notes"})
+        b (ui/text-view {:tab-closable false})
+        c (ui/text-view {:tab-label (ui/label {:text "Live"})})
+        p (ui/tabbed-pane {:drag-group :docs :on-page-changed note :on-page-moved note
+                           :on-page-closed note}
+                          a b c)
+        q (ui/tabbed-pane {:drag-group :docs :on-page-received note})
+        w (ui/window {:width 600 :height 400} (ui/hbox {} p q))]
+    (ui/show! w)
+    (testing "tabs show their fields"
+      (is (= 0 (:selected-index p)))
+      (is (= {:label "Notes" :tooltip "Your notes" :icon nil :closable true :accessory nil}
+             (headless/tab a)))
+      (is (= "Page 2" (:label (headless/tab b))))
+      (is (= "Live" (ui/tab-title p c)) "a widget label's text")
+      (is (identical? (:tab-bar p) (:parent (:tab-label c))) "the tab bar holds the label"))
+    (testing "choosing, moving and closing tabs"
+      (headless/click-tab! p b)
+      (headless/drag-tab! p a 2)
+      (is (= [b c a] (:children p)))
+      (is (= 0 (:selected-index p)) "b is still shown, now first")
+      (is (identical? a (ui/tab-at-point p (headless/tab-x p a) 5)))
+      (set-slot! a :tab-label "Renamed")
+      (is (= "Renamed" (:label (headless/tab a))))
+      (ui/on p :page-close-request (fn [e] (when (identical? (:value e) c) (ui/veto e))))
+      (is (not (headless/close-tab! p c)) "vetoed")
+      (is (headless/close-tab! p a))
+      (is (headless/destroyed? a)))
+    (testing "dropping a tab on another pane of its drag group"
+      (is (headless/drop-tab! c q 0))
+      (is (= [b] (:children p)))
+      (is (= [c] (:children q)))
+      (is (= "Live" (:tab-label c)) "a widget label becomes its text"))
+    (is (= [[:page-moved 2] [:page-closed 2] [:page-received 0]]
+           (filterv (fn [[s _]] (not= s :page-changed)) @seen)))
+    (is (= [0 1] (take 2 (keep (fn [[s i]] (when (= s :page-changed) i)) @seen)))
+        "the first page shown, then the clicked one")
+    (testing "Control-Tab switches pages"
+      (ui/add! p (ui/text-view {}))
+      (let [e (headless/key-down! b "Control+Tab")]
+        (is (ui/consumed? e))
+        (is (= 1 (:selected-index p)))))
+    (testing "a right-click on a tab"
+      (let [asked (atom nil)]
+        (ui/on p :tab-context-request (fn [e] (reset! asked (:page e)) (ui/consume! e)))
+        (headless/right-click-tab! p b)
+        (is (identical? b @asked))))
+    (ui/close! w)))
