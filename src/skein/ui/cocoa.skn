@@ -55,6 +55,25 @@ widgets made of several views, such as a spin button.")
 (defmethod layout-subviews [w width height]
   nil)
 
+(defgeneric native-row-count [w]
+  "How many rows w's table shows (a list box or table).")
+
+(defgeneric native-cell-text [w row column]
+  "The text w's table shows in row at column (indices).")
+
+(defgeneric native-double-action [w sender]
+  "The user double-clicked a row of w's table or outline view.")
+
+(defgeneric native-column-clicked [w column]
+  "The user clicked the title of column, an NSTableColumn of w's table.")
+
+(defgeneric native-outline [w op item arg]
+  "Answer w's outline view about the item (a pointer, null for the roots): op is :count,
+:child (arg is the index), :expandable? or :text (arg is the column index).")
+
+(defgeneric native-expanded [w item expanded]
+  "The user opened (expanded true) or closed the item (a pointer) in w's outline view.")
+
 (defgeneric native-natural-size [w]
   "w's natural [width height]: by default its AppKit view's fitting size.")
 
@@ -111,6 +130,55 @@ widgets made of several views, such as a spin button.")
   (when-let [w (objc/object-for tab-view)]
     (native-selection-changed w item)))
 
+;; Tables and outline views: their data source and delegate.
+
+(ffi/defcallback row-count-imp i64 [self ptr, cmd ptr, tv ptr]
+  (if-let [w (objc/object-for tv)] (native-row-count w) 0))
+
+(defn- column-index [tv col]
+  (objc/send-p-long (objc/send tv (objc/sel "tableColumns")) (objc/sel "indexOfObject:") col))
+
+(ffi/defcallback cell-value-imp ptr [self ptr, cmd ptr, tv ptr, col ptr, row i64]
+  (if-let [w (objc/object-for tv)]
+    (objc/ns-string (native-cell-text w row (column-index tv col)))
+    (ffi/null)))
+
+(ffi/defcallback double-action-imp void [self ptr, cmd ptr, sender ptr]
+  (when-let [w (objc/object-for sender)]
+    (native-double-action w sender)))
+
+(ffi/defcallback column-clicked-imp void [self ptr, cmd ptr, tv ptr, col ptr]
+  (when-let [w (objc/object-for tv)]
+    (native-column-clicked w col)))
+
+(ffi/defcallback outline-count-imp i64 [self ptr, cmd ptr, ov ptr, item ptr]
+  (if-let [w (objc/object-for ov)] (native-outline w :count item nil) 0))
+
+(ffi/defcallback outline-child-imp ptr [self ptr, cmd ptr, ov ptr, index i64, item ptr]
+  (if-let [w (objc/object-for ov)] (native-outline w :child item index) (ffi/null)))
+
+(ffi/defcallback outline-expandable-imp bool [self ptr, cmd ptr, ov ptr, item ptr]
+  (if-let [w (objc/object-for ov)] (boolean (native-outline w :expandable? item nil)) false))
+
+(ffi/defcallback outline-value-imp ptr [self ptr, cmd ptr, ov ptr, col ptr, item ptr]
+  (if-let [w (objc/object-for ov)]
+    (objc/ns-string (native-outline w :text item (column-index ov col)))
+    (ffi/null)))
+
+(defn- note-item
+  "The item an outline view notification is about."
+  [note]
+  (objc/send-p (objc/send note (objc/sel "userInfo")) (objc/sel "objectForKey:")
+               (objc/ns-string "NSObject")))
+
+(ffi/defcallback item-expanded-imp void [self ptr, cmd ptr, note ptr]
+  (when-let [w (objc/object-for (objc/send note (objc/sel "object")))]
+    (native-expanded w (note-item note) true)))
+
+(ffi/defcallback item-collapsed-imp void [self ptr, cmd ptr, note ptr]
+  (when-let [w (objc/object-for (objc/send note (objc/sel "object")))]
+    (native-expanded w (note-item note) false)))
+
 ;;; ------------------------------------------------------------------------------------
 ;;; The backend, and running on the main thread
 
@@ -121,11 +189,26 @@ widgets made of several views, such as a spin button.")
   (target :init nil :doc "The target of every control's action.")
   (window-delegate :init nil)
   (text-delegate :init nil)
+  (data-source :init nil :doc "The data source and delegate of tables and outline views.")
   (modes :init nil :doc "An NSArray of the run loop modes AppKit runs in."))
 
 (defn- define-classes! []
   (objc/define-class! "SkeinWaker" "NSObject" [["drain:" drain-imp "v@:@"]])
-  (objc/define-class! "SkeinTarget" "NSObject" [["action:" action-imp "v@:@"]])
+  (objc/define-class! "SkeinTarget" "NSObject" [["action:" action-imp "v@:@"]
+                                                ["doubleAction:" double-action-imp "v@:@"]])
+  (objc/define-class! "SkeinDataSource" "NSObject"
+                      [["numberOfRowsInTableView:" row-count-imp "q@:@"]
+                       ["tableView:objectValueForTableColumn:row:" cell-value-imp "@@:@@q"]
+                       ["tableViewSelectionDidChange:" selection-imp "v@:@"]
+                       ["tableView:didClickTableColumn:" column-clicked-imp "v@:@@"]
+                       ["outlineView:numberOfChildrenOfItem:" outline-count-imp "q@:@@"]
+                       ["outlineView:child:ofItem:" outline-child-imp "@@:@q@"]
+                       ["outlineView:isItemExpandable:" outline-expandable-imp "B@:@@"]
+                       ["outlineView:objectValueForTableColumn:byItem:" outline-value-imp
+                        "@@:@@@"]
+                       ["outlineViewSelectionDidChange:" selection-imp "v@:@"]
+                       ["outlineViewItemDidExpand:" item-expanded-imp "v@:@"]
+                       ["outlineViewItemDidCollapse:" item-collapsed-imp "v@:@"]])
   (objc/define-class! "SkeinWindowDelegate" "NSObject"
                       [["windowShouldClose:" should-close-imp "B@:@"]
                        ["windowDidResize:" did-resize-imp "v@:@"]])
@@ -160,7 +243,8 @@ widgets made of several views, such as a spin button.")
              :waker (objc/new-object "SkeinWaker")
              :target (objc/new-object "SkeinTarget")
              :window-delegate (objc/new-object "SkeinWindowDelegate")
-             :text-delegate (objc/new-object "SkeinTextDelegate"))))))
+             :text-delegate (objc/new-object "SkeinTextDelegate")
+             :data-source (objc/new-object "SkeinDataSource"))))))
 
 (defn- wake-main-thread!
   "Make the event loop run the work queued for the main thread soon, also while a menu is
@@ -1054,6 +1138,303 @@ keyword gives the platform's own, which follows dark mode."
       (ui/scrolled-by-user! s (int (math/round x)) (int (math/round y))))))
 
 ;;; ------------------------------------------------------------------------------------
+;;; List boxes, tables and trees: NSTableView and NSOutlineView in an NSScrollView
+
+(defn- table-of
+  "The NSTableView or NSOutlineView inside the widget's scroll view."
+  [w]
+  (objc/send (view w) (objc/sel "documentView")))
+
+(defn- make-table [w class-name]
+  (let [scroll (init-frame "NSScrollView")
+        tv (init-frame class-name)
+        b (ui/current-backend)]
+    (objc/send-p-void tv (objc/sel "setDataSource:") (:data-source b))
+    (objc/send-p-void tv (objc/sel "setDelegate:") (:data-source b))
+    (objc/send-p-void tv (objc/sel "setTarget:") (:target b))
+    (objc/send-p-void tv (objc/sel "setDoubleAction:") (objc/sel "doubleAction:"))
+    (objc/send-l-void tv (objc/sel "setColumnAutoresizingStyle:") 1) ; uniform
+    (objc/send-b-void scroll (objc/sel "setHasVerticalScroller:") true)
+    (objc/send-p-void scroll (objc/sel "setDocumentView:") tv)
+    (also-register! tv w)
+    (objc/release tv)
+    scroll))
+
+(defn- add-column!
+  "Add a column titled title (width pixels wide, if given) to the table view. Returns the
+NSTableColumn."
+  [tv title width alignment]
+  (let [n (objc/send-long (objc/send tv (objc/sel "tableColumns")) (objc/sel "count"))
+        col (objc/send-p (objc/alloc "NSTableColumn") (objc/sel "initWithIdentifier:")
+                         (objc/ns-string (str n)))]
+    (objc/send-p-void (objc/send col (objc/sel "headerCell")) (objc/sel "setStringValue:")
+                      (objc/ns-string (or title "")))
+    (when width (objc/send-d-void col (objc/sel "setWidth:") (f64 width)))
+    (when alignment
+      (objc/send-l-void (objc/send col (objc/sel "dataCell")) (objc/sel "setAlignment:")
+                        (text-alignment alignment)))
+    (objc/send-l-void col (objc/sel "setResizingMask:") 3)
+    (objc/send-p-void tv (objc/sel "addTableColumn:") col)
+    (objc/release col)
+    col))
+
+(defn- remove-columns! [tv]
+  (let [cols (objc/send (objc/send tv (objc/sel "tableColumns")) (objc/sel "copy"))
+        n (objc/send-long cols (objc/sel "count"))]
+    (doseq [i (range n)]
+      (objc/send-p-void tv (objc/sel "removeTableColumn:")
+                        (objc/send-l cols (objc/sel "objectAtIndex:") i)))
+    (objc/release cols)))
+
+(defn- show-headers! [tv show]
+  (if show
+    (let [h (objc/new-object "NSTableHeaderView")]
+      (objc/send-p-void tv (objc/sel "setHeaderView:") h)
+      (objc/release h))
+    (objc/send-p-void tv (objc/sel "setHeaderView:") (ffi/null))))
+
+(defn- selected-rows
+  "The table view's selected rows, in order."
+  [tv]
+  (let [set (objc/send tv (objc/sel "selectedRowIndexes"))
+        not-found 9223372036854775807]
+    (loop [i (objc/send-long set (objc/sel "firstIndex")) rows []]
+      (if (or (= i not-found) (< i 0))
+        rows
+        (recur (objc/send-l-long set (objc/sel "indexGreaterThanIndex:") i) (conj rows i))))))
+
+(defn- select-rows! [tv rows]
+  (let [set (objc/new-object "NSMutableIndexSet")]
+    (doseq [r rows] (objc/send-l-void set (objc/sel "addIndex:") r))
+    (quietly (fn [] (objc/send-pb-void tv (objc/sel "selectRowIndexes:byExtendingSelection:")
+                                       set false)))
+    (objc/release set)))
+
+(defn- reload! [tv]
+  (quietly (fn [] (objc/send-void tv (objc/sel "reloadData")))))
+
+(defn- activated-row
+  "The row a double-click or Return activated: the clicked row, else the selected one."
+  [tv]
+  (let [clicked (objc/send-long tv (objc/sel "clickedRow"))]
+    (if (>= clicked 0) clicked (objc/send-long tv (objc/sel "selectedRow")))))
+
+;;; List boxes
+
+(defmethod make-native [(l ui/list-box-widget)]
+  (let [scroll (make-table l "NSTableView")
+        tv (objc/send scroll (objc/sel "documentView"))]
+    (add-column! tv "" nil nil)
+    (show-headers! tv false)
+    scroll))
+
+(defmethod native-row-count [(l ui/list-box-widget)]
+  (count (:items l)))
+
+(defmethod native-cell-text [(l ui/list-box-widget) row column]
+  (ui/item-text l row))
+
+(defmethod set-native [(l ui/list-box-widget) (p (= :items)) v]
+  (reload! (table-of l))
+  (select-rows! (table-of l) (:selected-indices l)))
+
+(defmethod set-native [(l ui/list-box-widget) (p (= :item-label)) v]
+  (reload! (table-of l)))
+
+(defmethod set-native [(l ui/list-box-widget) (p (= :selected-indices)) v]
+  (select-rows! (table-of l) v))
+
+(defmethod set-native [(l ui/list-box-widget) (p (= :selection-mode)) v]
+  (objc/send-b-void (table-of l) (objc/sel "setAllowsMultipleSelection:") (= v :multiple)))
+
+(defmethod set-native [(l ui/list-box-widget) (p (= :border)) v]
+  (set-long! l "setBorderType:" (if v 2 0)))
+
+(defmethod set-native [(l ui/list-box-widget) (p (= :alternating)) v]
+  (objc/send-b-void (table-of l) (objc/sel "setUsesAlternatingRowBackgroundColors:") (boolean v)))
+
+(defmethod native-natural-size [(l ui/list-box-widget)]
+  [160 120])
+
+(defmethod native-selection-changed [(l ui/list-box-widget) tv]
+  (when-not (quiet?)
+    (let [rows (selected-rows tv)]
+      (when (not= rows (vec (:selected-indices l)))
+        (ui/selection-changed-by-user! l rows)))))
+
+(defmethod native-double-action [(l ui/list-box-widget) tv]
+  (let [row (activated-row tv)]
+    (when (>= row 0)
+      (ui/row-activated-by-user! l row 2))))
+
+;;; Tables
+
+(defmethod native-cell-text [(t ui/table-view-widget) row column]
+  (ui/table-cell-text t row column))
+
+(defn- show-sort! [t]
+  (let [tv (table-of t)
+        cols (objc/send tv (objc/sel "tableColumns"))
+        i (when-let [c (:sort-column t)] (index-of (:columns t) c))]
+    (doseq [k (range (objc/send-long cols (objc/sel "count")))]
+      (objc/send-pp-void tv (objc/sel "setIndicatorImage:inTableColumn:")
+                         (if (= k i)
+                           (objc/send-p (objc/cls "NSImage") (objc/sel "imageNamed:")
+                                        (objc/ns-string (if (:sort-descending t)
+                                                          "NSDescendingSortIndicator"
+                                                          "NSAscendingSortIndicator")))
+                           (ffi/null))
+                         (objc/send-l cols (objc/sel "objectAtIndex:") k)))))
+
+(defmethod set-native [(t ui/table-view-widget) (p (= :columns)) cols]
+  (let [tv (table-of t)]
+    (remove-columns! tv)
+    (doseq [c cols] (add-column! tv (:title c) (:width c) (:alignment c)))
+    (show-headers! tv (:headers t))
+    (reload! tv)
+    (show-sort! t)))
+
+(defmethod set-native [(t ui/table-view-widget) (p (= :headers)) v]
+  (show-headers! (table-of t) v))
+
+(defmethod set-native [(t ui/table-view-widget) (p (= :sort-column)) v]
+  (show-sort! t))
+
+(defmethod set-native [(t ui/table-view-widget) (p (= :sort-descending)) v]
+  (show-sort! t))
+
+(defmethod native-natural-size [(t ui/table-view-widget)]
+  [(max 160 (reduce + 0 (map (fn [c] (or (:width c) 100)) (:columns t)))) 120])
+
+(defmethod native-column-clicked [(t ui/table-view-widget) col]
+  (ui/column-clicked-by-user! t (column-index (table-of t) col)))
+
+;;; Trees
+
+(def ^:private item-ids
+  "The ids of tree items: [outline view address, item key] -> id, and id -> the item. An
+outline view knows each item by an NSNumber of its id (a tagged pointer, so the same
+object every time)."
+  (atom {:next 1 :ids {} :items {}}))
+
+(defn- item-ptr
+  "The NSNumber the tree's outline view knows item by."
+  [t item]
+  (let [k [(ffi/address (table-of t)) ((:item-key t) item)]
+        id (or (get-in @item-ids [:ids k])
+               (let [{n :next} (swap! item-ids
+                                      (fn [m] (-> m (update :next inc)
+                                                  (assoc-in [:ids k] (:next m)))))]
+                 (dec n)))]
+    (swap! item-ids assoc-in [:items id] item)
+    (objc/send-l (objc/cls "NSNumber") (objc/sel "numberWithLong:") id)))
+
+(defn- item-of
+  "The tree item the outline view's pointer p stands for (nil for null: the roots)."
+  [p]
+  (when-not (ffi/null? p)
+    (get-in @item-ids [:items (objc/send-long p (objc/sel "longValue"))])))
+
+(defmethod make-native [(t ui/tree-view-widget)]
+  (let [scroll (make-table t "NSOutlineView")
+        ov (objc/send scroll (objc/sel "documentView"))
+        col (add-column! ov "" nil nil)]
+    (objc/send-p-void ov (objc/sel "setOutlineTableColumn:") col)
+    (show-headers! ov false)
+    scroll))
+
+(defmethod native-outline [(t ui/tree-view-widget) op p arg]
+  (let [item (item-of p)
+        children (fn [] (ui/tree-children t item))]
+    (case op
+      :count (count (children))
+      :child (item-ptr t (nth (children) arg))
+      :expandable? (seq (ui/tree-children t item))
+      :text (ui/tree-cell-text t item arg))))
+
+(defn- show-expansion!
+  "Open and close the outline view's items as the tree's :expanded says, from the roots
+down through the open ones."
+  [t]
+  (let [ov (table-of t)
+        walk (fn walk [items]
+               (doseq [item items]
+                 (if (ui/expanded? t item)
+                   (do (quietly (fn [] (objc/send-p-void ov (objc/sel "expandItem:")
+                                                         (item-ptr t item))))
+                       (walk (ui/tree-children t item)))
+                   (quietly (fn [] (objc/send-p-void ov (objc/sel "collapseItem:")
+                                                     (item-ptr t item)))))))]
+    (walk (ui/tree-children t nil))))
+
+(defn- show-tree-selection! [t]
+  (let [ov (table-of t)
+        rows (keep (fn [item]
+                     (let [r (objc/send-p-long ov (objc/sel "rowForItem:") (item-ptr t item))]
+                       (when (>= r 0) r)))
+                   (:selection t))]
+    (select-rows! ov (sort rows))))
+
+(defmethod set-native [(t ui/tree-view-widget) (p (= :roots)) v]
+  (reload! (table-of t))
+  (show-expansion! t)
+  (show-tree-selection! t))
+
+(defmethod set-native [(t ui/tree-view-widget) (p (= :expanded)) v]
+  (show-expansion! t))
+
+(defmethod set-native [(t ui/tree-view-widget) (p (= :selection)) v]
+  (show-tree-selection! t))
+
+(defmethod set-native [(t ui/tree-view-widget) (p (= :item-label)) v]
+  (reload! (table-of t)))
+
+(defmethod set-native [(t ui/tree-view-widget) (p (= :selection-mode)) v]
+  (objc/send-b-void (table-of t) (objc/sel "setAllowsMultipleSelection:") (= v :multiple)))
+
+(defmethod set-native [(t ui/tree-view-widget) (p (= :headers)) v]
+  (show-headers! (table-of t) v))
+
+(defmethod set-native [(t ui/tree-view-widget) (p (= :columns)) cols]
+  (when (seq cols)
+    (let [ov (table-of t)]
+      (remove-columns! ov)
+      (doseq [c cols] (add-column! ov (:title c) (:width c) (:alignment c)))
+      (objc/send-p-void ov (objc/sel "setOutlineTableColumn:")
+                        (objc/send-l (objc/send ov (objc/sel "tableColumns"))
+                                     (objc/sel "objectAtIndex:") 0))
+      (reload! ov)
+      (show-expansion! t))))
+
+(defmethod ui/backend-tree-refresh [(b cocoa-backend) t item]
+  (let [ov (table-of t)]
+    (if item
+      (quietly (fn [] (objc/send-pb-void ov (objc/sel "reloadItem:reloadChildren:")
+                                         (item-ptr t item) true)))
+      (reload! ov))
+    (show-expansion! t)))
+
+(defmethod native-natural-size [(t ui/tree-view-widget)]
+  [160 120])
+
+(defmethod native-expanded [(t ui/tree-view-widget) p expanded]
+  (when-not (quiet?)
+    (when-let [item (item-of p)]
+      (ui/expansion-changed-by-user! t item expanded))))
+
+(defmethod native-selection-changed [(t ui/tree-view-widget) ov]
+  (when-not (quiet?)
+    (let [items (mapv (fn [r] (item-of (objc/send-l ov (objc/sel "itemAtRow:") r)))
+                      (selected-rows ov))]
+      (when (not= items (vec (:selection t)))
+        (ui/tree-selection-changed-by-user! t items)))))
+
+(defmethod native-double-action [(t ui/tree-view-widget) ov]
+  (let [row (activated-row ov)]
+    (when (>= row 0)
+      (ui/tree-item-activated-by-user! t (item-of (objc/send-l ov (objc/sel "itemAtRow:") row))))))
+
+;;; ------------------------------------------------------------------------------------
 ;;; For tests: the real controls, read and acted on
 
 (defn native-frame
@@ -1174,3 +1555,45 @@ string value."
   "The text in a text view's NSTextView."
   [v]
   (objc/call-with-pool (fn [] (objc/string-of (objc/send (text-view-of v) (objc/sel "string"))))))
+
+(defn row-count
+  "How many rows a list box's, table's or tree's view shows."
+  [w]
+  (objc/send-long (table-of w) (objc/sel "numberOfRows")))
+
+(defn cell-string
+  "The text in a list box's, table's or tree's view at row and column, as AppKit draws it."
+  [w row column]
+  (objc/call-with-pool
+   (fn [] (objc/string-of (objc/send (objc/send-ll (table-of w)
+                                                   (objc/sel "preparedCellAtColumn:row:")
+                                                   column row)
+                                     (objc/sel "stringValue"))))))
+
+(defn select-rows-natively!
+  "Select rows in a list box's, table's or tree's view, as the user does."
+  [w rows]
+  (let [set (objc/new-object "NSMutableIndexSet")]
+    (doseq [r rows] (objc/send-l-void set (objc/sel "addIndex:") r))
+    (objc/send-pb-void (table-of w) (objc/sel "selectRowIndexes:byExtendingSelection:") set false)
+    (objc/release set)))
+
+(defn double-click-selected!
+  "Send a list box's, table's or tree's double action for its selected row."
+  [w]
+  (let [tv (table-of w)]
+    (objc/send-pp-void tv (objc/sel "sendAction:to:")
+                       (objc/send tv (objc/sel "doubleAction")) (objc/send tv (objc/sel "target")))))
+
+(defn click-column-title!
+  "Tell a table's delegate its column at index was clicked, as AppKit does."
+  [t index]
+  (let [tv (table-of t)]
+    (objc/send-pp-void (objc/send tv (objc/sel "delegate")) (objc/sel "tableView:didClickTableColumn:")
+                       tv (objc/send-l (objc/send tv (objc/sel "tableColumns"))
+                                       (objc/sel "objectAtIndex:") index))))
+
+(defn expand-natively!
+  "Open the tree's item in its outline view, as clicking its disclosure triangle does."
+  [t item]
+  (objc/send-p-void (table-of t) (objc/sel "expandItem:") (item-ptr t item)))
