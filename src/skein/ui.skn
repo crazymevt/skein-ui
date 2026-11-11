@@ -3944,10 +3944,18 @@ place completion popups."
          side (if (or (<= (+ below h) (+ sy sh)) (< above sy)) :below :above)]
      [(max sx (min ax (- (+ sx sw) w))) (if (= side :below) below above) side])))
 
-(defn caret-position
-  "Where the caret is in the text view, as a character position."
-  [view]
-  (second (text-selection view)))
+(defgeneric caret-position [view]
+  "Where the caret is in the text or code view, as a character position.")
+
+(defmethod caret-position [(v text-view-widget)]
+  (second (text-selection v)))
+
+(defgeneric has-caret? [w]
+  "True for widgets with a text caret, which a completion popup can be shown under.")
+
+(defmethod has-caret? [w] false)
+
+(defmethod has-caret? [(v text-view-widget)] true)
 
 (defn caret-rectangle
   "Where the caret is, or would be at position, in the text view, [x y width height] from
@@ -4247,7 +4255,7 @@ in a handle-event method of your own that would take one of these keys."
 
 (defn show-completion-popup!
   "Show the completion popup for widget without taking the keyboard from it: below
-:rectangle ([x y width height] in widget) or, for a text view, below the caret at
+:rectangle ([x y width height] in widget) or, for a text or code view, below the caret at
 :position (the caret's own if not given), or above when there is no room below. :items,
 if given, become its items; with none it closes, or isn't shown. Shown again, it moves.
 From then on widget's :key-down events go through handle-completion-key first, and a click
@@ -4261,7 +4269,7 @@ in widget or leaving its window closes it. Returns the popup, or nil with no ite
        (when (and (:shown p) (not (identical? widget (:owner p))))
          (close-surface! p :closed))
        (let [anchor (or (:rectangle opts)
-                        (if (instance? text-view-widget widget)
+                        (if (has-caret? widget)
                           (or (:position opts) :caret)
                           (widget-rectangle widget)))]
          (set-slot! p :owner widget)
@@ -4373,6 +4381,914 @@ stop-timer! stops."
   [url]
   (let [b (current-backend)] (in-ui (fn [] (backend-open-url b url))))
   nil)
+
+;;; ------------------------------------------------------------------------------------
+;;; Text buffers: text for editors, shared by any number of code views. A buffer is plain
+;;; Skein, with no native counterpart: backends mirror it. Positions count characters
+;;; from 0. Every change goes through replace-buffer-range!, which updates the line index, bumps
+;;; the revision, records the undo history and emits :changed.
+
+(defclass buffer-change-event [event]
+  "A text buffer's text changed: the characters from :start to :old-end were replaced by
+those from :start to :new-end. :removed-text and :inserted-text are the old and new text,
+:revision the buffer's revision after the change."
+  (start :init 0)
+  (old-end :init 0)
+  (new-end :init 0)
+  (removed-text :init "")
+  (inserted-text :init "")
+  (revision :init 0))
+
+(defclass text-buffer [emitter]
+  "Text to edit, shared by any number of code views: its lines, an index of where each
+starts, a revision that grows with every change, an undo history, and :changed (a
+buffer-change-event) for each change. Make one with make-text-buffer."
+  (lines :cell :atom :init [""] :doc "The text's lines, without their newlines.")
+  (starts :cell :atom :init [0] :doc "Where each line starts.")
+  (length :cell :atom :init 0 :doc "The number of characters.")
+  (astral :cell :atom :init 0
+          :doc "How many characters are outside the Basic Multilingual Plane (two UTF-16
+units each).")
+  (revision :cell :atom :init 0 :doc "A number that grows with every change.")
+  (history-limit :cell :atom :init 1000
+                 :doc "How many changes undo! can take back; 0 keeps no history.")
+  (undo-stack :cell :atom :init ())
+  (redo-stack :cell :atom :init ())
+  (group :cell :atom :init [])
+  (group-depth :cell :atom :init 0)
+  (undoing :cell :atom :init false)
+  (views :cell :atom :init [] :doc "The code views showing it.")
+  (mirror :cell :atom :init nil :doc "The id of its :changed handler that updates the views."))
+
+(declare-widget! text-buffer {:signals {:changed buffer-change-event}})
+
+(def ^:private replace-buffer-range!)
+
+(def ^:dynamic *suppress-history*
+  "True while changes are made that undo! shouldn't see, such as a buffer's first text."
+  false)
+
+(defn make-text-buffer
+  "A new text buffer: (make-text-buffer {:text \"(defn f [x] x)\" :history-limit 1000}).
+:history-limit is how many changes undo! can take back; 0 keeps no history, for programs
+that keep their own."
+  ([] (make-text-buffer {}))
+  ([opts]
+   (let [b (make text-buffer :history-limit (get opts :history-limit 1000))
+         text (str (or (:text opts) ""))]
+     (when (pos? (count text))
+       (binding [*suppress-history* true]
+         (replace-buffer-range! b 0 0 text)))
+     (set-slot! b :revision 0)
+     b)))
+
+(defn buffer-length
+  "The number of characters in the buffer."
+  [b]
+  (:length b))
+
+(defn buffer-line-count
+  "The number of lines in the buffer: one more than its number of newlines."
+  [b]
+  (count (:lines b)))
+
+(defn- check-range [b start end]
+  (when-not (and (integer? start) (integer? end) (<= 0 start end (:length b)))
+    (error (str "the range " start " to " end " is outside the buffer, which has "
+                (:length b) " characters"))))
+
+(defn line-start
+  "Where line (counting from 0) of the buffer starts."
+  [b line]
+  (when-not (and (integer? line) (< -1 line (count (:lines b))))
+    (error (str "line " line " is not in the buffer, which has " (count (:lines b)) " lines")))
+  (nth (:starts b) line))
+
+(defn line-end
+  "Where line of the buffer ends, before its newline."
+  [b line]
+  (+ (line-start b line) (count (nth (:lines b) line))))
+
+(defn line-text
+  "The text of line of the buffer, without its newline."
+  [b line]
+  (line-start b line)
+  (nth (:lines b) line))
+
+(defn position-line
+  "The line position is on in the buffer, counting from 0."
+  [b position]
+  (let [starts (:starts b)]
+    (loop [lo 0 hi (dec (count starts))]
+      (if (< lo hi)
+        (let [mid (quot (+ lo hi 1) 2)]
+          (if (<= (nth starts mid) position) (recur mid hi) (recur lo (dec mid))))
+        lo))))
+
+(defn position-column
+  "How many characters position is from the start of its line."
+  [b position]
+  (- position (line-start b (position-line b position))))
+
+(defn buffer-text
+  "The buffer's text, all of it or from start to end."
+  ([b] (string/join "\n" (:lines b)))
+  ([b start end]
+   (check-range b start end)
+   (let [ls (position-line b start)
+         le (position-line b end)
+         lines (:lines b)
+         starts (:starts b)]
+     (if (= ls le)
+       (subs (nth lines ls) (- start (nth starts ls)) (- end (nth starts ls)))
+       (string/join "\n" (concat [(subs (nth lines ls) (- start (nth starts ls)))]
+                                 (subvec lines (inc ls) le)
+                                 [(subs (nth lines le) 0 (- end (nth starts le)))]))))))
+
+(defn buffer-char
+  "The character at position in the buffer (\newline at a line's end)."
+  [b position]
+  (check-range b position (inc position))
+  (let [line (position-line b position)
+        column (- position (nth (:starts b) line))
+        text (nth (:lines b) line)]
+    (if (< column (count text)) (nth text column) \newline)))
+
+(defn- split-at-newlines
+  "s cut at each newline, empty lines kept: one more string than s has newlines."
+  [s]
+  (loop [c (string/cursor s) from c out []]
+    (let [ch (string/char-at s c)]
+      (cond (nil? ch) (conj out (string/slice s from c))
+            (= ch \newline) (let [n (string/next s c)] (recur n n (conj out (string/slice s from c))))
+            :else (recur (string/next s c) from out)))))
+
+(defn- astral-count [s]
+  (count (filter (fn [c] (> (int c) 0xFFFF)) s)))
+
+;; The undo history: a record is a vector of edits [start removed inserted], oldest first.
+
+(defn- merge-edit
+  "record with edit joined to it when edit continues typing or deleting there, or nil."
+  [record edit]
+  (when (= 1 (count record))
+    (let [[s1 r1 i1] (first record)
+          [s2 r2 i2] edit
+          newline? (fn [t] (some (fn [c] (= c \newline)) t))]
+      (cond
+        ;; typing on: an insertion right after the last, no newline
+        (and (= "" r1) (= "" r2) (= s2 (+ s1 (count i1))) (not (newline? i2)) (not (newline? i1)))
+        [[s1 r1 (str i1 i2)]]
+        ;; Backspace: a deletion ending where the last began
+        (and (= "" i1) (= "" i2) (= (+ s2 (count r2)) s1))
+        [[s2 (str r2 r1) ""]]
+        ;; forward delete: a deletion at the same place
+        (and (= "" i1) (= "" i2) (= s2 s1))
+        [[s1 (str r1 r2) ""]]
+        :else nil))))
+
+(defn- record-change! [b start removed inserted merge]
+  (when-not (or (:undoing b) *suppress-history* (not (pos? (:history-limit b))))
+    (set-slot! b :redo-stack ())
+    (let [edit [start removed inserted]
+          merged (when (and merge (seq (:undo-stack b)))
+                   (merge-edit (first (:undo-stack b)) edit))]
+      (cond (pos? (:group-depth b)) (update-slot! b :group conj edit)
+            merged (update-slot! b :undo-stack (fn [st] (conj (rest st) merged)))
+            :else (update-slot! b :undo-stack
+                                (fn [st] (apply list (take (:history-limit b) (conj st [edit])))))))))
+
+(defn replace-buffer-range!
+  "Replace the buffer's characters from start to end with text, record the change for
+undo!, and emit :changed. With merge, the change joins the previous one in the history
+when it continues it, as typing a word or deleting with Backspace does, so undo! takes them
+back together. Returns the end of the new text."
+  ([b start end text] (replace-buffer-range! b start end text false))
+  ([b start end text merge]
+   (check-range b start end)
+   (let [text (str text)]
+     (if (and (= start end) (= "" text))
+       end
+       (let [removed (buffer-text b start end)
+             lines (:lines b)
+             starts (:starts b)
+             ls (position-line b start)
+             le (position-line b end)
+             prefix (subs (nth lines ls) 0 (- start (nth starts ls)))
+             suffix (subs (nth lines le) (- end (nth starts le)))
+             new-lines (split-at-newlines (str prefix text suffix))
+             delta (- (count text) (- end start))
+             new-starts (reduce (fn [acc line] (conj acc (+ (peek acc) (count line) 1)))
+                                [(nth starts ls)] (butlast new-lines))]
+         (set-slot! b :lines (into (into (subvec lines 0 ls) new-lines) (subvec lines (inc le))))
+         (set-slot! b :starts (into (into (subvec starts 0 ls) new-starts)
+                                    (map (fn [x] (+ x delta)) (subvec starts (inc le)))))
+         (update-slot! b :length + delta)
+         (update-slot! b :astral + (- (astral-count text) (astral-count removed)))
+         (update-slot! b :revision inc)
+         (record-change! b start removed text merge)
+         (emit! b (event-for b :changed :start start :old-end end :new-end (+ start (count text))
+                             :removed-text removed :inserted-text text :revision (:revision b)))
+         (+ start (count text)))))))
+
+(defn insert-into-buffer!
+  "Insert text at position in the buffer. Returns the end of the inserted text."
+  [b position text]
+  (replace-buffer-range! b position position text))
+
+(defn delete-buffer-range!
+  "Delete the buffer's characters from start to end."
+  [b start end]
+  (replace-buffer-range! b start end ""))
+
+(defn set-buffer-text!
+  "Replace all of the buffer's text with text, as one change."
+  [b text]
+  (replace-buffer-range! b 0 (:length b) text)
+  text)
+
+;; Characters and UTF-16 units, for backends whose strings count UTF-16 units
+
+(defn buffer-utf16-position
+  "position in the buffer counted in UTF-16 units, as NSString and Windows count."
+  [b position]
+  (if (zero? (:astral b))
+    position
+    (+ position (astral-count (buffer-text b 0 position)))))
+
+(defn buffer-position-from-utf16
+  "The character position in the buffer of the UTF-16 offset units."
+  [b units]
+  (if (zero? (:astral b))
+    (min units (:length b))
+    (loop [i 0 u 0]
+      (if (or (>= u units) (>= i (:length b)))
+        i
+        (recur (inc i) (+ u (if (> (int (buffer-char b i)) 0xFFFF) 2 1)))))))
+
+(defn utf16-length
+  "The number of UTF-16 units the string s takes."
+  [s]
+  (+ (count s) (astral-count s)))
+
+(defn call-with-undo-group
+  "Call f so that the changes it makes to the buffer are undone and redone as one."
+  [b f]
+  (update-slot! b :group-depth inc)
+  (try (f)
+       (finally
+         (when (zero? (update-slot! b :group-depth dec))
+           (let [group (:group b)]
+             (set-slot! b :group [])
+             (when (seq group)
+               (update-slot! b :undo-stack conj group)))))))
+
+(defmacro with-undo-group
+  "Run body so the changes it makes to the buffer are undone and redone as one:
+(with-undo-group [b] (delete-buffer-range! b 0 3) (insert-into-buffer! b 0 \"x\"))."
+  [[b] & body]
+  `(call-with-undo-group ~b (fn [] ~@body)))
+
+(defn clear-history!
+  "Forget the buffer's undo and redo history. Returns the buffer."
+  [b]
+  (set-slot! b :undo-stack ())
+  (set-slot! b :redo-stack ())
+  b)
+
+(defgeneric can-undo? [object]
+  "True when undo! has a change to take back in the text buffer or code view.")
+
+(defmethod can-undo? [(b text-buffer)] (boolean (seq (:undo-stack b))))
+
+(defgeneric can-redo? [object]
+  "True when redo! has a change to make again in the text buffer or code view.")
+
+(defmethod can-redo? [(b text-buffer)] (boolean (seq (:redo-stack b))))
+
+(defn- apply-edits!
+  "Apply edits, each [start old new], without recording them. Returns [start end] of the
+last."
+  [b edits]
+  (set-slot! b :undoing true)
+  (try
+    (reduce (fn [_ [s old new]] [s (replace-buffer-range! b s (+ s (count old)) new)]) [0 0] edits)
+    (finally (set-slot! b :undoing false))))
+
+(defgeneric undo! [object]
+  "Take back the last change to the text buffer or code view. For a buffer, returns
+[start end] of the text it restored, or nil with nothing to undo.")
+
+(defmethod undo! [(b text-buffer)]
+  (when-let [record (first (:undo-stack b))]
+    (update-slot! b :undo-stack rest)
+    (update-slot! b :redo-stack conj record)
+    (apply-edits! b (reverse (map (fn [[s r i]] [s i r]) record)))))
+
+(defgeneric redo! [object]
+  "Make again the last change undo! took back in the text buffer or code view. For a
+buffer, returns [start end] of the new text, or nil.")
+
+(defmethod redo! [(b text-buffer)]
+  (when-let [record (first (:redo-stack b))]
+    (update-slot! b :redo-stack rest)
+    (update-slot! b :undo-stack conj record)
+    (apply-edits! b record)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Code views: an editor view on a text buffer, with its own caret and selection, styled
+;;; runs and a line-number gutter. It is the platform's text view (NSTextView, GtkTextView),
+;;; so typing, input methods and accessibility are native; the buffer stays the truth: the
+;;; backend mirrors it and reports the native view's edits back as buffer changes. The
+;;; editing commands here are what the headless backend uses, and what programs call.
+
+(def ^:dynamic *native-input*
+  "True while a backend emits an input event that its native text view acts on itself if
+no one consumes it. When false, as in tests, a code view does the editing."
+  false)
+
+(def ^:dynamic *edit-origin*
+  "The code view whose native view made the buffer change being reported, or nil."
+  nil)
+
+(def ^:dynamic *from-native*
+  "True while a buffer change from a native view is applied, so it isn't sent back."
+  false)
+
+(defclass code-view-widget [widget]
+  "A text view for editing code: it shows a text buffer with styled runs and a
+line-number gutter, with a caret and selection of its own, so several views show and edit
+one buffer independently. Its keyboard and mouse signals come first, as for every widget
+with input-signals: a handle-event method that consumes Return, Home or any key replaces
+what it does. It emits :changed (a buffer-change-event) for any change to its buffer,
+:selection-changed when the caret or selection moves, and :scrolled."
+  (buffer :cell :atom :init (make-text-buffer) :doc "The text buffer it shows and edits.")
+  (editable :cell :atom :init true
+            :doc "Whether the user can change the text; programs can either way.")
+  (line-numbers :cell :atom :init true :doc "Whether to show line numbers in a gutter.")
+  (tab-width :cell :atom :init 4 :doc "How many spaces wide a tab is.")
+  (wrap :cell :atom :init false
+        :doc "Whether long lines wrap at its width, instead of scrolling sideways.")
+  (placeholder :cell :atom :init nil :doc "Dimmed text shown while it is empty, or nil.")
+  (text-styles :cell :atom :init {}
+               :doc "A map from style names to attribute maps, which runs with :style use.
+Changing it restyles the view, as a theme change needs.")
+  (font :cell :atom :init {:family :monospace :size 12 :weight :regular :italic false})
+  (cursor :cell :atom :init 0 :doc "Where the caret is: the moving end of the selection.")
+  (anchor :cell :atom :init 0 :doc "The fixed end of the selection; the cursor's if empty.")
+  (goal-column :cell :atom :init nil)
+  (runs :cell :atom :init [] :doc "The styled runs, [start end attributes], by start.")
+  (styled :cell :atom :init nil :doc "[start end] of the text whose runs the backend shows.")
+  (hexpand :cell :atom :init true)
+  (vexpand :cell :atom :init true))
+
+(declare-widget! code-view-widget
+                 {:properties [:buffer :editable :line-numbers :tab-width :wrap :placeholder
+                               :text-styles]
+                  :signals (merge input-signals
+                                  {:changed buffer-change-event :selection-changed event
+                                   :scrolled event :mouse-move mouse-event
+                                   :mouse-enter mouse-event :mouse-leave mouse-event})})
+
+(defn code-view
+  "A code view: (code-view {:buffer (make-text-buffer {:text \"(defn f [x] x)\"})})."
+  ([] (code-view {}))
+  ([opts] (build code-view-widget opts nil)))
+
+(defmethod measure [(v code-view-widget)]
+  [300 200])
+
+(defmethod has-caret? [(v code-view-widget)] true)
+
+(defmethod caret-position [(v code-view-widget)] (:cursor v))
+
+;;; Buffers and views
+
+(defgeneric backend-buffer-replaced [backend buffer start old-end text removed]
+  "The buffer's text from start to old-end (removed) became text: show it in the native
+views of the buffer's code views, except the one that made the change (*edit-origin*).")
+
+(defgeneric backend-code-set-selection [backend view anchor cursor]
+  "Show the code view's selection from anchor to cursor, the caret at cursor.")
+
+(defgeneric backend-code-position-at-point [backend view x y]
+  "The text position nearest x, y in the code view's content (its text area from the
+top left, scrolled part included, gutter excluded).")
+
+(defgeneric backend-code-point-at-position [backend view position]
+  "Where position is in the code view's content: [x y height], the top of a caret there.")
+
+(defgeneric backend-code-scroll-to-position [backend view position]
+  "Scroll the code view, if needed, so position shows.")
+
+(defgeneric backend-code-visible-lines [backend view]
+  "[first last], the lines the code view shows.")
+
+(defgeneric backend-code-gutter-width [backend view]
+  "The width of the code view's line-number gutter.")
+
+(defgeneric backend-code-apply-runs [backend view start end runs]
+  "Show runs, [start end attributes] with styles resolved, between start and end of the
+code view's text, whose text there has no style otherwise.")
+
+(defn- shift-position
+  "Where position goes when the text from start to old-end becomes start to new-end."
+  [position start old-end new-end]
+  (cond (<= position start) position
+        (>= position old-end) (+ position (- new-end old-end))
+        :else start))
+
+(defn- shift-runs
+  "runs moved for a change replacing start to old-end with start to new-end. A run that
+continues past an insertion grows to cover it, as typing in a word does."
+  [runs start old-end new-end]
+  (if (and (= start old-end) (= start new-end))
+    runs
+    (let [delta (- new-end old-end)]
+      (into [] (comp (map (fn [[s e a]]
+                            [(if (>= s old-end) (+ s delta) (min s start))
+                             (cond (>= e old-end) (+ e delta) (> e start) start :else e)
+                             a]))
+                     (filter (fn [[s e _]] (< s e))))
+            runs))))
+
+(def ^:private restyle!)
+(def ^:private ensure-styled!)
+
+(defn- buffer-changed!
+  "Keep the native views, and every view's selection and runs, in step with a change."
+  [e]
+  (let [b (:source e)
+        start (:start e)
+        old-end (:old-end e)
+        new-end (:new-end e)]
+    (when (and (not *from-native*) (some realized? (:views b)))
+      (let [bk (current-backend)]
+        (in-ui (fn [] (backend-buffer-replaced bk b start old-end (:inserted-text e)
+                                               (:removed-text e))))))
+    (doseq [v (:views b)]
+      (when-not (:destroyed v)
+        (set-slot! v :cursor (shift-position (:cursor v) start old-end new-end))
+        (set-slot! v :anchor (shift-position (:anchor v) start old-end new-end))
+        (set-slot! v :runs (shift-runs (:runs v) start old-end new-end))
+        (when-let [[a z] (:styled v)]
+          (set-slot! v :styled [(shift-position a start old-end new-end)
+                                (shift-position z start old-end new-end)]))
+        (when (realized? v)
+          (let [bk (current-backend)]
+            (when-not (identical? v *edit-origin*)
+              (in-ui (fn [] (backend-code-set-selection bk v (:anchor v) (:cursor v)))))
+            (in-ui (fn [] (backend-redraw bk v nil))))
+          (restyle! v (line-start b (position-line b start)) (line-end b (position-line b new-end)))
+          (ensure-styled! v))
+        (emit! v (event-for v :changed :start start :old-end old-end :new-end new-end
+                            :removed-text (:removed-text e) :inserted-text (:inserted-text e)
+                            :revision (:revision e)))))))
+
+(defn- attach-view! [v b]
+  (when-not (:mirror b)
+    (set-slot! b :mirror (on b :changed buffer-changed!)))
+  (update-slot! b :views (fn [vs] (if (some (fn [x] (identical? x v)) vs) vs (conj vs v)))))
+
+(defn- detach-view! [v b]
+  (update-slot! b :views (fn [vs] (filterv (fn [x] (not (identical? x v))) vs)))
+  (when (and (empty? (:views b)) (:mirror b))
+    (off b :changed (:mirror b))
+    (set-slot! b :mirror nil)))
+
+(defmethod initialize :after [(v code-view-widget)]
+  (attach-view! v (:buffer v))
+  ;; Its buffer, now and later.
+  (add-watch (cell v :buffer) ::buffer
+             (fn [_ _ old new]
+               (when-not (identical? old new)
+                 (detach-view! v old)
+                 (attach-view! v new)
+                 (set-slot! v :cursor 0)
+                 (set-slot! v :anchor 0)
+                 (set-slot! v :runs [])
+                 (set-slot! v :styled nil)))))
+
+(defmethod destroy! :before [(v code-view-widget)]
+  (detach-view! v (:buffer v)))
+
+(defn native-buffer-edited!
+  "Backends call this when the native text view origin (a code view, or nil) replaced the
+buffer's characters from start to old-end with text: it changes the buffer without sending
+the change back. Typing and deleting one character at a time merge in the undo history."
+  [b start old-end text origin]
+  (binding [*from-native* true
+            *edit-origin* origin]
+    (replace-buffer-range! b start old-end text (<= (+ (count text) (- old-end start)) 1))))
+
+;;; Text
+
+(defn code-text
+  "All of the code view's text."
+  [v]
+  (buffer-text (:buffer v)))
+
+(defn set-code-text!
+  "Make text all of the code view's text, as one change. Returns text."
+  [v text]
+  (set-buffer-text! (:buffer v) text))
+
+(defn text-length
+  "The number of characters in the code view's buffer."
+  [v]
+  (buffer-length (:buffer v)))
+
+;;; The selection
+
+(defn- clamp-position [v p] (max 0 (min p (text-length v))))
+
+(def ^:private scroll-to-position!)
+
+(defn set-selection!
+  "Select from anchor to cursor in the code view, the caret going to cursor, and unless
+:scroll is false bring the caret into view. Returns cursor."
+  ([v anchor cursor] (set-selection! v anchor cursor {}))
+  ([v anchor cursor opts]
+   (let [anchor (clamp-position v anchor)
+         cursor (clamp-position v cursor)]
+     (when-not (and (= anchor (:anchor v)) (= cursor (:cursor v)))
+       (set-slot! v :anchor anchor)
+       (set-slot! v :cursor cursor)
+       (when (realized? v)
+         (let [b (current-backend)]
+           (in-ui (fn [] (backend-code-set-selection b v anchor cursor)))))
+       (emit! v (event-for v :selection-changed)))
+     (when (and (get opts :scroll true) (realized? v))
+       (scroll-to-position! v cursor))
+     cursor)))
+
+(defn set-cursor!
+  "Put the code view's caret at position, with nothing selected. Returns it."
+  [v position]
+  (set-slot! v :goal-column nil)
+  (set-selection! v position position))
+
+(defn native-selection-changed!
+  "Backends call this when the user moved the code view's caret or selection natively."
+  [v anchor cursor]
+  (when-not (and (= anchor (:anchor v)) (= cursor (:cursor v)))
+    (set-slot! v :anchor anchor)
+    (set-slot! v :cursor cursor)
+    (set-slot! v :goal-column nil)
+    (emit! v (event-for v :selection-changed))))
+
+(defn selection
+  "The code view's selection as [start end], start <= end."
+  [v]
+  [(min (:anchor v) (:cursor v)) (max (:anchor v) (:cursor v))])
+
+(defn selection-empty?
+  "True when nothing is selected in the code view."
+  [v]
+  (= (:anchor v) (:cursor v)))
+
+(defn selected-text
+  "The text selected in the code view, or \"\"."
+  [v]
+  (let [[s e] (selection v)] (buffer-text (:buffer v) s e)))
+
+(defn replace-selection!
+  "Replace the code view's selection with s, leaving the caret after it. With merge, the
+change joins the previous one in the undo history, as typing does. Returns the caret."
+  ([v s] (replace-selection! v s false))
+  ([v s merge]
+   (let [[start end] (selection v)
+         new-end (binding [*edit-origin* v] (replace-buffer-range! (:buffer v) start end s merge))]
+     (set-cursor! v new-end))))
+
+(defn select-all!
+  "Select all of the code view's text."
+  [v]
+  (set-selection! v 0 (text-length v) {:scroll false}))
+
+;;; The clipboard and the history
+
+(defn copy-selection!
+  "Put the code view's selected text on the clipboard."
+  [v]
+  (when-not (selection-empty? v)
+    (set-clipboard-text! (selected-text v))))
+
+(defn cut-selection!
+  "Put the code view's selected text on the clipboard and delete it."
+  [v]
+  (when (and (:editable v) (not (selection-empty? v)))
+    (copy-selection! v)
+    (replace-selection! v "")))
+
+(defn paste-clipboard!
+  "Replace the code view's selection with the text on the clipboard."
+  [v]
+  (let [t (clipboard-text)]
+    (when (and t (:editable v))
+      (replace-selection! v t))))
+
+(defmethod undo! [(v code-view-widget)]
+  (when-let [[_ end] (binding [*edit-origin* v] (undo! (:buffer v)))]
+    (set-cursor! v end)
+    end))
+
+(defmethod redo! [(v code-view-widget)]
+  (when-let [[_ end] (binding [*edit-origin* v] (redo! (:buffer v)))]
+    (set-cursor! v end)
+    end))
+
+(defmethod can-undo? [(v code-view-widget)] (can-undo? (:buffer v)))
+(defmethod can-redo? [(v code-view-widget)] (can-redo? (:buffer v)))
+
+;;; Geometry
+
+(defn position-at-point
+  "The text position nearest x, y in the code view's content (its text area from the top
+left, scrolled part included, gutter excluded), where a click there puts the caret."
+  [v x y]
+  (let [b (current-backend)] (in-ui (fn [] (backend-code-position-at-point b v x y)))))
+
+(defn point-at-position
+  "Where position is in the code view's content: [x y height], the top of a caret there."
+  [v position]
+  (let [b (current-backend)
+        p (clamp-position v position)]
+    (in-ui (fn [] (backend-code-point-at-position b v p)))))
+
+(defn scroll-to-position!
+  "Scroll the code view, if needed, so position shows."
+  [v position]
+  (let [b (current-backend)
+        p (clamp-position v position)]
+    (in-ui (fn [] (backend-code-scroll-to-position b v p)))))
+
+(defn visible-lines
+  "[first last], the lines the code view shows."
+  [v]
+  (let [b (current-backend)] (in-ui (fn [] (backend-code-visible-lines b v)))))
+
+(defn gutter-width
+  "The width of the code view's line-number gutter, or 0 when it has none."
+  [v]
+  (if (:line-numbers v)
+    (let [b (current-backend)] (in-ui (fn [] (backend-code-gutter-width b v))))
+    0))
+
+(defn code-view-scrolled!
+  "Backends call this when the code view scrolled."
+  [v]
+  (ensure-styled! v)
+  (emit! v (event-for v :scrolled)))
+
+;;; Styled runs. Runs are kept sorted by start. The backend shows the runs of the styled
+;;; range, the visible lines with a margin; ensure-styled! extends it as the view scrolls,
+;;; so restyling a large text costs only what shows.
+
+(def ^:private style-margin
+  "How many lines beyond those showing get their runs shown ahead of scrolling."
+  200)
+
+(defn- normalize-run [r]
+  (let [[s e & more] r
+        attrs (if (map? (first more)) (first more) (apply hash-map more))]
+    [s e attrs]))
+
+(defn text-runs
+  "The code view's styled runs, [start end attributes] by start."
+  [v]
+  (:runs v))
+
+(defn- runs-between
+  "The runs of the view overlapping start to end, clipped to it."
+  [v start end]
+  (into [] (comp (filter (fn [[s e _]] (and (< s end) (> e start))))
+                 (map (fn [[s e a]] [(max s start) (min e end) a])))
+        (:runs v)))
+
+(defn resolve-run-attributes
+  "A run's attributes with its :style replaced by the style's attributes from the view's
+:text-styles, and its colors made colors or system color keywords."
+  [v attrs]
+  (let [all (merge (get (:text-styles v) (:style attrs)) (dissoc attrs :style))
+        color (fn [k] (when-let [c (get all k)] (ensure-color c)))]
+    (cond-> {}
+      (color :color) (assoc :color (color :color))
+      (color :background) (assoc :background (color :background))
+      (:bold all) (assoc :bold true)
+      (:italic all) (assoc :italic true)
+      (:underline all) (assoc :underline true))))
+
+(defn- show-runs! [v start end]
+  (when (< start end)
+    (let [b (current-backend)
+          runs (mapv (fn [[s e a]] [s e (resolve-run-attributes v a)]) (runs-between v start end))]
+      (in-ui (fn [] (backend-code-apply-runs b v start end runs))))))
+
+(defn- restyle!
+  "Show the view's runs again from start to end, where that is in its styled range."
+  [v start end]
+  (when-let [[a z] (:styled v)]
+    (when (realized? v)
+      (show-runs! v (max start a) (min end z (text-length v))))))
+
+(defn- ensure-styled!
+  "Make sure the backend shows the runs of the view's visible lines, and some around."
+  [v]
+  (when (realized? v)
+    (let [b (:buffer v)
+          [first-line last-line] (visible-lines v)
+          a (line-start b (max 0 (- first-line style-margin)))
+          z (line-end b (min (dec (buffer-line-count b)) (+ last-line style-margin)))
+          styled (:styled v)]
+      (cond (and styled (<= (first styled) a) (>= (second styled) z)) nil
+            (and styled (<= a (second styled)) (>= z (first styled)))
+            (do (show-runs! v a (first styled))
+                (show-runs! v (second styled) z)
+                (set-slot! v :styled [(min a (first styled)) (max z (second styled))]))
+            :else (do (show-runs! v a z)
+                      (set-slot! v :styled [a z]))))))
+
+(defn set-text-runs!
+  "Make runs all of the code view's styled runs: each [start end attributes], attributes a
+map of :style (a name in :text-styles giving defaults for the rest), :color and
+:background (color designators), :bold, :italic and :underline. Text outside any run has
+the plain style. Only what shows is styled at once; the rest as it scrolls into view."
+  [v runs]
+  (set-slot! v :runs (vec (sort-by first (filter (fn [[s e _]] (< s e)) (map normalize-run runs)))))
+  (let [old (:styled v)]
+    (set-slot! v :styled nil)
+    (when (and old (realized? v))
+      (let [b (current-backend)
+            z (min (second old) (text-length v))]
+        (in-ui (fn [] (backend-code-apply-runs b v (first old) z []))))))
+  (ensure-styled! v)
+  runs)
+
+(defn replace-text-runs!
+  "Replace the code view's runs between start and end with runs, which should lie in that
+range, and show the change where it shows: how to restyle part of a large text."
+  [v start end runs]
+  (let [piece (fn [s e a] (when (< s e) [s e a]))
+        old (mapcat (fn [[s e a]]
+                      (if (or (<= e start) (>= s end))
+                        [[s e a]]
+                        (remove nil? [(piece s (min e start) a) (piece (max s end) e a)])))
+                    (:runs v))
+        new (remove nil? (map (fn [[s e a]] (piece (max start s) (min end e) a))
+                              (map normalize-run runs)))]
+    (set-slot! v :runs (vec (sort-by first (concat old new)))))
+  (restyle! v start end)
+  runs)
+
+(defn text-style-at
+  "The attributes of the run at position in the code view, its style resolved, or nil."
+  [v position]
+  (when-let [[_ _ a] (first (filter (fn [[s e _]] (and (<= s position) (< position e))) (:runs v)))]
+    (resolve-run-attributes v a)))
+
+(defmethod property-changed :after [(v code-view-widget) property value]
+  (when (= property :text-styles)
+    (when-let [[a z] (:styled v)] (restyle! v a z))))
+
+;;; Editing commands. Native views do these themselves on macOS; they are here for the
+;;; headless backend, for platforms whose text view lacks one, and for programs (a Home key
+;;; that goes to the first character that isn't blank).
+
+(defn- word-char? [c]
+  (let [n (int c)]
+    (or (<= 48 n 57) (<= 65 n 90) (<= 97 n 122) (> n 127) (contains? (set "_-*+!?<>=/%&$") c))))
+
+(defn motion-target
+  "Where motion takes the code view's caret, and the goal column vertical motions keep:
+[position goal]. motion is :left, :right, :word-left, :word-right, :up, :down,
+:line-start, :line-end, :page-up, :page-down, :buffer-start or :buffer-end."
+  [v motion]
+  (let [b (:buffer v)
+        p (:cursor v)
+        n (buffer-length b)
+        line (position-line b p)
+        vertical (fn [lines]
+                   (let [goal (or (:goal-column v) (position-column b p))
+                         target (max 0 (min (dec (buffer-line-count b)) (+ line lines)))]
+                     [(min (+ (line-start b target) goal) (line-end b target)) goal]))
+        page (fn [] (let [[f l] (visible-lines v)] (max 1 (- l f))))]
+    (case motion
+      :left [(max 0 (dec p)) nil]
+      :right [(min n (inc p)) nil]
+      :word-left [(let [i (loop [i p] (if (and (> i 0) (not (word-char? (buffer-char b (dec i)))))
+                                        (recur (dec i)) i))]
+                    (loop [i i] (if (and (> i 0) (word-char? (buffer-char b (dec i)))) (recur (dec i)) i)))
+                  nil]
+      :word-right [(let [i (loop [i p] (if (and (< i n) (not (word-char? (buffer-char b i))))
+                                         (recur (inc i)) i))]
+                     (loop [i i] (if (and (< i n) (word-char? (buffer-char b i))) (recur (inc i)) i)))
+                   nil]
+      :line-start [(line-start b line) nil]
+      :line-end [(line-end b line) nil]
+      :up (vertical -1)
+      :down (vertical 1)
+      :page-up (vertical (- (page)))
+      :page-down (vertical (page))
+      :buffer-start [0 nil]
+      :buffer-end [n nil])))
+
+(defn move-cursor!
+  "Move the code view's caret by motion (see motion-target), extending the selection with
+extend, else leaving nothing selected. Returns where the caret went."
+  ([v motion] (move-cursor! v motion false))
+  ([v motion extend]
+   (let [[target goal] (motion-target v motion)
+         target (if (and (not extend) (not (selection-empty? v)) (contains? #{:left :right} motion))
+                  (let [[s e] (selection v)] (if (= motion :left) s e))
+                  target)]
+     (set-selection! v (if extend (:anchor v) target) target)
+     (set-slot! v :goal-column (when (contains? #{:up :down :page-up :page-down} motion) goal))
+     target)))
+
+(defn delete-backward!
+  "Delete the selection, or from the caret back to where motion (:left) takes it."
+  ([v] (delete-backward! v :left))
+  ([v motion]
+   (when (:editable v)
+     (when (selection-empty? v)
+       (set-selection! v (:cursor v) (first (motion-target v motion)) {:scroll false}))
+     (replace-selection! v "" true))))
+
+(defn delete-forward!
+  "Delete the selection, or from the caret forward to where motion (:right) takes it."
+  ([v] (delete-forward! v :right))
+  ([v motion]
+   (when (:editable v)
+     (when (selection-empty? v)
+       (set-selection! v (:cursor v) (first (motion-target v motion)) {:scroll false}))
+     (replace-selection! v "" true))))
+
+(defn type-text!
+  "Type text into the code view as the user would: it emits :text-input and, unless a
+handler consumes it, replaces the selection with text."
+  [v text]
+  (binding [*native-input* false]
+    (emit! v (event-for v :text-input :text text))))
+
+(defgeneric key-command [view e]
+  "What the key event e does in the code view when no handler consumes it: a function of
+the view, or nil. Platforms whose native view does the editing keys don't call it.")
+
+(defmethod key-command [(v code-view-widget) e]
+  (let [key (:key e)
+        mods (set (:modifiers e))
+        mac (= :macos (system/os))
+        shift (contains? mods :shift)
+        word (contains? mods (if mac :alt :control))
+        primary (contains? mods (primary-modifier))
+        line (and primary mac)
+        move (fn [m] (fn [v] (move-cursor! v m shift)))]
+    (case key
+      :left (move (cond line :line-start word :word-left :else :left))
+      :right (move (cond line :line-end word :word-right :else :right))
+      :up (move (if line :buffer-start :up))
+      :down (move (if line :buffer-end :down))
+      :home (move (if primary :buffer-start :line-start))
+      :end (move (if primary :buffer-end :line-end))
+      :page-up (move :page-up)
+      :page-down (move :page-down)
+      :backspace (fn [v] (delete-backward! v (if word :word-left :left)))
+      :delete (fn [v] (delete-forward! v (if word :word-right :right)))
+      :return (fn [v] (type-text! v "\n"))
+      :tab (fn [v] (type-text! v "\t"))
+      (when (and primary (char? key))
+        (case key
+          \a select-all!
+          \c copy-selection!
+          \x cut-selection!
+          \v paste-clipboard!
+          \z (if shift redo! undo!)
+          nil)))))
+
+(defmethod handle-event :around [(v code-view-widget) (e input-event)]
+  (call-next-method)
+  (when-not (or *native-input* (consumed? e))
+    (let [signal (:signal e)]
+      (cond
+        (= signal :key-down)
+        (let [command (key-command v e)
+              t (str (or (:text e) ""))]
+          (cond command (do (command v) (consume! e))
+                (and (pos? (count t))
+                     (every? (fn [c] (>= (int c) 32)) t)
+                     (not (some #{:command :control} (:modifiers e))))
+                (do (type-text! v t) (consume! e))
+                :else nil))
+        (= signal :text-input)
+        (when (:editable v)
+          (replace-selection! v (:text e) (= 1 (count (:text e)))))
+        (and (= signal :mouse-down) (= :left (:button e)))
+        (let [p (position-at-point v (:x e) (:y e))]
+          (if (contains? (set (:modifiers e)) :shift)
+            (set-selection! v (:anchor v) p)
+            (set-cursor! v p)))
+        :else nil))))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Appearance, palettes and control sizes

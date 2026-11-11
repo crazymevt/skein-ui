@@ -823,3 +823,81 @@ platform tells the core, which emits :closed with :dismissed). True if it closed
   [p index]
   (let [l (:list-view p)]
     (mouse! l :mouse-down 20 (+ 4 (* (:row-height p) index) 2) {:button :left})))
+
+;;; ------------------------------------------------------------------------------------
+;;; Code views: each character char-width wide (tabs to the next stop), each line
+;;; line-height high; the view shows as many lines as its height holds, from :top-line.
+
+(defn- display-column
+  "The column, tabs expanded, of the column-th character of text in the view."
+  [v text column]
+  (let [tab (max 1 (:tab-width v))]
+    (reduce (fn [col c] (if (= c \tab) (* tab (inc (quot col tab))) (inc col)))
+            0 (take column text))))
+
+(defn- top-line [v] (or (:top-line @(:native v)) 0))
+
+(defn- page-lines [v]
+  (let [[_ _ _ h] (or (:allocation v) [0 0 300 200])]
+    (max 1 (quot h line-height))))
+
+(defmethod ui/backend-buffer-replaced [(b headless-backend) buffer start old-end text removed]
+  nil)
+
+(defmethod ui/backend-code-set-selection [(b headless-backend) v anchor cursor]
+  (swap! (:native v) assoc :selection [anchor cursor]))
+
+(defmethod ui/backend-code-position-at-point [(b headless-backend) v x y]
+  (let [buf (:buffer v)
+        line (max 0 (min (dec (ui/buffer-line-count buf)) (int (math/floor (/ y line-height)))))
+        text (ui/line-text buf line)
+        target (/ x char-width)]
+    (+ (ui/line-start buf line)
+       (or (first (filter (fn [i] (> (/ (+ (display-column v text i) (display-column v text (inc i))) 2)
+                                     target))
+                          (range (count text))))
+           (count text)))))
+
+(defmethod ui/backend-code-point-at-position [(b headless-backend) v position]
+  (let [buf (:buffer v)
+        line (ui/position-line buf position)]
+    [(* char-width (display-column v (ui/line-text buf line) (- position (ui/line-start buf line))))
+     (* line line-height)
+     line-height]))
+
+(defmethod ui/backend-code-scroll-to-position [(b headless-backend) v position]
+  (let [line (ui/position-line (:buffer v) position)
+        top (top-line v)
+        n (page-lines v)]
+    (cond (< line top) (swap! (:native v) assoc :top-line line)
+          (>= line (+ top n)) (swap! (:native v) assoc :top-line (inc (- line n)))
+          :else nil)))
+
+(defmethod ui/backend-code-visible-lines [(b headless-backend) v]
+  (let [top (top-line v)]
+    [top (min (dec (ui/buffer-line-count (:buffer v))) (+ top (page-lines v) -1))]))
+
+(defmethod ui/backend-code-gutter-width [(b headless-backend) v]
+  (+ 16 (* char-width (max 3 (count (str (ui/buffer-line-count (:buffer v))))))))
+
+(defmethod ui/backend-code-apply-runs [(b headless-backend) v start end runs]
+  (swap! (:native v) update :applied-runs (fnil conj []) [start end runs]))
+
+(defmethod ui/backend-caret-rectangle [(b headless-backend) (v ui/code-view-widget) position]
+  (let [[x y h] (ui/backend-code-point-at-position b v position)]
+    [(+ x (ui/backend-code-gutter-width b v)) (- y (* (top-line v) h)) 1 h]))
+
+(defn native-selection
+  "The [anchor cursor] the code view's native view was last given."
+  [v]
+  (:selection @(:native v)))
+
+(defn applied-runs
+  "The runs the code view's native view was given, oldest first: [start end runs]."
+  [v]
+  (:applied-runs @(:native v)))
+
+(defn top-line-of
+  "The first line the code view shows."
+  [v]
+  (top-line v))

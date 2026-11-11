@@ -1,0 +1,153 @@
+(ns skein.ui.code-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]))
+
+;; Text buffers and code views (part E of step 6 of M2.14, D-097), on the headless
+;; backend.
+
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)))
+
+(deftest buffers
+  (let [b (ui/make-text-buffer {:text "one\ntwo\n\nfour"})
+        seen (atom [])]
+    (ui/on b :changed (fn [e] (swap! seen conj [(:start e) (:old-end e) (:new-end e)
+                                                (:removed-text e) (:inserted-text e)])))
+    (is (= 13 (ui/buffer-length b)))
+    (is (= 4 (ui/buffer-line-count b)))
+    (is (= [0 4 8 9] (mapv (fn [l] (ui/line-start b l)) (range 4))))
+    (is (= 7 (ui/line-end b 1)))
+    (is (= "" (ui/line-text b 2)))
+    (is (= 3 (ui/position-line b 9)))
+    (is (= 2 (ui/position-column b 6)))
+    (is (= "two\n\nf" (ui/buffer-text b 4 10)))
+    (is (= \newline (ui/buffer-char b 3)))
+    (is (= 0 (:revision b)))
+    (is (= 7 (ui/replace-buffer-range! b 4 7 "TWO")))
+    (is (= "one\nTWO\n\nfour" (ui/buffer-text b)))
+    (is (= [[4 7 7 "two" "TWO"]] @seen))
+    (is (= 1 (:revision b)))
+    (ui/insert-into-buffer! b 0 "zero\n")
+    (is (= 5 (ui/buffer-line-count b)))
+    (ui/delete-buffer-range! b 0 5)
+    (is (thrown-with-msg? error "outside the buffer" (ui/replace-buffer-range! b 3 99 "")))
+    (is (thrown-with-msg? error "not in the buffer" (ui/line-start b 9)))))
+
+(deftest undo-and-redo
+  (let [b (ui/make-text-buffer {:text "ab"})]
+    (is (not (ui/can-undo? b)) "the first text isn't a change")
+    (ui/replace-buffer-range! b 2 2 "c" true)
+    (ui/replace-buffer-range! b 3 3 "d" true)
+    (ui/replace-buffer-range! b 4 4 "\n" true)
+    (is (= "abcd\n" (ui/buffer-text b)))
+    (is (= [4 4] (ui/undo! b)) "the newline alone")
+    (is (= [2 2] (ui/undo! b)) "the typing, merged")
+    (is (= "ab" (ui/buffer-text b)))
+    (is (not (ui/can-undo? b)))
+    (ui/redo! b)
+    (is (= "abcd" (ui/buffer-text b)))
+    (ui/with-undo-group [b]
+      (ui/delete-buffer-range! b 0 1)
+      (ui/insert-into-buffer! b 0 "X"))
+    (is (= "Xbcd" (ui/buffer-text b)))
+    (is (not (ui/can-redo? b)) "a change forgets what could be redone")
+    (ui/undo! b)
+    (is (= "abcd" (ui/buffer-text b)) "the group, as one")
+    (ui/clear-history! b)
+    (is (not (ui/can-undo? b))))
+  (let [b (ui/make-text-buffer {:text "abc" :history-limit 0})]
+    (ui/insert-into-buffer! b 0 "x")
+    (is (not (ui/can-undo? b)))))
+
+(deftest utf16-positions
+  (let [b (ui/make-text-buffer {:text "a😀b"})]
+    (is (= 3 (ui/buffer-length b)))
+    (is (= 3 (ui/buffer-utf16-position b 2)))
+    (is (= 2 (ui/buffer-position-from-utf16 b 3)))
+    (is (= 4 (ui/utf16-length "a😀b")))))
+
+(deftest buffers-against-a-model
+  ;; Random edits to a buffer and to a plain string agree, and undo takes them all back.
+  (dotimes [seed 20]
+    (let [alphabet ["a" "b" "\n" "é" "😀" "xy" "\n\n" ""]
+          start-text "hello\nworld"
+          b (ui/make-text-buffer {:text start-text})
+          model (atom start-text)]
+      (dotimes [_ 60]
+        (let [n (count @model)
+              s (rand-int (inc n))
+              e (+ s (rand-int (inc (- n s))))
+              t (apply str (repeatedly (rand-int 4) (fn [] (rand-nth alphabet))))]
+          (ui/replace-buffer-range! b s e t)
+          (swap! model (fn [m] (str (subs m 0 s) t (subs m e))))
+          (is (= @model (ui/buffer-text b)))
+          (is (= (count @model) (ui/buffer-length b)))
+          (let [p (rand-int (inc (count @model)))
+                before (subs @model 0 p)
+                line (count (filter (fn [c] (= c \newline)) before))]
+            (is (= line (ui/position-line b p)))
+            (is (= (inc (count (filter (fn [c] (= c \newline)) @model)))
+                   (ui/buffer-line-count b))))))
+      (while (ui/can-undo? b) (ui/undo! b))
+      (is (= start-text (ui/buffer-text b))))))
+
+(deftest code-views
+  (let [b (ui/make-text-buffer {:text "(defn f [x]\n  x)"})
+        changes (atom 0)
+        v (ui/code-view {:buffer b :on-changed (fn [_] (swap! changes inc))})
+        w (ui/window {:width 400 :height 300} v)]
+    (ui/show! w)
+    (testing "the selection and editing"
+      (ui/set-selection! v 1 5)
+      (is (= "defn" (ui/selected-text v)))
+      (is (= [1 5] (headless/native-selection v)))
+      (ui/replace-selection! v "def")
+      (is (= "(def f [x]\n  x)" (ui/code-text v)))
+      (is (= 4 (:cursor v)))
+      (is (= 1 @changes))
+      (ui/undo! v)
+      (is (= "(defn f [x]\n  x)" (ui/code-text v))))
+    (testing "keys edit as the platform's text view would"
+      (ui/set-cursor! v 0)
+      (headless/key-down! v "Right")
+      (is (= 1 (:cursor v)))
+      (headless/key-down! v "Down")
+      (is (= 13 (:cursor v)) "the same column, a line down")
+      (headless/key-down! v "Shift+Left")
+      (is (= [13 12] [(:anchor v) (:cursor v)]))
+      (headless/key-down! v "Backspace")
+      (is (= "(defn f [x]\n x)" (ui/code-text v)))
+      (ui/type-text! v "ab")
+      (is (= "(defn f [x]\nab x)" (ui/code-text v)))
+      (headless/key-down! v "Primary+Z")
+      (is (= "(defn f [x]\n x)" (ui/code-text v)) "the typing, merged"))
+    (testing "two views of one buffer"
+      (let [v2 (ui/code-view {:buffer b})]
+        (ui/set-cursor! v2 3)
+        (ui/set-cursor! v 0)
+        (ui/replace-selection! v ";; ")
+        (is (= 6 (:cursor v2)) "the other caret moves with the text")
+        (ui/destroy! v2)
+        (is (= [v] (:views b)))))
+    (testing "runs"
+      (ui/set-text-runs! v [[1 5 {:style :keyword}] [6 7 {:color :red :bold true}]])
+      (set-slot! v :text-styles {:keyword {:color :purple}})
+      (is (= {:color (ui/ensure-color :purple)} (ui/text-style-at v 2)))
+      (ui/insert-into-buffer! b 0 "  ")
+      (is (= [3 7] (take 2 (first (ui/text-runs v)))) "runs move with the text")
+      (is (seq (headless/applied-runs v)))
+      (ui/replace-text-runs! v 0 5 [[0 2 {:italic true}]])
+      (is (= [[0 2 {:italic true}] [5 7 {:style :keyword}]] (take 2 (ui/text-runs v)))))
+    (testing "geometry"
+      (is (= [0 16 16] (ui/point-at-position v (ui/line-start b 1))))
+      (is (= (ui/line-start b 1) (ui/position-at-point v 0 20)))
+      (is (= 40 (ui/gutter-width v)))
+      (is (= [0 1] (ui/visible-lines v))))
+    (testing "a completion popup under the caret"
+      (let [c (ui/completion-popup {})]
+        (ui/set-cursor! v 2)
+        (ui/show-completion-popup! c v {:items ["a" "b"]})
+        (is (= :caret (:anchor (headless/shown-for c))))
+        (is (= [56 0 1 16] (ui/caret-rectangle v)))
+        (ui/close-surface! c)))
+    (ui/close! w)))
