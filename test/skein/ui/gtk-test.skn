@@ -1,7 +1,8 @@
 (ns skein.ui.gtk-test
   (:require [skein.test :refer [deftest is are testing use-fixtures]]
             [skein.ui :as ui]
-            [skein.ui.gtk :as gtk]))
+            [skein.ui.gtk :as gtk]
+            [skein.io :as io]))
 
 ;; The GTK 4 backend (step 5 of M2.14, D-097), where GTK 4 is installed and can open a
 ;; display (Linux CI runs it under Xvfb): the widgets as GTK's, read back from GTK and
@@ -455,3 +456,28 @@
       (ui/set-code-text! empty "x")
       (is (not (gtk/code-placeholder-shown? empty))))
     (ui/close! w)))
+
+(deftest images-fonts-and-row-icons
+  (let [png (io/read-bytes "test/skein/ui/red-3x2.png")
+        i (ui/image-from-bytes png)
+        g (ui/glyph-image "λ" {:size 20})
+        star (or (ui/system-image "starred") (ui/system-image "folder") g)]
+    (is (= [3 2] [(:width i) (:height i)]))
+    (is (nil? (ui/system-image "no-such-icon-anywhere")))
+    (is (pos? (count (ui/font-families))))
+    (let [l (ui/list-box {:items ["a" "b"] :icon-fn (fn [x] (when (= x "a") star))})
+          t (ui/table-view {:items [{:n 1}] :columns [(ui/column "N" :n {:icon-fn (fn [_] g)})]})
+          c (ui/canvas {:on-draw (fn [e] (ui/draw-image! (:context e) g 0 0)
+                                   (ui/draw-image! (:context e) i 20 0))})
+          v (ui/image-view {:image i})
+          w (ui/window {:title "Images" :width 300 :height 300} (ui/vbox {} l t v c))]
+      (ui/show! w)
+      (gtk/settle!)
+      (is (= "a" (gtk/cell-string l 0 0)))
+      (is (gtk/cell-has-icon? l 0 0))
+      (is (not (gtk/cell-has-icon? l 1 0)))
+      (is (gtk/cell-has-icon? t 0 0))
+      (is (gtk/has-image? v))
+      (ui/close! w))
+    (ui/free-image! i)
+    (is (thrown-with-msg? error "freed" (ui/image-view {:image i})))))

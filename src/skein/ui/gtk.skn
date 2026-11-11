@@ -16,6 +16,7 @@ act on and read the real widgets."
             [skein.ffi :as ffi]
             [skein.math :as math]
             [skein.string :as string]
+            [skein.system :as system]
             [skein.time :as time]))
 
 ;;; ------------------------------------------------------------------------------------
@@ -537,23 +538,107 @@ inside it that holds its children."
   "image (by identity) -> its GdkTexture, made once and kept: images don't change."
   (atom {}))
 
+(defn- texture-from-bytes
+  "A new GdkTexture of the bytes of an image file, or null."
+  [bytes]
+  (let [gb (ffi/pin [p bytes] (lib/g-bytes-new p (count bytes)))
+        t (lib/texture-new-from-bytes gb (ffi/null))]
+    (lib/g-bytes-unref gb)
+    t))
+
+(defn- system-paintable
+  "The icon theme's image called name, as a texture of its file when GTK reads it (so a
+canvas can draw it), else as the theme's paintable; or null."
+  [name]
+  (let [theme (lib/icon-theme-get-for-display (lib/display-get-default))]
+    (if-not (lib/icon-theme-has-icon theme name)
+      (ffi/null)
+      (let [icon (lib/icon-theme-lookup-icon theme name (ffi/null) 24 1 0 0)
+            file (lib/icon-paintable-get-file icon)
+            path (when-not (ffi/null? file)
+                   (let [p (lib/owned-string (lib/g-file-get-path file))]
+                     (lib/g-object-unref file)
+                     p))
+            t (if path (lib/texture-new-from-filename path (ffi/null)) (ffi/null))]
+        (if (ffi/null? t)
+          icon
+          (do (lib/g-object-unref icon) t))))))
+
+(def ^:private glyph-texture
+  "A texture of a glyph image's text (defined with the drawing, below).")
+
 (defn texture
-  "The GdkTexture of a skein.ui image, or null for nil."
+  "The GdkTexture (or, for a system image GTK can't read as one, GdkPaintable) of a
+skein.ui image, or null for nil."
   [image]
   (cond
     (nil? image) (ffi/null)
     (get @textures image) (get @textures image)
     :else
-    (let [t (if (:path image)
-              (lib/texture-new-from-filename (:path image) (ffi/null))
+    (let [_ (ui/check-image image)
+          t (cond
+              (:path image) (lib/texture-new-from-filename (:path image) (ffi/null))
+              (:data image) (texture-from-bytes (:data image))
+              (:system image) (system-paintable (:system image))
+              (:glyph image) (glyph-texture (:glyph image))
+              :else
               (let [w (:width image) h (:height image)
                     bytes (ffi/pin [p (:pixels image)] (lib/g-bytes-new p (* 4 w h)))
                     t (lib/memory-texture-new w h 5 bytes (* 4 w))]  ; GDK_MEMORY_R8G8B8A8
                 (lib/g-bytes-unref bytes)
                 t))]
-      (when (ffi/null? t) (error "GTK can't read the image" (pr-str (:path image))))
+      (when (ffi/null? t) (error "GTK can't read the image" (pr-str (or (:path image) (:system image)))))
       (swap! textures assoc image t)
       t)))
+
+(defmethod ui/backend-image-data-size [(b gtk-backend) bytes]
+  (let [t (texture-from-bytes bytes)]
+    (when (ffi/null? t) (error "GTK can't read the image data"))
+    (let [size [(lib/texture-get-width t) (lib/texture-get-height t)]]
+      (lib/g-object-unref t)
+      size)))
+
+(defmethod ui/backend-system-image-size [(b gtk-backend) name]
+  (when (lib/icon-theme-has-icon (lib/icon-theme-get-for-display (lib/display-get-default)) name)
+    [24 24]))
+
+(def ^:private image-surfaces
+  "image (by identity) -> a Cairo image surface of it, for canvases to draw."
+  (atom {}))
+
+(defmethod ui/backend-free-image [(b gtk-backend) image]
+  (when-let [t (get @textures image)]
+    (swap! textures dissoc image)
+    (lib/g-object-unref t))
+  (when-let [s (get @image-surfaces image)]
+    (swap! image-surfaces dissoc image)
+    (lib/cairo-surface-destroy s)))
+
+(defmethod ui/backend-font-families [(b gtk-backend)]
+  (ffi/with-foreign [families (ffi/alloc ptr 1)]
+    (ffi/with-foreign [n (ffi/alloc i32 1)]
+      (lib/pango-font-map-list-families (lib/pango-cairo-font-map-get-default) families n)
+      (let [array (ffi/get families ptr)
+            names (mapv (fn [i] (lib/pango-font-family-get-name (ffi/get array ptr i)))
+                        (range (ffi/get n i32)))]
+        (lib/g-free array)
+        names))))
+
+(defmethod ui/backend-register-font-file [(b gtk-backend) path]
+  (if (= :macos (system/os))
+    ;; Pango draws with Core Text there.
+    (let [url (lib/cf-url-create-from-file-system-representation (ffi/null) path (count (str path)) false)]
+      (ffi/with-foreign [err (ffi/alloc ptr 1)]
+        (ffi/put! err ptr (ffi/null) 0)
+        (let [ok (lib/ct-register-fonts-for-url url 1 err)
+              e (ffi/get err ptr)
+              code (when-not (ffi/null? e) (lib/cf-error-get-code e))]
+          (when-not (ffi/null? e) (lib/cf-release e))
+          (lib/cf-release url)
+          (when-not (or ok (= code 105))
+            (error "macOS can't register the font file" (pr-str path))))))
+    (when-not (lib/fc-config-app-font-add-file (ffi/null) path)
+      (error "fontconfig can't add the font file" (pr-str path)))))
 
 (defmethod ui/backend-image-size [(b gtk-backend) path]
   (let [t (lib/texture-new-from-filename path (ffi/null))]
@@ -1169,6 +1254,10 @@ inside it that holds its children."
 (defn- view-of [w] (:view (parts-of w)))
 (defn- selection-of [w] (:selection (parts-of w)))
 
+(def ^:private icon-cells
+  "[GTK widget address, row, column] of the cells showing an icon, for tests."
+  (atom #{}))
+
 (def ^:private bound-cells
   "For tests: [widget address, row, column] -> the text last bound in the cell."
   (atom {}))
@@ -1343,14 +1432,31 @@ inside it that holds its children."
 (defmethod make-native [(t ui/tree-view-widget)] (make-list-native t))
 
 (defmethod setup-cell [w column list-item]
+  ;; A box of the row's icon (hidden without one) and its label.
   (let [label (lib/label-new "")
+        icon (lib/image-new)
+        box (lib/box-new 0 4)
         c (get (columns-of w) column)]
     (lib/label-set-xalign label (f32 (xalign (:alignment c))))
+    (lib/widget-set-hexpand label true)
+    (lib/image-set-pixel-size icon 16)
+    (lib/widget-set-visible icon false)
+    (lib/box-append box icon)
+    (lib/box-append box label)
     (if (and (tree? w) (= column 0))
       (let [expander (lib/tree-expander-new)]
-        (lib/tree-expander-set-child expander label)
+        (lib/tree-expander-set-child expander box)
         (lib/list-item-set-child list-item expander))
-      (lib/list-item-set-child list-item label))))
+      (lib/list-item-set-child list-item box))))
+
+(defn- cell-item
+  "The item of the list item's row."
+  [w list-item]
+  (if (tree? w)
+    (item-of-object (lib/tree-row-get-item (lib/list-item-get-item list-item)))
+    (let [pos (lib/list-item-get-position list-item)
+          items (vec (:items w))]
+      (when (< -1 pos (count items)) (nth items pos)))))
 
 (defn- cell-text [w column list-item]
   (if (tree? w)
@@ -1365,11 +1471,17 @@ inside it that holds its children."
 (defmethod bind-cell [w column list-item]
   (let [text (cell-text w column list-item)
         child (lib/list-item-get-child list-item)
-        label (if (and (tree? w) (= column 0))
-                (do (lib/tree-expander-set-list-row child (lib/list-item-get-item list-item))
-                    (lib/tree-expander-get-child child))
-                child)]
+        box (if (and (tree? w) (= column 0))
+              (do (lib/tree-expander-set-list-row child (lib/list-item-get-item list-item))
+                  (lib/tree-expander-get-child child))
+              child)
+        [icon label] (lib/children-of box)
+        image (ui/row-icon w (cell-item w list-item) column)]
     (lib/label-set-text label text)
+    (lib/image-set-from-paintable icon (texture image))
+    (lib/widget-set-visible icon (some? image))
+    (swap! icon-cells (if image conj disj)
+           [(ffi/address (native w)) (lib/list-item-get-position list-item) column])
     (swap! bound-cells assoc
            [(ffi/address (native w)) (lib/list-item-get-position list-item) column]
            text)))
@@ -1648,13 +1760,11 @@ stroke colors are set as each shape is drawn."
     (lib/g-object-unref layout)
     size))
 
-(def ^:private image-surfaces
-  "image (by identity) -> a Cairo image surface of it."
-  (atom {}))
-
 (defn- image-surface [image]
   (or (get @image-surfaces image)
       (let [t (texture image)
+            _ (when-not (string/includes? (lib/type-name-of t) "Texture")
+                (error "GTK can't draw the system image" (pr-str (:system image)) "on a canvas"))
             w (lib/texture-get-width t)
             h (lib/texture-get-height t)
             surface (lib/cairo-image-surface-create 0 w h)]   ; CAIRO_FORMAT_ARGB32
@@ -3503,3 +3613,34 @@ which has it already."
   "True if the code view shows its placeholder."
   [w]
   (boolean (when-let [l (:placeholder (code-parts-of w))] (lib/widget-get-visible l))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Glyph images and row icons
+
+(defn- glyph-texture
+  "A texture of the glyph image's text drawn in the middle of a square."
+  [{:keys [text font color size template]}]
+  (let [extent (int (math/ceil size))
+        surface (lib/cairo-image-surface-create 0 extent extent)   ; CAIRO_FORMAT_ARGB32
+        cr (lib/cairo-create surface)
+        gc (make gtk-context :cr cr :width extent :height extent :widget nil)]
+    (ui/draw-text! gc text (/ extent 2) (/ extent 2)
+                   {:font font :color (if template (ui/rgb 0 0 0) color)
+                    :align :center :valign :center})
+    (lib/cairo-destroy cr)
+    (lib/cairo-surface-flush surface)
+    (let [stride (lib/cairo-image-surface-get-stride surface)
+          bytes (lib/g-bytes-new (lib/cairo-image-surface-get-data surface) (* stride extent))
+          ;; GDK_MEMORY_B8G8R8A8_PREMULTIPLIED 0: Cairo's ARGB32 on a little-endian machine
+          t (lib/memory-texture-new extent extent 0 bytes stride)]
+      (lib/g-bytes-unref bytes)
+      (lib/cairo-surface-destroy surface)
+      t)))
+
+(defmethod set-native [(l ui/list-box-widget) (p (= :icon-fn)) f] (reload! l))
+(defmethod set-native [(t ui/tree-view-widget) (p (= :icon-fn)) f] (reload! t))
+
+(defn cell-has-icon?
+  "True if the list box's, table's or tree's cell at row and column shows an icon."
+  [w row column]
+  (contains? @icon-cells [(ffi/address (native w)) row column]))

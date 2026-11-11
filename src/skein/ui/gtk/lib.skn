@@ -281,6 +281,30 @@ hasn't placed it."
 (ffi/defcfun ^:blocking picture-set-can-shrink "gtk_picture_set_can_shrink" void [p ptr, v bool])
 (ffi/defcfun ^:blocking image-new-from-paintable "gtk_image_new_from_paintable" ptr [t ptr])
 (ffi/defcfun ^:blocking image-set-pixel-size "gtk_image_set_pixel_size" void [i ptr, n i32])
+(ffi/defcfun ^:blocking image-new "gtk_image_new" ptr [])
+(ffi/defcfun ^:blocking image-set-from-paintable "gtk_image_set_from_paintable" void
+  [i ptr, p ptr])
+(ffi/defcfun ^:blocking texture-new-from-bytes "gdk_texture_new_from_bytes" ptr
+  [bytes ptr, error ptr])
+(ffi/defcfun ^:blocking icon-theme-get-for-display "gtk_icon_theme_get_for_display" ptr
+  [display ptr])
+(ffi/defcfun ^:blocking icon-theme-has-icon "gtk_icon_theme_has_icon" bool [t ptr, name c-string])
+(ffi/defcfun ^:blocking icon-theme-lookup-icon "gtk_icon_theme_lookup_icon" ptr
+  [t ptr, name c-string, fallbacks ptr, size i32, scale i32, direction i32, flags i32])
+(ffi/defcfun ^:blocking icon-paintable-get-file "gtk_icon_paintable_get_file" ptr [p ptr])
+(ffi/defcfun ^:blocking g-file-get-path "g_file_get_path" ptr [f ptr])
+(ffi/defcfun ^:blocking pango-cairo-font-map-get-default "pango_cairo_font_map_get_default" ptr [])
+(ffi/defcfun ^:blocking pango-font-map-list-families "pango_font_map_list_families" void
+  [m ptr, families ptr, n ptr])
+(ffi/defcfun ^:blocking pango-font-family-get-name "pango_font_family_get_name" c-string [f ptr])
+(ffi/defcfun ^:blocking fc-config-app-font-add-file "FcConfigAppFontAddFile" bool
+  [config ptr, path c-string])
+(ffi/defcfun ct-register-fonts-for-url "CTFontManagerRegisterFontsForURL" bool
+  [url ptr, scope u32, error ptr])
+(ffi/defcfun cf-url-create-from-file-system-representation
+  "CFURLCreateFromFileSystemRepresentation" ptr [allocator ptr, path c-string, n i64, dir bool])
+(ffi/defcfun cf-error-get-code "CFErrorGetCode" i64 [e ptr])
+(ffi/defcfun cf-release "CFRelease" void [o ptr])
 (ffi/defcfun ^:blocking button-set-child "gtk_button_set_child" void [b ptr, child ptr])
 
 ;;; Frames, text views, notebooks, panes and scrolled windows
