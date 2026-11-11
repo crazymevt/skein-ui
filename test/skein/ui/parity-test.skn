@@ -357,3 +357,42 @@
       (is (= [nil] (headless/row-icons t 1)))
       (is (thrown-with-msg? error "an :icon-fn gives"
                             (ui/row-icon (ui/list-box {:items [1] :icon-fn (fn [_] "x")}) 1))))))
+
+(deftest window-states
+  (let [seen (atom [])
+        w (ui/window {:title "Doc" :width 400 :height 300 :position [100 120]
+                      :on-state-changed (fn [e] (swap! seen conj (:value e)))}
+                     (ui/label {:text "x"}))]
+    (ui/show! w)
+    (is (= :normal (ui/window-state w)))
+    (testing "the user maximizes: the normal frame is kept"
+      (headless/change-state! w :maximized)
+      (is (= :maximized (:state w)))
+      (is (= headless/screen-size [(:width w) (:height w)]))
+      (is (= {:position [100 120] :size [400 300] :state :maximized} (ui/window-frame w))))
+    (testing "the program restores it"
+      (set-slot! w :state :normal)
+      (is (= [400 300] [(:width w) (:height w)]))
+      (is (= [100 120] (:position w))))
+    (testing "a minimized window is saved as normal"
+      (headless/drag-window! w [50 60] [500 350])
+      (headless/change-state! w :minimized)
+      (is (= {:position [50 60] :size [500 350] :state :normal} (ui/window-frame w))))
+    (is (= [:maximized :normal :minimized] @seen))
+    (let [s (ui/window-frame-string w)]
+      (is (= "{:position [50 60] :size [500 350] :state :normal}" s))
+      (ui/close! w)
+      (testing "restoring before show opens it as it was"
+        (let [w2 (ui/window {:title "Again"} (ui/label {:text "x"}))]
+          (ui/restore-window-frame! w2 "{:position [50 60] :size [500 350] :state :fullscreen}")
+          (ui/show! w2)
+          (is (= :fullscreen (ui/window-state w2)))
+          (is (= {:position [50 60] :size [500 350] :state :fullscreen} (ui/window-frame w2)))
+          (ui/close! w2)))))
+  (is (thrown-with-msg? error "not a window frame" (ui/restore-window-frame! (ui/window {}) "(eval 1)")))
+  (is (thrown-with-msg? error "not a window frame"
+                        (ui/restore-window-frame! (ui/window {}) "{:position [1 2] :size [3 4] :state :normal} x")))
+  (is (thrown-with-msg? error ":size" (ui/restore-window-frame! (ui/window {}) {:position nil :size [0 4] :state :normal})))
+  (is (thrown-with-msg? error "a window's state" (ui/window {:state :huge})))
+  (is (= {:position nil :size [3 4] :state :normal}
+         (ui/window-frame (ui/restore-window-frame! (ui/window {}) "{:position nil :size [3 4] :state :normal}")))))

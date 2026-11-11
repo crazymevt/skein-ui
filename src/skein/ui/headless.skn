@@ -929,3 +929,49 @@ platform tells the core, which emits :closed with :dismissed). True if it closed
   "The images the list box's (or table's) rows show in the column, by row."
   ([w] (row-icons w 0))
   ([w column] (mapv (fn [item] (ui/row-icon w item column)) (:items w))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Window states: a window's native state changes at once, on a screen of screen-size;
+;;; set before it shows, it applies when it does.
+
+(def screen-size "The headless screen's size, [width height]." [1440 900])
+
+(defn- native-state [w] (or (:window-state @(:native w)) :normal))
+
+(defn- apply-state! [w state]
+  (let [old (native-state w)]
+    (when (not= old state)
+      (swap! (:native w) assoc :window-state state)
+      (cond (contains? #{:maximized :fullscreen} state)
+            (do (ui/moved-by-user! w 0 0) (apply ui/resized-by-user! w screen-size))
+            (and (= state :normal) (:normal-frame w))
+            (let [{:keys [position size]} (:normal-frame w)]
+              (apply ui/resized-by-user! w size)
+              (when position (apply ui/moved-by-user! w position)))
+            :else nil)
+      (ui/state-changed-by-user! w state))))
+
+(defmethod ui/backend-window-state [(b headless-backend) w]
+  (native-state w))
+
+(defmethod ui/backend-set-property :after [(b headless-backend) (w ui/window-widget) property value]
+  (when (and (= property :state) (:shown @(:native w)))
+    (apply-state! w value)))
+
+(defmethod ui/backend-show :after [(b headless-backend) (w ui/window-widget)]
+  (when (not= (:state w) (native-state w))
+    (when (nil? (:normal-frame w))
+      (set-slot! w :normal-frame {:position (:position w) :size [(:width w) (:height w)]}))
+    (apply-state! w (:state w))))
+
+(defn change-state!
+  "Change the window's state as the user would (the title bar's buttons, a key):
+:maximized, :minimized, :fullscreen or :normal."
+  [w state]
+  (apply-state! w state))
+
+(defn drag-window!
+  "Move and resize the window as the user would, to [x y] and [width height]."
+  [w [x y] [width height]]
+  (ui/moved-by-user! w x y)
+  (ui/resized-by-user! w width height))

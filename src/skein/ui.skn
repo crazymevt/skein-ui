@@ -1211,23 +1211,44 @@ veto refuses) when asked to close, and :closed once it closed; :shown when shown
   (palette :cell :atom :init nil :doc "Color overrides for everything in it, as a widget's.")
   (surface :cell :atom :init :window)
   (background :cell :atom :init nil)
-  (last-appearance :cell :atom :init nil))
+  (last-appearance :cell :atom :init nil)
+  (state :cell :atom :init :normal
+         :doc ":normal, :maximized, :minimized or :fullscreen: set it to change the window's
+state (applied once it shows); it follows the user's changes, which emit :state-changed.")
+  (normal-frame :cell :atom :init nil
+                :doc "{:position :size} of the window when last :normal, kept while it isn't.")
+  (settled-state :cell :atom :init :normal :doc "The state :state-changed last reported.")
+  (state-transition :cell :atom :init false
+                    :doc "True while the backend changes the state, as a fullscreen animation
+does, when the window's geometry isn't its normal one."))
 
 (declare-widget! window-widget {:properties [:title :width :height :menu-bar :min-size
                                              :position :resizable :closable :appearance
-                                             :palette :surface :background]
+                                             :palette :surface :background :state]
                                 :layout [:width :height]
                                 :signals {:close-request close-event :closed event
                                           :shown event :resize resize-event
                                           :activated event :deactivated event
                                           :moved value-event :key-down key-event
-                                          :appearance-changed value-event}})
+                                          :appearance-changed value-event
+                                          :state-changed value-event}})
+
+(def window-states
+  "The states of a window."
+  #{:normal :maximized :minimized :fullscreen})
+
+(defn- check-window-state [state]
+  (when-not (contains? window-states state)
+    (error "a window's state is :normal, :maximized, :minimized or :fullscreen, not"
+           (pr-str state)))
+  state)
 
 (def ^:private open-windows
   "The windows made and not yet closed, oldest first."
   (atom []))
 
 (defmethod initialize :after [(w window-widget)]
+  (check-window-state (:state w))
   (swap! open-windows conj w))
 
 (defn windows
@@ -1262,6 +1283,8 @@ veto refuses) when asked to close, and :closed once it closed; :shown when shown
     (in-ui (fn [] (backend-center-window b w))))
   w)
 
+(def ^:private note-normal-frame!)
+
 (defn show!
   "Show the window and make it the active one. The first time, it gets its content's
 natural size unless it has :width and :height, and is centered unless it has a
@@ -1277,6 +1300,7 @@ natural size unless it has :width and :height, and is centered unless it has a
         (in-ui (fn [] (backend-center-window b w))))
       (in-ui (fn [] (backend-show b w))))
     (set-slot! w :shown true)
+    (when (nil? (:normal-frame w)) (note-normal-frame! w))
     (emit! w (event-for w :shown))
     w))
 
@@ -1338,6 +1362,105 @@ other windows from the user. Returns the value given to end-modal!."
     (finally
       (swap! modal-windows (fn [ms] (filterv (fn [m] (not (identical? m w))) ms))))))
 
+(defgeneric backend-window-state [backend window]
+  "The window's actual state: :normal, :maximized, :minimized or :fullscreen.")
+
+(defmethod backend-window-state [(b backend) w]
+  (:state w))
+
+(defn window-state
+  "The window's actual state, as the platform has it: :normal, :maximized, :minimized or
+:fullscreen. Fullscreen changes take a moment: watch :state-changed."
+  [w]
+  (if (realized? w)
+    (let [b (current-backend)] (in-ui (fn [] (backend-window-state b w))))
+    (:state w)))
+
+(defn- note-normal-frame!
+  "Remember the window's geometry as its normal frame, if it is :normal now."
+  [w]
+  (when (and (:shown w) (not (:state-transition w)) (= :normal (window-state w)))
+    (set-slot! w :normal-frame {:position (:position w) :size [(:width w) (:height w)]})))
+
+(defn state-changed-by-user!
+  "Backends call this when the window's state settled at state, the user's doing or the
+program's: it stores it and emits :state-changed, once for each change."
+  [w state]
+  (when (not= state (:state w)) (sync-property! w :state state))
+  (when (not= state (:settled-state w))
+    (set-slot! w :settled-state state)
+    (emit! w (event-for w :state-changed :value state))))
+
+(defmethod property-changed :after [(w window-widget) property value]
+  (when (= property :state) (check-window-state value)))
+
+(defn window-frame
+  "The window's frame to save and restore later (restore-window-frame!): {:position
+[x y] (nil if it never had one) :size [width height] :state}, its normal geometry
+even while it's maximized or fullscreen. A minimized window is saved as :normal."
+  [w]
+  (let [state (window-state w)
+        f (if (or (= state :normal) (nil? (:normal-frame w)))
+            {:position (:position w) :size [(:width w) (:height w)]}
+            (:normal-frame w))]
+    {:position (:position f) :size (:size f) :state (if (= state :minimized) :normal state)}))
+
+(defn window-frame-string
+  "The window's frame (window-frame) as a string to store in settings."
+  [w]
+  (let [{:keys [position size state]} (window-frame w)]
+    (str "{:position " (pr-str position) " :size " (pr-str size) " :state " (pr-str state) "}")))
+
+(defn- frame-tokens
+  "The tokens of a frame string: brackets and braces, and the words between."
+  [s]
+  (loop [cs (seq s) word [] out []]
+    (let [flush (fn [out] (if (seq word) (conj out (apply str word)) out))]
+      (if (empty? cs)
+        (flush out)
+        (let [c (first cs)]
+          (cond (contains? #{\{ \} \[ \]} c) (recur (rest cs) [] (conj (flush out) (str c)))
+                (contains? #{\space \tab \newline \return \,} c) (recur (rest cs) [] (flush out))
+                :else (recur (rest cs) (conj word c) out)))))))
+
+(defn- parse-frame
+  "The frame map in the string s, read strictly as window-frame-string writes it."
+  [s]
+  (let [t (frame-tokens s)
+        bad (fn [] (error "not a window frame:" (pr-str s)))
+        num (fn [x] (or (parse-long x) (bad)))
+        [position rest-t] (cond (= (nth t 2 nil) "nil") [nil (drop 3 t)]
+                                (= (nth t 2 nil) "[")
+                                (if (= "]" (nth t 5 nil)) [[(num (nth t 3)) (num (nth t 4))] (drop 6 t)] (bad))
+                                :else (bad))
+        r (vec rest-t)]
+    (when-not (and (= "{" (first t)) (= ":position" (nth t 1 nil)) (= 8 (count r))
+                   (= ":size" (r 0)) (= "[" (r 1)) (= "]" (r 4)) (= ":state" (r 5))
+                   (= "}" (r 7)) (string/starts-with? (r 6) ":"))
+      (bad))
+    {:position position :size [(num (r 2)) (num (r 3))] :state (keyword (subs (r 6) 1))}))
+
+(defn restore-window-frame!
+  "Give the window a frame window-frame (or window-frame-string) gave: its normal
+position and size, then its state. Restore before show! to open it as it was. Returns the
+window."
+  [w frame]
+  (let [f (if (string? frame) (parse-frame frame) frame)
+        {:keys [position size state]} f]
+    (when-not (or (nil? position) (and (vector? position) (= 2 (count position))
+                                       (every? integer? position)))
+      (error "a window frame's :position is [x y] or nil, not" (pr-str position)))
+    (when-not (and (vector? size) (= 2 (count size)) (every? (fn [x] (and (integer? x) (pos? x))) size))
+      (error "a window frame's :size is [width height], not" (pr-str size)))
+    (check-window-state state)
+    (set-slot! w :state :normal)
+    (when position (set-slot! w :position position))
+    (set-slot! w :width (first size))
+    (set-slot! w :height (second size))
+    (set-slot! w :normal-frame {:position position :size size})
+    (set-slot! w :state state)
+    w))
+
 (defn resized-by-user!
   "Backends call this when the user resized the window's content area to width by
 height: it lays the window out at once and emits :resize."
@@ -1345,6 +1468,7 @@ height: it lays the window out at once and emits :resize."
   (when (not= [width height] [(:width w) (:height w)])
     (sync-property! w :width width)
     (sync-property! w :height height)
+    (note-normal-frame! w)
     (update-layout! w)
     (emit! w (event-for w :resize :width width :height height))))
 
@@ -1358,6 +1482,7 @@ window."
   "Backends call this when the user moved the window's top left corner to x, y."
   [w x y]
   (sync-property! w :position [x y])
+  (note-normal-frame! w)
   (emit! w (event-for w :moved :value [x y])))
 
 ;;; ------------------------------------------------------------------------------------
