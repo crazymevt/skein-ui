@@ -169,3 +169,44 @@
       (gtk/edit-text! tv "typed")
       (is (= "typed" (:text tv))))
     (ui/close! w)))
+
+(deftest lists-tables-and-trees
+  (let [seen (atom [])
+        l (ui/list-box {:items ["a" "b" "c"]
+                        :on-selection-changed (fn [e] (swap! seen conj [:selected (:index e)]))
+                        :on-row-activated (fn [e] (swap! seen conj [:activated (:item e)]))})
+        t (ui/table-view {:columns [(ui/column "Name" :name {:width 100})
+                                    (ui/column "Age" :age)]
+                          :items [{:name "Ada" :age 36} {:name "Bob" :age 7}]})
+        files {"/" ["docs" "src"] "src" ["main.skn"]}
+        tree (ui/tree-view {:roots ["/"] :children-fn (fn [f] (get files f []))
+                            :on-expanded (fn [e] (swap! seen conj [:expanded (:item e)]))})
+        w (ui/window {:width 400 :height 500} (ui/vbox {} l t tree))]
+    (ui/show! w)
+    (gtk/settle!)
+    (testing "list boxes"
+      (is (= 3 (gtk/row-count l)))
+      (is (= "b" (gtk/cell-string l 1 0)))
+      (gtk/select-rows-natively! l [2])
+      (is (= [2] (:selected-indices l)))
+      (gtk/activate-row! l 2)
+      (set-slot! l :items ["x" "y"])
+      (is (= 2 (gtk/row-count l)))
+      (is (= [[:selected 2] [:activated "c"]] @seen)))
+    (testing "tables sort by a clicked column"
+      (is (= "36" (gtk/cell-string t 0 1)))
+      (gtk/click-column-title! t 1)
+      (gtk/settle!)
+      (is (= ["Bob" "Ada"] (mapv :name (:items t))))
+      (is (= "Bob" (gtk/cell-string t 0 0))))
+    (testing "trees"
+      (is (= 1 (gtk/row-count tree)))
+      (ui/expand! tree "/")
+      (is (= 3 (gtk/row-count tree)))
+      (gtk/expand-natively! tree "src")
+      (is (= 4 (gtk/row-count tree)))
+      (is (ui/expanded? tree "src"))
+      (is (= [:expanded "src"] (last @seen)))
+      (gtk/select-rows-natively! tree [3])
+      (is (= ["main.skn"] (:selection tree))))
+    (ui/close! w)))

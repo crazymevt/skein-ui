@@ -44,6 +44,15 @@ split pane's divider).")
 (defmethod layout-native [w width height]
   nil)
 
+(defgeneric setup-cell [w column list-item]
+  "Give the GtkListItem of w's list, table or tree a child for a cell of column.")
+
+(defgeneric bind-cell [w column list-item]
+  "Show in the GtkListItem's child the cell of its row in column.")
+
+(defgeneric children-model [w item]
+  "The GListModel of the children of a tree's item (a GtkStringObject), or null.")
+
 (defgeneric native-natural-size [w]
   "w's natural [width height]: by default its GTK widget's natural size.")
 
@@ -64,7 +73,7 @@ split pane's divider).")
 
 (def ^:private signal-kinds
   [:clicked :activate :changed :toggled :value-changed :resized :selected :switch-page
-   :close-request :position])
+   :close-request :position :sort :items-changed])
 
 (defn- kind-of [data] (nth signal-kinds (ffi/address data)))
 
@@ -97,6 +106,40 @@ this namespace's), reporting it as kind. Returns o."
 (ffi/defcallback switch-page-imp void [notebook ptr, page ptr, number u32, data ptr]
   (when-let [w (lib/object-for notebook)]
     (native-signal w :switch-page notebook number)))
+
+(def ^:private factory-owners
+  "A list item factory's address -> [widget column-index]."
+  (atom {}))
+
+(ffi/defcallback setup-imp void [factory ptr, item ptr, data ptr]
+  (when-let [[w column] (get @factory-owners (ffi/address factory))]
+    (setup-cell w column item)))
+
+(ffi/defcallback bind-imp void [factory ptr, item ptr, data ptr]
+  (when-let [[w column] (get @factory-owners (ffi/address factory))]
+    (bind-cell w column item)))
+
+(ffi/defcallback selection-changed-imp void [model ptr, position u32, n u32, data ptr]
+  (when-let [w (lib/object-for model)]
+    (native-signal w :selected model nil)))
+
+(ffi/defcallback activate-row-imp void [view ptr, position u32, data ptr]
+  (when-let [w (lib/object-for view)]
+    (native-signal w :activate view position)))
+
+(def ^:private trees
+  "A small id -> the tree widget, for the tree list model's children function."
+  (atom {}))
+
+(ffi/defcallback children-imp ptr [item ptr, data ptr]
+  (if-let [t (get @trees (ffi/address data))]
+    (children-model t item)
+    (ffi/null)))
+
+(ffi/defcallback items-changed-imp void [model ptr, position u32, removed u32, added u32,
+                                         data ptr]
+  (when-let [w (lib/object-for model)]
+    (native-signal w :items-changed model nil)))
 
 (def ^:private pulsing
   "progress bar id -> the indeterminate progress bar it pulses."
@@ -980,6 +1023,323 @@ inside it that holds its children."
                                             (lib/scrolled-get-vadjustment (native s))))))))
 
 ;;; ------------------------------------------------------------------------------------
+;;; List boxes, tables and trees: GtkListView or GtkColumnView in a GtkScrolledWindow.
+;;; A list's or table's model has one string per row (the rows are the core's); a tree's
+;;; is a GtkTreeListModel of GtkStringObjects of item ids. Cells are filled by signal
+;;; list item factories, one for each column.
+
+(def ^:private list-parts
+  "The widget's GtkScrolledWindow address -> {:view :selection :model :columns :tree-id}."
+  (atom {}))
+
+(defn- parts-of [w] (get @list-parts (ffi/address (native w))))
+(defn- view-of [w] (:view (parts-of w)))
+(defn- selection-of [w] (:selection (parts-of w)))
+
+(def ^:private bound-cells
+  "For tests: [widget address, row, column] -> the text last bound in the cell."
+  (atom {}))
+
+(defn- new-factory
+  "A signal list item factory for the widget's column."
+  [w column]
+  (let [f (lib/signal-factory-new)]
+    (swap! factory-owners assoc (ffi/address f) [w column])
+    (lib/g-signal-connect-data f "setup" setup-imp (ffi/null) (ffi/null) 0)
+    (lib/g-signal-connect-data f "bind" bind-imp (ffi/null) (ffi/null) 0)
+    f))
+
+(defn- tree? [w] (instance? ui/tree-view-widget w))
+(defn- columns-of [w] (vec (:columns w)))
+
+(defn- selection-model
+  "A selection model over model (taking it), single or multiple as w's :selection-mode."
+  [w model]
+  (let [sel (if (= :multiple (:selection-mode w))
+              (lib/multi-selection-new model)
+              (let [s (lib/single-selection-new model)]
+                (lib/single-selection-set-autoselect s false)
+                (lib/single-selection-set-can-unselect s true)
+                s))]
+    (lib/register! sel w)
+    (lib/g-signal-connect-data sel "selection-changed" selection-changed-imp (ffi/null)
+                               (ffi/null) 0)
+    sel))
+
+(def ^:private tree-ids (atom 0))
+
+(def ^:private item-ids
+  "[tree view address, item key] -> id, and id -> the item."
+  (atom {:next 1 :ids {} :items {}}))
+
+(defn- item-id [t item]
+  (let [k [(ffi/address (native t)) ((:item-key t) item)]
+        id (or (get-in @item-ids [:ids k])
+               (let [{n :next} (swap! item-ids (fn [m] (-> m (update :next inc)
+                                                           (assoc-in [:ids k] (:next m)))))]
+                 (dec n)))]
+    (swap! item-ids assoc-in [:items id] item)
+    (str id)))
+
+(defn- item-of-object
+  "The tree item of a GtkStringObject of its id."
+  [o]
+  (get-in @item-ids [:items (parse-long (lib/string-object-get-string o))]))
+
+(defn- items-model [t items]
+  (lib/string-list-of (map (fn [i] (item-id t i)) items)))
+
+(defn- row-model
+  "A new model for w's rows: row numbers for a list or table, the tree's for a tree."
+  [w]
+  (if (tree? w)
+    (lib/tree-list-model-new (items-model w (ui/tree-children w nil)) false false children-imp
+                             (lib/signal-data (:tree-id (parts-of w))) (ffi/null))
+    (lib/string-list-of (map str (range (count (:items w)))))))
+
+(defmethod children-model [(t ui/tree-view-widget) o]
+  (let [children (ui/tree-children t (item-of-object o))]
+    (if (seq children) (items-model t children) (ffi/null))))
+
+(defn- set-view-model! [w sel]
+  (if (:columns? (parts-of w))
+    (lib/column-view-set-model (view-of w) sel)
+    (lib/list-view-set-model (view-of w) sel)))
+
+(defn- tree-row [w position]
+  (lib/tree-list-model-get-row (:model (parts-of w)) position))
+
+(defn- n-rows [w]
+  (lib/list-model-n-items (selection-of w)))
+
+(defn- show-expansion!
+  "Open the tree's rows the core says are open, from the top down."
+  [t]
+  (quietly
+   (fn []
+     (loop [i 0]
+       (when (< i (n-rows t))
+         (let [row (tree-row t i)
+               o (lib/tree-row-get-item row)
+               item (item-of-object o)]
+           (lib/tree-row-set-expanded row (boolean (ui/expanded? t item)))
+           (lib/g-object-unref o)
+           (lib/g-object-unref row))
+         (recur (inc i)))))))
+
+(defn- row-items
+  "The tree's items at the rows."
+  [t rows]
+  (mapv (fn [r] (let [row (tree-row t r)
+                      o (lib/tree-row-get-item row)
+                      item (item-of-object o)]
+                  (lib/g-object-unref o)
+                  (lib/g-object-unref row)
+                  item))
+        rows))
+
+(defn- selected-rows [w]
+  (let [set (lib/selection-get (selection-of w))
+        rows (mapv (fn [i] (lib/bitset-get-nth set i)) (range (lib/bitset-get-size set)))]
+    (lib/bitset-unref set)
+    rows))
+
+(defn- select-rows! [w rows]
+  (quietly
+   (fn []
+     (lib/selection-unselect-all (selection-of w))
+     (doseq [r rows] (lib/selection-select-item (selection-of w) r false)))))
+
+(defn- reload! [w]
+  (let [model (row-model w)
+        sel (selection-model w model)]
+    (when (tree? w)
+      (lib/register! model w)
+      (lib/g-signal-connect-data model "items-changed" items-changed-imp (ffi/null) (ffi/null) 0))
+    (swap! list-parts update (ffi/address (native w)) assoc :model model :selection sel)
+    (quietly (fn [] (set-view-model! w sel)))
+    (if (tree? w)
+      (do (show-expansion! w)
+          (select-rows! w (keep (fn [r] (when (contains? (set (:selection w)) (first (row-items w [r])))
+                                          r))
+                                (range (n-rows w)))))
+      (select-rows! w (:selected-indices w)))))
+
+(defn- add-columns! [w]
+  (let [view (view-of w)
+        cols (columns-of w)]
+    (doseq [[i c] (map-indexed vector cols)]
+      (let [col (lib/column-new (:title c) (new-factory w i))]
+        (when (:width c) (lib/column-set-fixed-width col (:width c)))
+        (lib/column-set-expand col (nil? (:width c)))
+        (when (:sort c)
+          (lib/column-set-sorter col (lib/custom-sorter-new (ffi/null) (ffi/null) (ffi/null))))
+        (lib/column-view-append-column view col)
+        (lib/g-object-unref col)))))
+
+(defn- remove-columns! [w]
+  (let [view (view-of w)
+        cols (lib/column-view-get-columns view)
+        items (mapv (fn [i] (lib/list-model-get-item cols i)) (range (lib/list-model-n-items cols)))]
+    (doseq [c items]
+      (lib/column-view-remove-column view c)
+      (lib/g-object-unref c))))
+
+(defn- make-list-native [w]
+  (let [scroll (owned (lib/scrolled-new))
+        columns? (and (not (instance? ui/list-box-widget w)) (seq (columns-of w)))
+        columns? (or (instance? ui/table-view-widget w) columns?)
+        tree-id (when (tree? w) (swap! tree-ids inc))
+        _ (when tree-id (swap! trees assoc tree-id w))
+        view (if columns?
+               (lib/column-view-new (ffi/null))
+               (lib/list-view-new (ffi/null) (new-factory w 0)))]
+    (lib/scrolled-set-child scroll view)
+    (lib/register! view w)
+    (lib/g-signal-connect-data view "activate" activate-row-imp (ffi/null) (ffi/null) 0)
+    (swap! list-parts assoc (ffi/address scroll) {:view view :columns? columns? :tree-id tree-id})
+    (when columns?
+      (let [sorter (lib/column-view-get-sorter view)]
+        (lib/register! sorter w)
+        (connect! sorter "changed" :sort signal-arg-imp)))
+    scroll))
+
+(defmethod make-native [(l ui/list-box-widget)] (make-list-native l))
+(defmethod make-native [(t ui/tree-view-widget)] (make-list-native t))
+
+(defmethod setup-cell [w column list-item]
+  (let [label (lib/label-new "")
+        c (get (columns-of w) column)]
+    (lib/label-set-xalign label (f32 (xalign (:alignment c))))
+    (if (and (tree? w) (= column 0))
+      (let [expander (lib/tree-expander-new)]
+        (lib/tree-expander-set-child expander label)
+        (lib/list-item-set-child list-item expander))
+      (lib/list-item-set-child list-item label))))
+
+(defn- cell-text [w column list-item]
+  (if (tree? w)
+    (let [row (lib/list-item-get-item list-item)
+          item (item-of-object (lib/tree-row-get-item row))]
+      (ui/tree-cell-text w item column))
+    (let [pos (lib/list-item-get-position list-item)]
+      (if (instance? ui/table-view-widget w)
+        (ui/table-cell-text w pos column)
+        (ui/item-text w pos)))))
+
+(defmethod bind-cell [w column list-item]
+  (let [text (cell-text w column list-item)
+        child (lib/list-item-get-child list-item)
+        label (if (and (tree? w) (= column 0))
+                (do (lib/tree-expander-set-list-row child (lib/list-item-get-item list-item))
+                    (lib/tree-expander-get-child child))
+                child)]
+    (lib/label-set-text label text)
+    (swap! bound-cells assoc [(ffi/address (native w)) (lib/list-item-get-position list-item) column]
+           text)))
+
+(defmethod set-native [(l ui/list-box-widget) (p (= :items)) v] (reload! l))
+(defmethod set-native [(l ui/list-box-widget) (p (= :item-label)) v] (reload! l))
+(defmethod set-native [(l ui/list-box-widget) (p (= :selection-mode)) v] (reload! l))
+(defmethod set-native [(l ui/list-box-widget) (p (= :selected-indices)) v] (select-rows! l v))
+(defmethod set-native [(l ui/list-box-widget) (p (= :border)) v]
+  (lib/scrolled-set-has-frame (native l) (boolean v)))
+
+(defmethod native-natural-size [(l ui/list-box-widget)] [160 120])
+
+(defmethod native-signal [(l ui/list-box-widget) (k (= :selected)) model arg]
+  (when-not (quiet?)
+    (let [rows (selected-rows l)]
+      (when (not= rows (vec (:selected-indices l)))
+        (ui/selection-changed-by-user! l rows)))))
+
+(defmethod native-signal [(l ui/list-box-widget) (k (= :activate)) view row]
+  (ui/row-activated-by-user! l row 2))
+
+;;; Tables
+
+(defmethod set-native [(t ui/table-view-widget) (p (= :columns)) v]
+  (when (:view (parts-of t))
+    (remove-columns! t)
+    (add-columns! t)
+    (reload! t)))
+
+(defmethod set-native [(t ui/table-view-widget) (p (= :alternating)) v]
+  (lib/column-view-set-row-separators (view-of t) (not v)))
+
+(defn- show-sort! [t]
+  (let [view (view-of t)
+        i (when-let [c (:sort-column t)] (index-of (:columns t) c))]
+    (when i
+      (let [cols (lib/column-view-get-columns view)
+            col (lib/list-model-get-item cols i)]
+        (quietly (fn [] (lib/column-view-sort-by-column view col (if (:sort-descending t) 1 0))))
+        (lib/g-object-unref col)))))
+
+(defmethod set-native [(t ui/table-view-widget) (p (= :sort-column)) v] (show-sort! t))
+(defmethod set-native [(t ui/table-view-widget) (p (= :sort-descending)) v] (show-sort! t))
+
+(defmethod native-natural-size [(t ui/table-view-widget)]
+  [(max 160 (reduce + 0 (map (fn [c] (or (:width c) 100)) (:columns t)))) 120])
+
+(defmethod native-signal [(t ui/table-view-widget) (k (= :sort)) sorter arg]
+  (when-not (quiet?)
+    (let [col (lib/column-sorter-primary sorter)
+          cols (lib/column-view-get-columns (view-of t))]
+      (when-not (ffi/null? col)
+        (let [i (first (filter (fn [i] (let [c (lib/list-model-get-item cols i)
+                                             same (= (ffi/address c) (ffi/address col))]
+                                         (lib/g-object-unref c)
+                                         same))
+                               (range (lib/list-model-n-items cols))))]
+          (when i (ui/column-clicked-by-user! t i)))))))
+
+;;; Trees
+
+(defmethod set-native [(t ui/tree-view-widget) (p (= :roots)) v] (reload! t))
+(defmethod set-native [(t ui/tree-view-widget) (p (= :item-label)) v] (reload! t))
+(defmethod set-native [(t ui/tree-view-widget) (p (= :selection-mode)) v] (reload! t))
+(defmethod set-native [(t ui/tree-view-widget) (p (= :expanded)) v] (show-expansion! t))
+
+(defmethod set-native [(t ui/tree-view-widget) (p (= :selection)) v]
+  (let [wanted (set v)]
+    (select-rows! t (filter (fn [r] (contains? wanted (first (row-items t [r]))))
+                            (range (n-rows t))))))
+
+(defmethod set-native [(t ui/tree-view-widget) (p (= :columns)) v]
+  (when (and (:columns? (parts-of t)) (seq v))
+    (remove-columns! t)
+    (add-columns! t)
+    (reload! t)))
+
+(defmethod ui/backend-tree-refresh [(b gtk-backend) t item]
+  (reload! t))
+
+(defmethod native-natural-size [(t ui/tree-view-widget)] [160 120])
+
+(defmethod native-signal [(t ui/tree-view-widget) (k (= :items-changed)) model arg]
+  ;; The user opened or closed a row: find the rows whose state isn't the core's.
+  (when-not (quiet?)
+    (doseq [r (range (n-rows t))]
+      (let [row (tree-row t r)
+            o (lib/tree-row-get-item row)
+            item (item-of-object o)
+            open (lib/tree-row-get-expanded row)]
+        (lib/g-object-unref o)
+        (lib/g-object-unref row)
+        (when (not= open (ui/expanded? t item))
+          (ui/expansion-changed-by-user! t item open))))))
+
+(defmethod native-signal [(t ui/tree-view-widget) (k (= :selected)) model arg]
+  (when-not (quiet?)
+    (let [items (row-items t (selected-rows t))]
+      (when (not= items (vec (:selection t)))
+        (ui/tree-selection-changed-by-user! t items)))))
+
+(defmethod native-signal [(t ui/tree-view-widget) (k (= :activate)) view row]
+  (ui/tree-item-activated-by-user! t (first (row-items t [row]))))
+
+;;; ------------------------------------------------------------------------------------
 ;;; For tests: the real widgets, read and acted on
 
 (defn native-frame
@@ -1091,3 +1451,41 @@ inside it that holds its children."
   [s]
   [(int (math/round (lib/adjustment-get-value (lib/scrolled-get-hadjustment (native s)))))
    (int (math/round (lib/adjustment-get-value (lib/scrolled-get-vadjustment (native s)))))])
+
+(defn row-count
+  "How many rows a list box's, table's or tree's view has."
+  [w]
+  (n-rows w))
+
+(defn cell-string
+  "The text GTK last asked the backend to show in the cell at row and column."
+  [w row column]
+  (get @bound-cells [(ffi/address (native w)) row column]))
+
+(defn select-rows-natively!
+  "Select rows in a list box's, table's or tree's view, as the user does."
+  [w rows]
+  (lib/selection-unselect-all (selection-of w))
+  (doseq [r rows] (lib/selection-select-item (selection-of w) r false)))
+
+(defn activate-row!
+  "Activate a row of a list box's, table's or tree's view, as a double-click does."
+  [w row]
+  (lib/g-signal-emit-u32 (view-of w) "activate" row (ffi/null)))
+
+(defn click-column-title!
+  "Click the title of the table's column at index, as the user does: GTK sorts by it."
+  [t index]
+  (let [cols (lib/column-view-get-columns (view-of t))
+        col (lib/list-model-get-item cols index)]
+    (lib/column-view-sort-by-column (view-of t) col 0)
+    (lib/g-object-unref col)))
+
+(defn expand-natively!
+  "Open the tree's item's row, as clicking its expander does."
+  [t item]
+  (doseq [r (range (n-rows t))]
+    (when (= item (first (row-items t [r])))
+      (let [row (tree-row t r)]
+        (lib/tree-row-set-expanded row true)
+        (lib/g-object-unref row)))))

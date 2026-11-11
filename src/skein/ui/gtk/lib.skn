@@ -343,6 +343,81 @@ hasn't placed it."
 (ffi/defcfun ^:blocking paned-set-shrink-end "gtk_paned_set_shrink_end_child" void
   [p ptr, v bool])
 
+;;; Lists, tables and trees
+
+(ffi/defcfun ^:blocking g-signal-emit-u32 "g_signal_emit_by_name" void
+  [instance ptr, signal c-string & n u32, end ptr])
+(ffi/defcfun ^:blocking list-model-get-item "g_list_model_get_item" ptr [m ptr, i u32])
+(ffi/defcfun ^:blocking signal-factory-new "gtk_signal_list_item_factory_new" ptr [])
+(ffi/defcfun ^:blocking list-item-set-child "gtk_list_item_set_child" void [i ptr, child ptr])
+(ffi/defcfun ^:blocking list-item-get-child "gtk_list_item_get_child" ptr [i ptr])
+(ffi/defcfun ^:blocking list-item-get-item "gtk_list_item_get_item" ptr [i ptr])
+(ffi/defcfun ^:blocking list-item-get-position "gtk_list_item_get_position" u32 [i ptr])
+(ffi/defcfun ^:blocking list-view-new "gtk_list_view_new" ptr [model ptr, factory ptr])
+(ffi/defcfun ^:blocking list-view-set-model "gtk_list_view_set_model" void [v ptr, model ptr])
+(ffi/defcfun ^:blocking column-view-new "gtk_column_view_new" ptr [model ptr])
+(ffi/defcfun ^:blocking column-view-set-model "gtk_column_view_set_model" void
+  [v ptr, model ptr])
+(ffi/defcfun ^:blocking column-view-get-columns "gtk_column_view_get_columns" ptr [v ptr])
+(ffi/defcfun ^:blocking column-view-append-column "gtk_column_view_append_column" void
+  [v ptr, column ptr])
+(ffi/defcfun ^:blocking column-view-remove-column "gtk_column_view_remove_column" void
+  [v ptr, column ptr])
+(ffi/defcfun ^:blocking column-view-get-sorter "gtk_column_view_get_sorter" ptr [v ptr])
+(ffi/defcfun ^:blocking column-view-sort-by-column "gtk_column_view_sort_by_column" void
+  [v ptr, column ptr, direction i32])
+(ffi/defcfun ^:blocking column-view-set-row-separators "gtk_column_view_set_show_row_separators"
+  void [v ptr, show bool])
+(ffi/defcfun ^:blocking column-new "gtk_column_view_column_new" ptr [title c-string, factory ptr])
+(ffi/defcfun ^:blocking column-set-fixed-width "gtk_column_view_column_set_fixed_width" void
+  [c ptr, width i32])
+(ffi/defcfun ^:blocking column-set-expand "gtk_column_view_column_set_expand" void
+  [c ptr, v bool])
+(ffi/defcfun ^:blocking column-set-sorter "gtk_column_view_column_set_sorter" void
+  [c ptr, sorter ptr])
+(ffi/defcfun ^:blocking column-sorter-primary "gtk_column_view_sorter_get_primary_sort_column"
+  ptr [s ptr])
+(ffi/defcfun ^:blocking column-sorter-order "gtk_column_view_sorter_get_primary_sort_order"
+  i32 [s ptr])
+(ffi/defcfun ^:blocking custom-sorter-new "gtk_custom_sorter_new" ptr
+  [f ptr, data ptr, destroy ptr])
+(ffi/defcfun ^:blocking single-selection-new "gtk_single_selection_new" ptr [model ptr])
+(ffi/defcfun ^:blocking single-selection-set-autoselect "gtk_single_selection_set_autoselect"
+  void [s ptr, v bool])
+(ffi/defcfun ^:blocking single-selection-set-can-unselect
+  "gtk_single_selection_set_can_unselect" void [s ptr, v bool])
+(ffi/defcfun ^:blocking multi-selection-new "gtk_multi_selection_new" ptr [model ptr])
+(ffi/defcfun ^:blocking selection-get "gtk_selection_model_get_selection" ptr [m ptr])
+(ffi/defcfun ^:blocking selection-select-item "gtk_selection_model_select_item" bool
+  [m ptr, position u32, unselect-rest bool])
+(ffi/defcfun ^:blocking selection-unselect-all "gtk_selection_model_unselect_all" bool [m ptr])
+(ffi/defcfun ^:blocking bitset-get-size "gtk_bitset_get_size" u64 [b ptr])
+(ffi/defcfun ^:blocking bitset-get-nth "gtk_bitset_get_nth" u32 [b ptr, n u32])
+(ffi/defcfun ^:blocking bitset-unref "gtk_bitset_unref" void [b ptr])
+(ffi/defcfun ^:blocking string-object-get-string "gtk_string_object_get_string" c-string
+  [o ptr])
+(ffi/defcfun ^:blocking tree-list-model-new "gtk_tree_list_model_new" ptr
+  [root ptr, passthrough bool, autoexpand bool, create ptr, data ptr, destroy ptr])
+(ffi/defcfun ^:blocking tree-list-model-get-row "gtk_tree_list_model_get_row" ptr
+  [m ptr, position u32])
+(ffi/defcfun ^:blocking tree-row-get-item "gtk_tree_list_row_get_item" ptr [r ptr])
+(ffi/defcfun ^:blocking tree-row-set-expanded "gtk_tree_list_row_set_expanded" void
+  [r ptr, v bool])
+(ffi/defcfun ^:blocking tree-row-get-expanded "gtk_tree_list_row_get_expanded" bool [r ptr])
+(ffi/defcfun ^:blocking tree-expander-new "gtk_tree_expander_new" ptr [])
+(ffi/defcfun ^:blocking tree-expander-set-child "gtk_tree_expander_set_child" void
+  [e ptr, child ptr])
+(ffi/defcfun ^:blocking tree-expander-get-child "gtk_tree_expander_get_child" ptr [e ptr])
+(ffi/defcfun ^:blocking tree-expander-set-list-row "gtk_tree_expander_set_list_row" void
+  [e ptr, row ptr])
+
+(defn string-list-of
+  "A new GtkStringList of the strings."
+  [strings]
+  (let [l (string-list-new (ffi/null))]
+    (doseq [s strings] (string-list-append l s))
+    l))
+
 ;;; ------------------------------------------------------------------------------------
 ;;; From GTK objects to Skein's
 
