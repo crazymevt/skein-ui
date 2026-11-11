@@ -307,10 +307,10 @@
   (let [ticks (atom [])
         once (ui/after 0.05 (fn [] (swap! ticks conj :once)))
         often (ui/every 0.04 (fn [] (swap! ticks conj :often)))]
-    (cocoa/run-for! 0.3)
+    ;; A shared CI runner can't keep a 40 ms rate: wait for three ticks, up to 2 s.
+    (is (run-until! (fn [] (<= 3 (count (filter #{:often} @ticks))))) "every repeats")
     (ui/stop-timer! often)
     (is (= 1 (count (filter #{:once} @ticks))))
-    (is (<= 3 (count (filter #{:often} @ticks))))
     (is (not (ui/timer-running? once))))
   (let [saved (ui/clipboard-text)]
     (ui/set-clipboard-text! "from skein-ui")
