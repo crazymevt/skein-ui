@@ -41,6 +41,20 @@ and read the real controls."
 (defmethod native-text-changed [w field]
   nil)
 
+(defgeneric native-selection-changed [w sender]
+  "The user chose something in w's AppKit control: an item of a combo entry's list, a tab,
+a divider position.")
+
+(defmethod native-selection-changed [w sender]
+  nil)
+
+(defgeneric layout-subviews [w width height]
+  "Place the AppKit views inside w's own, after it got the size width by height; for
+widgets made of several views, such as a spin button.")
+
+(defmethod layout-subviews [w width height]
+  nil)
+
 (defgeneric native-natural-size [w]
   "w's natural [width height]: by default its AppKit view's fitting size.")
 
@@ -86,6 +100,17 @@ and read the real controls."
 (ffi/defcallback yes-imp bool [self ptr, cmd ptr]
   true)
 
+(ffi/defcallback selection-imp void [self ptr, cmd ptr, note ptr]
+  ;; A notification whose object is the control: a combo box's choice, a split view's
+  ;; divider, a clip view's bounds (scrolling).
+  (let [o (objc/send note (objc/sel "object"))]
+    (when-let [w (objc/object-for o)]
+      (native-selection-changed w o))))
+
+(ffi/defcallback tab-selected-imp void [self ptr, cmd ptr, tab-view ptr, item ptr]
+  (when-let [w (objc/object-for tab-view)]
+    (native-selection-changed w item)))
+
 ;;; ------------------------------------------------------------------------------------
 ;;; The backend, and running on the main thread
 
@@ -105,7 +130,12 @@ and read the real controls."
                       [["windowShouldClose:" should-close-imp "B@:@"]
                        ["windowDidResize:" did-resize-imp "v@:@"]])
   (objc/define-class! "SkeinTextDelegate" "NSObject"
-                      [["controlTextDidChange:" text-changed-imp "v@:@"]])
+                      [["controlTextDidChange:" text-changed-imp "v@:@"]
+                       ["textDidChange:" text-changed-imp "v@:@"]
+                       ["comboBoxSelectionDidChange:" selection-imp "v@:@"]
+                       ["splitViewDidResizeSubviews:" selection-imp "v@:@"]
+                       ["boundsDidChange:" selection-imp "v@:@"]
+                       ["tabView:didSelectTabViewItem:" tab-selected-imp "v@:@@"]])
   (objc/define-class! "SkeinFlippedView" "NSView" [["isFlipped" yes-imp "B@:"]]))
 
 (defn backend
@@ -204,7 +234,8 @@ open, a modal dialog runs or the user drags."
   (native-natural-size w))
 
 (defmethod ui/backend-set-bounds [(b cocoa-backend) w x y width height]
-  (objc/send-r-void (view w) (objc/sel "setFrame:") (objc/rect x y width height)))
+  (objc/send-r-void (view w) (objc/sel "setFrame:") (objc/rect x y width height))
+  (layout-subviews w width height))
 
 (defn- flipped-view []
   (objc/send-r (objc/alloc "SkeinFlippedView") (objc/sel "initWithFrame:") (objc/rect 0 0 0 0)))
@@ -391,6 +422,638 @@ as iOS does; Intel Macs put right before center."
   (ui/emit! e (ui/event-for e :activate)))
 
 ;;; ------------------------------------------------------------------------------------
+;;; Helpers for the controls below
+
+(def ^:private quiet-depth
+  "Above 0 while the backend changes a control itself, so the delegate's notification of
+the change isn't taken for the user's."
+  (atom 0))
+
+(defn- quiet? [] (pos? @quiet-depth))
+
+(defn- quietly [f]
+  (swap! quiet-depth inc)
+  (try (f) (finally (swap! quiet-depth dec))))
+
+(defn- also-register!
+  "Register the AppKit object o, part of w, as standing for w too. Returns o."
+  [o w]
+  (objc/register! o w))
+
+(defn- set-double! [o selector v]
+  (objc/send-d-void (view o) (objc/sel selector) (f64 (or v 0))))
+
+(defn- double-of [n selector]
+  (objc/send-double n (objc/sel selector)))
+
+(defn- whole
+  "x as an integer if it is a whole number, so a slider at 7.0 says 7."
+  [x]
+  (if (= x (math/floor x)) (int x) x))
+
+(def ^:private color-selectors
+  {:text "labelColor" :secondary-text "secondaryLabelColor" :disabled-text "tertiaryLabelColor"
+   :background "textBackgroundColor" :control-background "controlBackgroundColor"
+   :window-background "windowBackgroundColor" :selection "selectedContentBackgroundColor"
+   :accent "controlAccentColor" :separator "separatorColor" :link "linkColor"
+   :grid "gridColor" :system-red "systemRedColor" :system-orange "systemOrangeColor"
+   :system-yellow "systemYellowColor" :system-green "systemGreenColor"
+   :system-mint "systemMintColor" :system-teal "systemTealColor"
+   :system-cyan "systemCyanColor" :system-blue "systemBlueColor"
+   :system-indigo "systemIndigoColor" :system-purple "systemPurpleColor"
+   :system-pink "systemPinkColor" :system-brown "systemBrownColor"
+   :system-gray "systemGrayColor"})
+
+(defn ns-color
+  "An autoreleased NSColor for the color designator d (nil for nil): a system color
+keyword gives the platform's own, which follows dark mode."
+  [d]
+  (let [c (ui/ensure-color d)]
+    (cond (nil? c) (ffi/null)
+          (keyword? c) (objc/send (objc/cls "NSColor") (objc/sel (get color-selectors c)))
+          :else (objc/send-dddd (objc/cls "NSColor")
+                                (objc/sel "colorWithSRGBRed:green:blue:alpha:")
+                                (f64 (ui/color-red c)) (f64 (ui/color-green c))
+                                (f64 (ui/color-blue c)) (f64 (ui/color-alpha c))))))
+
+(defn color-of
+  "The skein.ui color of an NSColor, in sRGB."
+  [nc]
+  (let [c (objc/send-p nc (objc/sel "colorUsingColorSpace:")
+                       (objc/send (objc/cls "NSColorSpace") (objc/sel "sRGBColorSpace")))]
+    (ui/rgb (double-of c "redComponent") (double-of c "greenComponent")
+            (double-of c "blueComponent") (double-of c "alphaComponent"))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Images
+
+(def ^:private native-images
+  "image (by identity) -> its NSImage, made once and kept: images don't change."
+  (atom {}))
+
+(defn ns-image
+  "The NSImage of a skein.ui image, or null for nil."
+  [image]
+  (cond
+    (nil? image) (ffi/null)
+    (get @native-images image) (get @native-images image)
+    :else
+    (let [n (if (:path image)
+              (objc/send-p (objc/alloc "NSImage") (objc/sel "initWithContentsOfFile:")
+                           (objc/ns-string (:path image)))
+              (let [w (:width image) h (:height image)
+                    rep (objc/send-bitmap
+                         (objc/alloc "NSBitmapImageRep")
+                         (objc/sel (str "initWithBitmapDataPlanes:pixelsWide:pixelsHigh:"
+                                        "bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:"
+                                        "colorSpaceName:bytesPerRow:bitsPerPixel:"))
+                         (ffi/null) w h 8 4 true false (objc/ns-string "NSDeviceRGBColorSpace")
+                         (* 4 w) 32)
+                    img (objc/send-z (objc/alloc "NSImage") (objc/sel "initWithSize:")
+                                     {:width (f64 w) :height (f64 h)})]
+                (ffi/pin [p (:pixels image)]
+                  (objc/memcpy (objc/send rep (objc/sel "bitmapData")) p (* 4 w h)))
+                (objc/send-p-void img (objc/sel "addRepresentation:") rep)
+                (objc/release rep)
+                img))]
+      (when (ffi/null? n) (error "AppKit can't read the image" (pr-str (:path image))))
+      (swap! native-images assoc image n)
+      n)))
+
+(defmethod ui/backend-image-size [(b cocoa-backend) path]
+  (let [n (objc/send-p (objc/alloc "NSImage") (objc/sel "initWithContentsOfFile:")
+                       (objc/ns-string path))]
+    (when (ffi/null? n) (error "AppKit can't read the image" (pr-str path)))
+    (let [[w h] (objc/size-vec (objc/send-size n (objc/sel "size")))]
+      (objc/release n)
+      [(int (math/round w)) (int (math/round h))])))
+
+(defmethod make-native [(v ui/image-view-widget)] (init-frame "NSImageView"))
+
+(defmethod set-native [(v ui/image-view-widget) (p (= :image)) image]
+  (objc/send-p-void (view v) (objc/sel "setImage:") (ns-image image)))
+
+(defmethod set-native [(v ui/image-view-widget) (p (= :scaling)) s]
+  ;; NSImageScaleProportionallyDown 0, AxesIndependently 1, None 2
+  (set-long! v "setImageScaling:" (case s :fill 1 :none 2 0)))
+
+(defmethod native-natural-size [(v ui/image-view-widget)]
+  (if-let [i (:image v)] [(:width i) (:height i)] [0 0]))
+
+(defmethod set-native [(b ui/button-widget) (p (= :image)) image]
+  (objc/send-p-void (view b) (objc/sel "setImage:") (ns-image image))
+  ;; NSNoImage 0, NSImageOnly 1, NSImageLeft 2
+  (set-long! b "setImagePosition:" (cond (nil? image) 0 (= :icon (:style b)) 1 :else 2)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Toggles, check boxes and radio buttons
+
+(defn- make-toggle [button-type]
+  (let [n (init-frame "NSButton")]
+    (objc/send-l-void n (objc/sel "setButtonType:") button-type)
+    (when (= button-type 1) (objc/send-l-void n (objc/sel "setBezelStyle:") 1))
+    (connect-action! n)))
+
+(defmethod make-native [(t ui/toggle-button-widget)] (make-toggle 1)) ; NSButtonTypePushOnPushOff
+(defmethod make-native [(t ui/check-box-widget)] (make-toggle 3))     ; NSButtonTypeSwitch
+(defmethod make-native [(t ui/radio-button-widget)] (make-toggle 4))  ; NSButtonTypeRadio
+
+(defmethod set-native [(t ui/toggle-button-widget) (p (= :label)) v]
+  (set-string! t "setTitle:" v))
+
+(defmethod set-native [(t ui/toggle-button-widget) (p (= :checked)) v]
+  (set-long! t "setState:" (if v 1 0)))
+
+(defmethod set-native [(t ui/toggle-button-widget) (p (= :image)) image]
+  (objc/send-p-void (view t) (objc/sel "setImage:") (ns-image image))
+  (set-long! t "setImagePosition:" (cond (nil? image) 0 (= :icon (:style t)) 1 :else 2)))
+
+(defmethod native-action [(t ui/toggle-button-widget) sender]
+  (let [on (= 1 (objc/send-long sender (objc/sel "state")))]
+    (when (not= on (boolean (:checked t)))
+      (ui/toggled-by-user! t on))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Sliders, spin buttons, progress bars and spinners
+
+(defmethod make-native [(s ui/slider-widget)]
+  (let [n (init-frame "NSSlider")]
+    (objc/send-b-void n (objc/sel "setContinuous:") true)
+    (connect-action! n)))
+
+(defmethod set-native [(s ui/slider-widget) (p (= :min)) v] (set-double! s "setMinValue:" v))
+(defmethod set-native [(s ui/slider-widget) (p (= :max)) v] (set-double! s "setMaxValue:" v))
+(defmethod set-native [(s ui/slider-widget) (p (= :value)) v] (set-double! s "setDoubleValue:" v))
+(defmethod set-native [(s ui/slider-widget) (p (= :ticks)) v]
+  (set-long! s "setNumberOfTickMarks:" (or v 0)))
+(defmethod set-native [(s ui/slider-widget) (p (= :snap)) v]
+  (set-bool! s "setAllowsTickMarkValuesOnly:" v))
+(defmethod set-native [(s ui/slider-widget) (p (= :orientation)) v]
+  (set-bool! s "setVertical:" (= v :vertical)))
+
+(defmethod native-natural-size [(s ui/slider-widget)]
+  (let [[w h] (call-next-method)]
+    (if (= :vertical (:orientation s)) [w (max h 120)] [(max w 120) h])))
+
+(defmethod native-action [(s ui/slider-widget) sender]
+  (let [v (whole (double-of sender "doubleValue"))]
+    (when (not= v (:value s))
+      (ui/changed-by-user! s :value v))))
+
+(defn- spin-parts
+  "The field and the stepper inside a spin button's view."
+  [w]
+  (let [subviews (objc/send (view w) (objc/sel "subviews"))]
+    [(objc/send-l subviews (objc/sel "objectAtIndex:") 0)
+     (objc/send-l subviews (objc/sel "objectAtIndex:") 1)]))
+
+(defmethod make-native [(w ui/spin-button-widget)]
+  (let [n (flipped-view)
+        field (init-frame "NSTextField")
+        stepper (init-frame "NSStepper")]
+    (connect-action! field)
+    (connect-action! stepper)
+    (objc/send-b-void stepper (objc/sel "setValueWraps:") false)
+    (objc/send-p-void n (objc/sel "addSubview:") field)
+    (objc/send-p-void n (objc/sel "addSubview:") stepper)
+    (also-register! field w)
+    (also-register! stepper w)
+    (objc/release field)
+    (objc/release stepper)
+    n))
+
+(defn- show-spin-value! [w]
+  (let [[field stepper] (spin-parts w)
+        v (or (:value w) 0)]
+    (objc/send-d-void stepper (objc/sel "setDoubleValue:") (f64 v))
+    (objc/send-p-void field (objc/sel "setStringValue:")
+                      (objc/ns-string (format (str "%." (or (:digits w) 0) "f") (f64 v))))))
+
+(defmethod set-native [(w ui/spin-button-widget) (p (= :min)) v]
+  (objc/send-d-void (second (spin-parts w)) (objc/sel "setMinValue:") (f64 v)))
+(defmethod set-native [(w ui/spin-button-widget) (p (= :max)) v]
+  (objc/send-d-void (second (spin-parts w)) (objc/sel "setMaxValue:") (f64 v)))
+(defmethod set-native [(w ui/spin-button-widget) (p (= :step)) v]
+  (objc/send-d-void (second (spin-parts w)) (objc/sel "setIncrement:") (f64 v)))
+(defmethod set-native [(w ui/spin-button-widget) (p (= :value)) v] (show-spin-value! w))
+(defmethod set-native [(w ui/spin-button-widget) (p (= :digits)) v] (show-spin-value! w))
+
+(defmethod native-natural-size [(w ui/spin-button-widget)]
+  [(+ 64 (* 7 (or (:digits w) 0))) 22])
+
+(defmethod layout-subviews [(w ui/spin-button-widget) width height]
+  (let [[field stepper] (spin-parts w)]
+    (objc/send-r-void field (objc/sel "setFrame:") (objc/rect 0 0 (max 0 (- width 19)) height))
+    (objc/send-r-void stepper (objc/sel "setFrame:") (objc/rect (max 0 (- width 15)) 0 15 height))))
+
+(defmethod native-action [(w ui/spin-button-widget) sender]
+  (let [[field stepper] (spin-parts w)
+        v (if (= (ffi/address sender) (ffi/address stepper))
+            (double-of stepper "doubleValue")
+            (math/clamp (double-of field "doubleValue") (:min w) (:max w)))
+        v (whole v)]
+    (ui/sync-property! w :value v)
+    (show-spin-value! w)
+    (ui/emit! w (ui/event-for w :changed :value v))))
+
+(defmethod make-native [(p ui/progress-bar-widget)]
+  (let [n (init-frame "NSProgressIndicator")]
+    (objc/send-l-void n (objc/sel "setStyle:") 0)
+    n))
+
+(defmethod set-native [(b ui/progress-bar-widget) (p (= :min)) v] (set-double! b "setMinValue:" v))
+(defmethod set-native [(b ui/progress-bar-widget) (p (= :max)) v] (set-double! b "setMaxValue:" v))
+(defmethod set-native [(b ui/progress-bar-widget) (p (= :value)) v]
+  (set-double! b "setDoubleValue:" v))
+(defmethod set-native [(b ui/progress-bar-widget) (p (= :indeterminate)) v]
+  (set-bool! b "setIndeterminate:" v)
+  (objc/send-p-void (view b) (objc/sel (if v "startAnimation:" "stopAnimation:")) (ffi/null)))
+
+(defmethod native-natural-size [(b ui/progress-bar-widget)]
+  [120 (second (call-next-method))])
+
+(defmethod make-native [(s ui/spinner-widget)]
+  (let [n (init-frame "NSProgressIndicator")]
+    (objc/send-l-void n (objc/sel "setStyle:") 1)
+    (objc/send-b-void n (objc/sel "setDisplayedWhenStopped:") false)
+    n))
+
+(defmethod set-native [(s ui/spinner-widget) (p (= :active)) v]
+  (objc/send-p-void (view s) (objc/sel (if v "startAnimation:" "stopAnimation:")) (ffi/null)))
+
+(defmethod native-natural-size [(s ui/spinner-widget)]
+  [16 16])
+
+;;; ------------------------------------------------------------------------------------
+;;; Combo boxes and combo entries
+
+(defmethod make-native [(c ui/combo-box-widget)]
+  (connect-action! (objc/send-rb (objc/alloc "NSPopUpButton")
+                                 (objc/sel "initWithFrame:pullsDown:") (objc/rect 0 0 0 0) false)))
+
+(defn- show-items! [c]
+  (let [n (view c)]
+    (objc/send-void n (objc/sel "removeAllItems"))
+    (doseq [i (range (count (:items c)))]
+      (objc/send-p-void n (objc/sel "addItemWithTitle:") (objc/ns-string (ui/item-text c i))))))
+
+(defmethod set-native [(c ui/combo-box-widget) (p (= :items)) v]
+  (show-items! c)
+  (set-long! c "selectItemAtIndex:" (or (:selected-index c) -1)))
+
+(defmethod set-native [(c ui/combo-box-widget) (p (= :item-label)) v]
+  (set-native c :items (:items c)))
+
+(defmethod set-native [(c ui/combo-box-widget) (p (= :selected-index)) v]
+  (set-long! c "selectItemAtIndex:" (or v -1)))
+
+(defmethod native-action [(c ui/combo-box-widget) sender]
+  (let [i (objc/send-long sender (objc/sel "indexOfSelectedItem"))]
+    (ui/chosen-by-user! c (when (>= i 0) i))))
+
+(defmethod make-native [(c ui/combo-entry-widget)]
+  (let [n (init-frame "NSComboBox")]
+    (objc/send-p-void n (objc/sel "setDelegate:") (:text-delegate (ui/current-backend)))
+    (connect-action! n)))
+
+(defmethod set-native [(c ui/combo-entry-widget) (p (= :items)) v]
+  (objc/send-void (view c) (objc/sel "removeAllItems"))
+  (doseq [i (range (count v))]
+    (objc/send-p-void (view c) (objc/sel "addItemWithObjectValue:")
+                      (objc/ns-string (ui/item-text c i)))))
+
+(defmethod set-native [(c ui/combo-entry-widget) (p (= :item-label)) v]
+  (set-native c :items (:items c)))
+
+(defmethod set-native [(c ui/combo-entry-widget) (p (= :text)) v]
+  (set-string! c "setStringValue:" v))
+
+(defmethod native-text-changed [(c ui/combo-entry-widget) field]
+  (ui/changed-by-user! c :text (objc/string-of (objc/send field (objc/sel "stringValue")))))
+
+(defmethod native-selection-changed [(c ui/combo-entry-widget) sender]
+  (let [i (objc/send-long sender (objc/sel "indexOfSelectedItem"))]
+    (when (>= i 0)
+      (ui/changed-by-user! c :text (ui/item-text c i)))))
+
+(defmethod native-action [(c ui/combo-entry-widget) sender]
+  (ui/emit! c (ui/event-for c :activate)))
+
+(defmethod native-natural-size [(c ui/combo-entry-widget)]
+  (let [[w h] (call-next-method)] [(max w 120) h]))
+
+;;; ------------------------------------------------------------------------------------
+;;; Color buttons and date pickers
+
+(defmethod make-native [(c ui/color-button-widget)]
+  (connect-action! (init-frame "NSColorWell")))
+
+(defmethod set-native [(c ui/color-button-widget) (p (= :color)) v]
+  (objc/send-p-void (view c) (objc/sel "setColor:") (ns-color v)))
+
+(defmethod native-action [(c ui/color-button-widget) sender]
+  (ui/changed-by-user! c :color (color-of (objc/send sender (objc/sel "color")))))
+
+(defmethod native-natural-size [(c ui/color-button-widget)]
+  [44 24])
+
+(defmethod make-native [(d ui/date-picker-widget)]
+  (let [n (init-frame "NSDatePicker")]
+    (objc/send-l-void n (objc/sel "setDatePickerStyle:") 0)
+    (connect-action! n)))
+
+(defmethod set-native [(d ui/date-picker-widget) (p (= :date)) v]
+  (objc/send-p-void (view d) (objc/sel "setDateValue:")
+                    (objc/send-d (objc/cls "NSDate") (objc/sel "dateWithTimeIntervalSince1970:")
+                                 (/ (f64 v) 1000.0))))
+
+(defmethod set-native [(d ui/date-picker-widget) (p (= :mode)) v]
+  ;; NSDatePickerElementFlagYearMonthDay 0xe0, HourMinuteSecond 0x0e
+  (set-long! d "setDatePickerElements:" (case v :time 0x0e :date-time 0xee 0xe0)))
+
+(defmethod native-action [(d ui/date-picker-widget) sender]
+  (let [ms (int (math/round (* 1000 (double-of (objc/send sender (objc/sel "dateValue"))
+                                               "timeIntervalSince1970"))))]
+    (ui/changed-by-user! d :date ms)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Frames
+
+(defmethod make-native [(f ui/frame-widget)]
+  (let [n (init-frame "NSBox")
+        content (flipped-view)]
+    (objc/send-p-void n (objc/sel "setContentView:") content)
+    (objc/release content)
+    n))
+
+(defmethod container-view [(f ui/frame-widget)]
+  (objc/send (view f) (objc/sel "contentView")))
+
+(defmethod set-native [(f ui/frame-widget) (p (= :title)) v]
+  ;; NSNoTitle 0, NSAtTop 2
+  (set-long! f "setTitlePosition:" (if v 2 0))
+  (set-string! f "setTitle:" v))
+
+(defn- frame-decoration
+  "What an NSBox adds around its content: the size it takes for a 200 by 200 content."
+  [f]
+  (let [n (view f)
+        old (objc/send-rect n (objc/sel "frame"))
+        [ox oy ow oh] (objc/rect-vec old)]
+    (objc/send-r-void n (objc/sel "setFrameFromContentFrame:") (objc/rect 0 0 200 200))
+    (let [[_ _ w h] (objc/rect-vec (objc/send-rect n (objc/sel "frame")))]
+      (objc/send-r-void n (objc/sel "setFrame:") (objc/rect ox oy ow oh))
+      [(int (math/ceil (- w 200))) (int (math/ceil (- h 200)))])))
+
+(defmethod ui/backend-decoration-size [(b cocoa-backend) (f ui/frame-widget)]
+  (frame-decoration f))
+
+(defmethod ui/backend-content-area [(b cocoa-backend) (f ui/frame-widget) width height]
+  (let [[dw dh] (frame-decoration f)]
+    [0 0 (max 0 (- width dw)) (max 0 (- height dh))]))
+
+;;; ------------------------------------------------------------------------------------
+;;; Text views
+
+(defn- text-view-of
+  "The NSTextView inside a text view widget's scroll view."
+  [v]
+  (objc/send (view v) (objc/sel "documentView")))
+
+(defmethod make-native [(v ui/text-view-widget)]
+  (let [scroll (init-frame "NSScrollView")
+        tv (objc/send-r (objc/alloc "NSTextView") (objc/sel "initWithFrame:")
+                        (objc/rect 0 0 200 100))]
+    (objc/send-b-void scroll (objc/sel "setHasVerticalScroller:") true)
+    (objc/send-b-void tv (objc/sel "setVerticallyResizable:") true)
+    (objc/send-l-void tv (objc/sel "setAutoresizingMask:") 2) ; NSViewWidthSizable
+    (objc/send-b-void tv (objc/sel "setRichText:") false)
+    (objc/send-p-void tv (objc/sel "setDelegate:") (:text-delegate (ui/current-backend)))
+    (objc/send-p-void scroll (objc/sel "setDocumentView:") tv)
+    (also-register! tv v)
+    (objc/release tv)
+    scroll))
+
+(defmethod set-native [(v ui/text-view-widget) (p (= :text)) s]
+  (objc/send-p-void (text-view-of v) (objc/sel "setString:") (objc/ns-string (or s ""))))
+
+(defmethod set-native [(v ui/text-view-widget) (p (= :editable)) e]
+  (objc/send-b-void (text-view-of v) (objc/sel "setEditable:") (boolean e)))
+
+(defmethod set-native [(v ui/text-view-widget) (p (= :border)) b]
+  (set-long! v "setBorderType:" (if b 2 0)))   ; NSBezelBorder 2, NSNoBorder 0
+
+(defmethod set-native [(v ui/text-view-widget) (p (= :wrap)) w]
+  (let [tv (text-view-of v)
+        container (objc/send tv (objc/sel "textContainer"))]
+    (objc/send-b-void (view v) (objc/sel "setHasHorizontalScroller:") (not w))
+    (objc/send-b-void tv (objc/sel "setHorizontallyResizable:") (not w))
+    (objc/send-b-void container (objc/sel "setWidthTracksTextView:") (boolean w))
+    (when-not w
+      (objc/send-z-void container (objc/sel "setContainerSize:")
+                        {:width 1.0e7 :height 1.0e7}))))
+
+(defmethod set-native [(v ui/text-view-widget) (p (= :placeholder)) s]
+  (let [tv (text-view-of v)]
+    (when (objc/responds? tv "setPlaceholderString:")
+      (objc/send-p-void tv (objc/sel "setPlaceholderString:") (objc/ns-string s)))))
+
+(defmethod native-natural-size [(v ui/text-view-widget)]
+  [240 120])
+
+(defmethod native-text-changed [(v ui/text-view-widget) tv]
+  (ui/changed-by-user! v :text (objc/string-of (objc/send tv (objc/sel "string")))))
+
+(defmethod ui/backend-text-append [(b cocoa-backend) v s]
+  (let [tv (text-view-of v)
+        storage (objc/send tv (objc/sel "textStorage"))
+        end (objc/send-long storage (objc/sel "length"))]
+    (objc/send-range-p-void storage (objc/sel "replaceCharactersInRange:withString:")
+                            {:location end :length 0} (objc/ns-string s))
+    (objc/send-p-void tv (objc/sel "scrollToEndOfDocument:") (ffi/null))))
+
+(defmethod ui/backend-text-selection [(b cocoa-backend) v]
+  (let [r (objc/send-range (text-view-of v) (objc/sel "selectedRange"))
+        start (ffi/field r objc/ns-range :location)]
+    [start (+ start (ffi/field r objc/ns-range :length))]))
+
+(defmethod ui/backend-set-text-selection [(b cocoa-backend) v start end]
+  (objc/send-range-void (text-view-of v) (objc/sel "setSelectedRange:")
+                        {:location start :length (- end start)}))
+
+(defmethod ui/backend-text-insert [(b cocoa-backend) v s]
+  (let [tv (text-view-of v)
+        [start end] (ui/backend-text-selection b v)]
+    (objc/send-range-p-void (objc/send tv (objc/sel "textStorage"))
+                            (objc/sel "replaceCharactersInRange:withString:")
+                            {:location start :length (- end start)} (objc/ns-string s))
+    (ui/backend-set-text-selection b v (+ start (count s)) (+ start (count s)))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Notebooks
+
+(defmethod make-native [(n ui/notebook-widget)]
+  (let [tv (init-frame "NSTabView")]
+    (objc/send-p-void tv (objc/sel "setDelegate:") (:text-delegate (ui/current-backend)))
+    tv))
+
+(defn- tab-item
+  "The NSTabViewItem of the notebook's page at index."
+  [n index]
+  (objc/send-l (view n) (objc/sel "tabViewItemAtIndex:") index))
+
+(defmethod ui/backend-add-child [(b cocoa-backend) (n ui/notebook-widget) page]
+  (let [item (objc/send-p (objc/alloc "NSTabViewItem") (objc/sel "initWithIdentifier:")
+                          (ffi/null))
+        wrapper (flipped-view)]
+    (objc/send-p-void wrapper (objc/sel "addSubview:") (view page))
+    (objc/send-p-void item (objc/sel "setView:") wrapper)
+    (objc/send-p-void item (objc/sel "setLabel:") (objc/ns-string (or (:tab-label page) "")))
+    (quietly (fn [] (objc/send-p-void (view n) (objc/sel "addTabViewItem:") item)))
+    (objc/release wrapper)
+    (objc/release item)))
+
+(defmethod ui/backend-remove-child [(b cocoa-backend) (n ui/notebook-widget) page]
+  (let [wrapper (objc/send (view page) (objc/sel "superview"))
+        items (objc/send (view n) (objc/sel "tabViewItems"))
+        n-items (objc/send-long items (objc/sel "count"))]
+    (objc/send-void (view page) (objc/sel "removeFromSuperview"))
+    (doseq [i (range n-items)]
+      (let [item (objc/send-l items (objc/sel "objectAtIndex:") i)]
+        (when (= (ffi/address (objc/send item (objc/sel "view"))) (ffi/address wrapper))
+          (quietly (fn [] (objc/send-p-void (view n) (objc/sel "removeTabViewItem:") item))))))))
+
+(defmethod ui/backend-set-page-label [(b cocoa-backend) n page label]
+  (when-let [i (index-of (:children n) page)]
+    (objc/send-p-void (tab-item n i) (objc/sel "setLabel:") (objc/ns-string (or label "")))))
+
+(defmethod set-native [(n ui/notebook-widget) (p (= :selected-index)) i]
+  (when (< -1 (or i -1) (count (:children n)))
+    (quietly (fn [] (set-long! n "selectTabViewItemAtIndex:" i)))))
+
+(defmethod set-native [(n ui/notebook-widget) (p (= :tab-position)) v]
+  ;; NSTopTabsBezelBorder 0, NSLeftTabsBezelBorder 1, NSBottomTabsBezelBorder 2, right 3
+  (set-long! n "setTabViewType:" (case v :left 1 :bottom 2 :right 3 0)))
+
+(defn- tab-decoration [n]
+  (let [tv (view n)
+        [_ _ ow oh] (objc/rect-vec (objc/send-rect tv (objc/sel "frame")))
+        _ (objc/send-z-void tv (objc/sel "setFrameSize:") {:width 300.0 :height 300.0})
+        [_ _ cw ch] (objc/rect-vec (objc/send-rect tv (objc/sel "contentRect")))]
+    (objc/send-z-void tv (objc/sel "setFrameSize:") {:width (f64 ow) :height (f64 oh)})
+    [(int (math/ceil (- 300 cw))) (int (math/ceil (- 300 ch)))]))
+
+(defmethod ui/backend-decoration-size [(b cocoa-backend) (n ui/notebook-widget)]
+  (tab-decoration n))
+
+(defmethod ui/backend-content-area [(b cocoa-backend) (n ui/notebook-widget) width height]
+  (let [[dw dh] (tab-decoration n)]
+    [0 0 (max 0 (- width dw)) (max 0 (- height dh))]))
+
+(defmethod native-selection-changed [(n ui/notebook-widget) item]
+  (when-not (quiet?)
+    (let [i (objc/send-p-long (view n) (objc/sel "indexOfTabViewItem:") item)]
+      (when (not= i (:selected-index n))
+        (ui/page-changed-by-user! n i)))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Split panes
+
+(defmethod make-native [(p ui/paned-widget)]
+  (let [n (init-frame "NSSplitView")]
+    (objc/send-l-void n (objc/sel "setDividerStyle:") 2)   ; NSSplitViewDividerStyleThin
+    (objc/send-p-void n (objc/sel "setDelegate:") (:text-delegate (ui/current-backend)))
+    n))
+
+(defmethod set-native [(p ui/paned-widget) (k (= :orientation)) v]
+  (set-bool! p "setVertical:" (= v :horizontal)))
+
+(defmethod ui/backend-decoration-size [(b cocoa-backend) (p ui/paned-widget)]
+  (let [t (int (math/ceil (double-of (view p) "dividerThickness")))] [t t]))
+
+(defmethod native-selection-changed [(p ui/paned-widget) split-view]
+  (when-not (quiet?)
+    (when-let [first-pane (first (ui/visible-children p))]
+      (let [[_ _ w h] (objc/rect-vec (objc/send-rect (view first-pane) (objc/sel "frame")))
+            position (int (math/round (if (= :horizontal (:orientation p)) w h)))]
+        (when (not= position (:position p))
+          (ui/divider-moved-by-user! p position))))))
+
+(defmethod ui/backend-set-bounds [(b cocoa-backend) (w ui/widget) x y width height]
+  ;; A split view's panes are placed by layout: its own resizing notices aren't the user's.
+  (quietly (fn [] (call-next-method))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Scrolled windows
+
+(defn- clip-view [s] (objc/send (view s) (objc/sel "contentView")))
+
+(defmethod make-native [(s ui/scrolled-window-widget)]
+  (let [n (init-frame "NSScrollView")
+        document (flipped-view)
+        clip (objc/send n (objc/sel "contentView"))
+        b (ui/current-backend)]
+    (objc/send-p-void n (objc/sel "setDocumentView:") document)
+    (objc/release document)
+    (objc/send-b-void clip (objc/sel "setPostsBoundsChangedNotifications:") true)
+    (objc/send-pppp-void (objc/send (objc/cls "NSNotificationCenter") (objc/sel "defaultCenter"))
+                         (objc/sel "addObserver:selector:name:object:")
+                         (:text-delegate b) (objc/sel "boundsDidChange:")
+                         (objc/ns-string "NSViewBoundsDidChangeNotification") clip)
+    (also-register! clip s)
+    n))
+
+(defmethod container-view [(s ui/scrolled-window-widget)]
+  (objc/send (view s) (objc/sel "documentView")))
+
+(defn- set-scrollers! [s]
+  (let [n (view s)
+        h (:horizontal-policy s)
+        v (:vertical-policy s)]
+    (objc/send-b-void n (objc/sel "setHasHorizontalScroller:") (not= h :never))
+    (objc/send-b-void n (objc/sel "setHasVerticalScroller:") (not= v :never))
+    (objc/send-b-void n (objc/sel "setAutohidesScrollers:")
+                      (not (or (= h :always) (= v :always))))))
+
+(defmethod set-native [(s ui/scrolled-window-widget) (p (= :horizontal-policy)) v]
+  (set-scrollers! s))
+
+(defmethod set-native [(s ui/scrolled-window-widget) (p (= :vertical-policy)) v]
+  (set-scrollers! s))
+
+(defmethod set-native [(s ui/scrolled-window-widget) (p (= :border)) v]
+  (set-long! s "setBorderType:" (if v 2 0)))
+
+(defmethod ui/backend-decoration-size [(b cocoa-backend) (s ui/scrolled-window-widget)]
+  (if (:border s) [2 2] [0 0]))
+
+(defmethod ui/backend-content-area [(b cocoa-backend) (s ui/scrolled-window-widget)
+                                    width height]
+  (let [[w h] (objc/size-vec (objc/send-size (view s) (objc/sel "contentSize")))]
+    [0 0 (int (math/floor w)) (int (math/floor h))]))
+
+(defmethod ui/backend-set-scroll-extent [(b cocoa-backend) s width height]
+  (let [n (view s)
+        before (objc/size-vec (objc/send-size n (objc/sel "contentSize")))]
+    (quietly
+     (fn [] (objc/send-z-void (objc/send n (objc/sel "documentView")) (objc/sel "setFrameSize:")
+                              {:width (f64 width) :height (f64 height)})))
+    (let [after (objc/size-vec (objc/send-size n (objc/sel "contentSize")))]
+      (when (not= before after)
+        (mapv (fn [x] (int (math/floor x))) after)))))
+
+(defmethod ui/backend-scroll-to [(b cocoa-backend) s x y]
+  (quietly
+   (fn []
+     (objc/send-point-void (clip-view s) (objc/sel "scrollToPoint:") {:x (f64 x) :y (f64 y)})
+     (objc/send-p-void (view s) (objc/sel "reflectScrolledClipView:") (clip-view s)))))
+
+(defmethod native-selection-changed [(s ui/scrolled-window-widget) clip]
+  (when-not (quiet?)
+    (let [[x y] (objc/rect-vec (objc/send-rect clip (objc/sel "bounds")))]
+      (ui/scrolled-by-user! s (int (math/round x)) (int (math/round y))))))
+
+;;; ------------------------------------------------------------------------------------
 ;;; For tests: the real controls, read and acted on
 
 (defn native-frame
@@ -438,3 +1101,76 @@ string value."
   (let [n (view e)]
     (objc/send-pp-void n (objc/sel "sendAction:to:")
                        (objc/send n (objc/sel "action")) (objc/send n (objc/sel "target")))))
+
+(defn native-double
+  "The double the widget's AppKit control answers to the selector named name."
+  [w name]
+  (objc/send-double (view w) (objc/sel name)))
+
+(defn set-native-double!
+  "Set a slider's double value and send its action, as dragging it does."
+  [w v]
+  (let [n (view w)]
+    (objc/send-d-void n (objc/sel "setDoubleValue:") (f64 v))
+    (objc/send-pp-void n (objc/sel "sendAction:to:")
+                       (objc/send n (objc/sel "action")) (objc/send n (objc/sel "target")))))
+
+(defn native-spin-text
+  "The text in a spin button's field."
+  [w]
+  (objc/call-with-pool
+   (fn [] (objc/string-of (objc/send (first (spin-parts w)) (objc/sel "stringValue"))))))
+
+(defn native-title-of-selected
+  "The title of a combo box's chosen item."
+  [c]
+  (objc/call-with-pool
+   (fn [] (objc/string-of (objc/send (view c) (objc/sel "titleOfSelectedItem"))))))
+
+(defn choose-item!
+  "Choose the item at index in a combo box, as the user does."
+  [c index]
+  (let [n (view c)]
+    (objc/send-l-void n (objc/sel "selectItemAtIndex:") index)
+    (objc/send-pp-void n (objc/sel "sendAction:to:")
+                       (objc/send n (objc/sel "action")) (objc/send n (objc/sel "target")))))
+
+(defn native-color
+  "The color a color button shows."
+  [c]
+  (objc/call-with-pool (fn [] (color-of (objc/send (view c) (objc/sel "color"))))))
+
+(defn native-date
+  "The date a date picker shows, in milliseconds since 1970."
+  [d]
+  (objc/call-with-pool
+   (fn [] (int (math/round (* 1000 (double-of (objc/send (view d) (objc/sel "dateValue"))
+                                              "timeIntervalSince1970")))))))
+
+(defn has-image?
+  "True if the image view or button shows an image."
+  [w]
+  (not (ffi/null? (objc/send (view w) (objc/sel "image")))))
+
+(defn tab-labels
+  "The labels of a notebook's tabs."
+  [n]
+  (objc/call-with-pool
+   (fn [] (mapv (fn [i] (objc/string-of (objc/send (tab-item n i) (objc/sel "label"))))
+                (range (objc/send-long (view n) (objc/sel "numberOfTabViewItems")))))))
+
+(defn choose-tab!
+  "Click the notebook's tab at index, as the user does."
+  [n index]
+  (objc/send-l-void (view n) (objc/sel "selectTabViewItemAtIndex:") index))
+
+(defn scroll-origin
+  "The point of a scrolled window's content at its top left, [x y]."
+  [s]
+  (let [[x y] (objc/rect-vec (objc/send-rect (clip-view s) (objc/sel "bounds")))]
+    [(int (math/round x)) (int (math/round y))]))
+
+(defn native-text
+  "The text in a text view's NSTextView."
+  [v]
+  (objc/call-with-pool (fn [] (objc/string-of (objc/send (text-view-of v) (objc/sel "string"))))))

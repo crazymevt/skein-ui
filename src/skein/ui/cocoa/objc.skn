@@ -36,6 +36,9 @@ and all of them run on the main thread, which no fiber waits to share."
 (ffi/defcstruct ns-point
   (x f64) (y f64))
 
+(ffi/defcstruct ns-range
+  (location u64) (length u64))
+
 (defn rect
   "An NSRect argument: a map of :x, :y, :width and :height."
   [x y width height]
@@ -123,6 +126,25 @@ and all of them run on the main thread, which no fiber waits to share."
   [self ptr, sel ptr, type u64, location ns-point, flags u64, time f64, window i64,
    context ptr, subtype i16, data1 i64, data2 i64])
 (ffi/defcfun ^:blocking send-pb-void "objc_msgSend" void [self ptr, sel ptr, a ptr, b bool])
+(ffi/defcfun ^:blocking send-p-long "objc_msgSend" i64 [self ptr, sel ptr, a ptr])
+(ffi/defcfun ^:blocking send-pp-bool "objc_msgSend" bool [self ptr, sel ptr, a ptr, b ptr])
+(ffi/defcfun ^:blocking send-ppp-void "objc_msgSend" void [self ptr, sel ptr, a ptr, b ptr, c ptr])
+(ffi/defcfun ^:blocking send-pppp-void "objc_msgSend" void
+  [self ptr, sel ptr, a ptr, b ptr, c ptr, d ptr])
+(ffi/defcfun ^:blocking send-rb "objc_msgSend" ptr [self ptr, sel ptr, r ns-rect, b bool])
+(ffi/defcfun ^:blocking send-z "objc_msgSend" ptr [self ptr, sel ptr, z ns-size])
+(ffi/defcfun ^:blocking send-dddd "objc_msgSend" ptr
+  [self ptr, sel ptr, a f64, b f64, c f64, d f64])
+(ffi/defcfun ^:blocking send-dl-void "objc_msgSend" void [self ptr, sel ptr, d f64, n i64])
+(ffi/defcfun ^:blocking send-point-void "objc_msgSend" void [self ptr, sel ptr, p ns-point])
+(ffi/defcfun ^:blocking send-range "objc_msgSend" ns-range [self ptr, sel ptr])
+(ffi/defcfun ^:blocking send-range-void "objc_msgSend" void [self ptr, sel ptr, r ns-range])
+(ffi/defcfun ^:blocking send-range-p-void "objc_msgSend" void
+  [self ptr, sel ptr, r ns-range, s ptr])
+(ffi/defcfun ^:blocking send-bitmap "objc_msgSend" ptr
+  [self ptr, sel ptr, planes ptr, width i64, height i64, bits i64, samples i64, alpha bool,
+   planar bool, space ptr, row-bytes i64, pixel-bits i64])
+(ffi/defcfun memcpy "memcpy" ptr [to ptr, from ptr, n u64])
 
 (defn new-object
   "A new instance of the class named class-name: [[class alloc] init], owned (+1)."
