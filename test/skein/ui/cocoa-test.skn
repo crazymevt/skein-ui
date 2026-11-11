@@ -2,6 +2,7 @@
   (:require [skein.test :refer [deftest is are testing use-fixtures]]
             [skein.ui :as ui]
             [skein.ui.cocoa :as cocoa]
+            [skein.ui.cocoa.objc :as objc]
             [skein.system :as system]
             [skein.io :as io]
             [skein.ffi :as ffi]
@@ -12,9 +13,27 @@
 
 (def mac? (= :macos (system/os)))
 
-(def backend (when mac? (delay (cocoa/backend))))
+(def backend
+  (when mac?
+    (delay
+      (let [b (cocoa/backend)
+            info (objc/send (objc/cls "NSProcessInfo") (objc/sel "processInfo"))]
+        ;; On CI every application is in the background, where App Nap slows timers and
+        ;; the run loop: a user-initiated, latency-critical activity keeps the tests' pace.
+        ;; NSActivityUserInitiated 0x00FFFFFF | NSActivityLatencyCritical 0xFF00000000.
+        (objc/retain (objc/send-lp info (objc/sel "beginActivityWithOptions:reason:")
+                                   0xFF00FFFFFF (objc/ns-string "skein-ui's tests")))
+        b))))
 
 (use-fixtures :each (fn [t] (when mac? (ui/use-backend! @backend) (t))))
+
+(defn- run-until!
+  "Run the event loop until (done?) or two seconds have passed; returns (done?)."
+  [done?]
+  (loop [n 0]
+    (cond (done?) true
+          (>= n 100) false
+          :else (do (cocoa/run-for! 0.02) (recur (inc n))))))
 
 (deftest windows-and-labels
   (let [l (ui/label {:text "Hello" :tooltip "greeting"})
@@ -430,8 +449,7 @@
           (is (< 0 ch 30))
           (is (< y 40) "on the second line"))
         (ui/show-completion-popup! c v {:items ["cab" "car" "cat"]})
-        (cocoa/run-for! 0.1)
-        (is (cocoa/native-surface-shown? c))
+        (is (run-until! (fn [] (cocoa/native-surface-shown? c))))
         (let [[px py pw ph] (cocoa/native-panel-frame c)
               [cx cy _ ch] (cocoa/native-screen-rect v (ui/caret-rectangle v))]
           (is (= (:size c) [pw ph]))

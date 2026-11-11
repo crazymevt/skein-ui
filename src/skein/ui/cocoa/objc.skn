@@ -148,6 +148,7 @@ and all of them run on the main thread, which no fiber waits to share."
 (ffi/defcfun ^:blocking send-pb "objc_msgSend" ptr [self ptr, sel ptr, a ptr, b bool])
 (ffi/defcfun ^:blocking send-pp-long "objc_msgSend" i64 [self ptr, sel ptr, a ptr, b ptr])
 (ffi/defcfun ^:blocking send-ll "objc_msgSend" ptr [self ptr, sel ptr, a i64, b i64])
+(ffi/defcfun ^:blocking send-lp "objc_msgSend" ptr [self ptr, sel ptr, n i64, p ptr])
 (ffi/defcfun ^:blocking send-pl "objc_msgSend" ptr [self ptr, sel ptr, a ptr, b i64])
 (ffi/defcfun ^:blocking send-ppl "objc_msgSend" ptr [self ptr, sel ptr, a ptr, b ptr, n i64])
 (ffi/defcfun ^:blocking send-pbp-void "objc_msgSend" void [self ptr, sel ptr, a ptr, b bool, c ptr])
