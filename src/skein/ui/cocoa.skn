@@ -152,6 +152,19 @@ button the mouse button, event the NSEvent.")
     (objc/ns-string (native-cell-text w row (column-index tv col)))
     (ffi/null)))
 
+(def ^:private cell-view
+  "The NSTableCellView of a list's, table's or tree's cell (defined below).")
+
+(ffi/defcallback table-view-imp ptr [self ptr, cmd ptr, tv ptr, col ptr, row i64]
+  (if-let [w (objc/object-for tv)]
+    (cell-view w tv col (column-index tv col) row)
+    (ffi/null)))
+
+(ffi/defcallback outline-view-imp ptr [self ptr, cmd ptr, ov ptr, col ptr, item ptr]
+  (if-let [w (objc/object-for ov)]
+    (cell-view w ov col (column-index ov col) item)
+    (ffi/null)))
+
 (ffi/defcallback double-action-imp void [self ptr, cmd ptr, sender ptr]
   (when-let [w (objc/object-for sender)]
     (native-double-action w sender)))
@@ -340,6 +353,8 @@ consumed it (defined below).")
                        ["outlineView:isItemExpandable:" outline-expandable-imp "B@:@@"]
                        ["outlineView:objectValueForTableColumn:byItem:" outline-value-imp
                         "@@:@@@"]
+                       ["tableView:viewForTableColumn:row:" table-view-imp "@@:@@q"]
+                       ["outlineView:viewForTableColumn:item:" outline-view-imp "@@:@@@"]
                        ["outlineViewSelectionDidChange:" selection-imp "v@:@"]
                        ["outlineViewItemDidExpand:" item-expanded-imp "v@:@"]
                        ["outlineViewItemDidCollapse:" item-collapsed-imp "v@:@"]])
@@ -750,6 +765,47 @@ keyword gives the platform's own, which follows dark mode."
   "image (by identity) -> its NSImage, made once and kept: images don't change."
   (atom {}))
 
+(defn- image-from-data
+  "A new NSImage of the bytes of an image file, or null."
+  [bytes]
+  (let [data (ffi/pin [p bytes]
+               (objc/send-pl (objc/cls "NSData") (objc/sel "dataWithBytes:length:") p (count bytes)))]
+    (objc/send-p (objc/alloc "NSImage") (objc/sel "initWithData:") data)))
+
+(defn- system-ns-image
+  "A new reference to the SF Symbol or named image called name, or null."
+  [name]
+  (let [n (objc/send-pp (objc/cls "NSImage") (objc/sel "imageWithSystemSymbolName:accessibilityDescription:")
+                        (objc/ns-string name) (ffi/null))
+        n (if (ffi/null? n) (objc/send-p (objc/cls "NSImage") (objc/sel "imageNamed:") (objc/ns-string name)) n)]
+    (if (ffi/null? n) n (objc/retain n))))
+
+(def ^:private text-attributes
+  "An NSDictionary of a font and color for drawing text (defined below).")
+
+(def ^:private with-app-appearance
+  "Call f with the application's appearance current (defined below).")
+
+(defn- glyph-ns-image
+  "A new NSImage of a glyph image's text, centered."
+  [{:keys [text font color size template]}]
+  (let [render (fn []
+                 (let [img (objc/send-z (objc/alloc "NSImage") (objc/sel "initWithSize:")
+                                        {:width (f64 size) :height (f64 size)})
+                       s (objc/autorelease
+                          (objc/send-pp (objc/alloc "NSAttributedString") (objc/sel "initWithString:attributes:")
+                                        (objc/ns-string text)
+                                        (text-attributes font (if template (ui/rgb 0 0 0) color))))
+                       [w h] (objc/size-vec (objc/send-size s (objc/sel "size")))]
+                   (objc/send-void img (objc/sel "lockFocus"))
+                   (try (objc/send-point-void s (objc/sel "drawAtPoint:")
+                                              {:x (f64 (/ (- size w) 2)) :y (f64 (/ (- size h) 2))})
+                        (finally (objc/send-void img (objc/sel "unlockFocus"))))
+                   (objc/send-b-void img (objc/sel "setTemplate:") (boolean template))
+                   img))]
+    ;; A system color is drawn as it is in the application's appearance.
+    (if (and (keyword? color) (not template)) (with-app-appearance render) (render))))
+
 (defn ns-image
   "The NSImage of a skein.ui image, or null for nil."
   [image]
@@ -757,9 +813,14 @@ keyword gives the platform's own, which follows dark mode."
     (nil? image) (ffi/null)
     (get @native-images image) (get @native-images image)
     :else
-    (let [n (if (:path image)
-              (objc/send-p (objc/alloc "NSImage") (objc/sel "initWithContentsOfFile:")
-                           (objc/ns-string (:path image)))
+    (let [_ (ui/check-image image)
+          n (cond
+              (:path image) (objc/send-p (objc/alloc "NSImage") (objc/sel "initWithContentsOfFile:")
+                                         (objc/ns-string (:path image)))
+              (:data image) (image-from-data (:data image))
+              (:system image) (system-ns-image (:system image))
+              (:glyph image) (glyph-ns-image (:glyph image))
+              :else
               (let [w (:width image) h (:height image)
                     rep (objc/send-bitmap
                          (objc/alloc "NSBitmapImageRep")
@@ -775,9 +836,49 @@ keyword gives the platform's own, which follows dark mode."
                 (objc/send-p-void img (objc/sel "addRepresentation:") rep)
                 (objc/release rep)
                 img))]
-      (when (ffi/null? n) (error "AppKit can't read the image" (pr-str (:path image))))
+      (when (ffi/null? n) (error "AppKit can't read the image" (pr-str (or (:path image) (:system image)))))
       (swap! native-images assoc image n)
       n)))
+
+(defmethod ui/backend-image-data-size [(b cocoa-backend) bytes]
+  (let [n (image-from-data bytes)]
+    (when (ffi/null? n) (error "macOS can't read the image data"))
+    (let [[w h] (objc/size-vec (objc/send-size n (objc/sel "size")))]
+      (objc/release n)
+      [(int (math/round w)) (int (math/round h))])))
+
+(defmethod ui/backend-system-image-size [(b cocoa-backend) name]
+  (let [n (system-ns-image name)]
+    (when-not (ffi/null? n)
+      (let [[w h] (objc/size-vec (objc/send-size n (objc/sel "size")))]
+        (objc/release n)
+        [(int (math/round w)) (int (math/round h))]))))
+
+(defmethod ui/backend-free-image [(b cocoa-backend) image]
+  (when-let [n (get @native-images image)]
+    (swap! native-images dissoc image)
+    (objc/release n)))
+
+(defmethod ui/backend-font-families [(b cocoa-backend)]
+  (objc/call-with-pool
+   (fn []
+     (let [names (objc/send (objc/send (objc/cls "NSFontManager") (objc/sel "sharedFontManager"))
+                            (objc/sel "availableFontFamilies"))]
+       (mapv (fn [i] (objc/string-of (objc/send-l names (objc/sel "objectAtIndex:") i)))
+             (range (objc/send-long names (objc/sel "count"))))))))
+
+(defmethod ui/backend-register-font-file [(b cocoa-backend) path]
+  (let [url (objc/send-p (objc/cls "NSURL") (objc/sel "fileURLWithPath:") (objc/ns-string path))]
+    (ffi/with-foreign [err (ffi/alloc ptr 1)]
+      (ffi/put! err ptr (ffi/null) 0)
+      ;; kCTFontManagerScopeProcess 1
+      (when-not (objc/ct-register-fonts-for-url url 1 err)
+        (let [e (ffi/get err ptr)
+              code (when-not (ffi/null? e) (objc/cf-error-get-code e))]
+          (when-not (ffi/null? e) (objc/cf-release e))
+          ;; 105: registered already, perhaps by another toolkit in this process
+          (when-not (= code 105)
+            (error "macOS can't register the font file" (pr-str path))))))))
 
 (defmethod ui/backend-image-size [(b cocoa-backend) path]
   (let [n (objc/send-p (objc/alloc "NSImage") (objc/sel "initWithContentsOfFile:")
@@ -2357,10 +2458,16 @@ string value."
   "The text in a list box's, table's or tree's view at row and column, as AppKit draws it."
   [w row column]
   (objc/call-with-pool
-   (fn [] (objc/string-of (objc/send (objc/send-ll (table-of w)
-                                                   (objc/sel "preparedCellAtColumn:row:")
-                                                   column row)
-                                     (objc/sel "stringValue"))))))
+   (fn [] (let [v (objc/send-llb (table-of w) (objc/sel "viewAtColumn:row:makeIfNecessary:")
+                                 column row true)]
+            (objc/string-of (objc/send (objc/send v (objc/sel "textField"))
+                                       (objc/sel "stringValue")))))))
+
+(defn cell-image
+  "The NSImage in a list box's, table's or tree's cell at row and column, or null."
+  [w row column]
+  (let [v (objc/send-llb (table-of w) (objc/sel "viewAtColumn:row:makeIfNecessary:") column row true)]
+    (objc/send (objc/send v (objc/sel "imageView")) (objc/sel "image"))))
 
 (defn select-rows-natively!
   "Select rows in a list box's, table's or tree's view, as the user does."
@@ -4145,3 +4252,74 @@ selection."
   "True if the code view shows its placeholder."
   [w]
   (boolean (when-let [l (:placeholder (parts w))] (not (objc/send-bool l (objc/sel "isHidden"))))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Row icons: lists, tables and trees are view-based, each cell an NSTableCellView with a
+;;; label and an image view, so an icon and its text share the row's selection and
+;;; appearance.
+
+(defn- with-app-appearance [f]
+  (let [old (objc/send (objc/cls "NSAppearance") (objc/sel "currentAppearance"))]
+    (objc/send-p-void (objc/cls "NSAppearance") (objc/sel "setCurrentAppearance:")
+                      (objc/send (:app (ui/current-backend)) (objc/sel "effectiveAppearance")))
+    (try (f)
+         (finally (objc/send-p-void (objc/cls "NSAppearance") (objc/sel "setCurrentAppearance:") old)))))
+
+(defn- cell-parts
+  "[text image alignment] of a cell."
+  [w index row-or-item]
+  (cond
+    (instance? ui/tree-view-widget w)
+    (let [item (item-of row-or-item)]
+      [(ui/tree-cell-text w item index) (ui/row-icon w item index)
+       (:alignment (get (vec (:columns w)) index))])
+    :else
+    (let [items (vec (:items w))
+          row row-or-item]
+      [(native-cell-text w row index)
+       (when (< -1 row (count items)) (ui/row-icon w (nth items row) index))
+       (:alignment (get (vec (:columns w)) index))])))
+
+(defn- cell-view [w table col index row-or-item]
+  (let [[text image alignment] (cell-parts w index row-or-item)
+        id (objc/ns-string "skein-cell")
+        made (objc/send-pp table (objc/sel "makeViewWithIdentifier:owner:") id (ffi/null))
+        cell (if (ffi/null? made)
+               (let [c (objc/autorelease (objc/new-object "NSTableCellView"))
+                     label (objc/send-p (objc/cls "NSTextField") (objc/sel "labelWithString:")
+                                        (objc/ns-string ""))
+                     icon (objc/autorelease (objc/new-object "NSImageView"))]
+                 (objc/send-p-void c (objc/sel "setIdentifier:") id)
+                 (objc/send-l-void label (objc/sel "setLineBreakMode:") 4)    ; truncate tail
+                 (objc/send-l-void icon (objc/sel "setImageScaling:") 3)      ; proportionally
+                 (objc/send-p-void c (objc/sel "addSubview:") label)
+                 (objc/send-p-void c (objc/sel "addSubview:") icon)
+                 (objc/send-p-void c (objc/sel "setTextField:") label)
+                 (objc/send-p-void c (objc/sel "setImageView:") icon)
+                 c)
+               made)
+        width (objc/send-double col (objc/sel "width"))
+        height (objc/send-double table (objc/sel "rowHeight"))
+        label (objc/send cell (objc/sel "textField"))
+        icon (objc/send cell (objc/sel "imageView"))
+        offset (if image 22 2)
+        ;; An icon alone in its cell sits where the column aligns its contents.
+        icon-x (if (and image (= "" text))
+                 (case alignment :center (/ (- width 16) 2) :right (- width 18) 2)
+                 2)]
+    (objc/send-r-void cell (objc/sel "setFrame:") (objc/rect 0 0 width height))
+    (objc/send-r-void label (objc/sel "setFrame:")
+                      (objc/rect offset (max 0 (/ (- height 17) 2)) (max 0 (- width offset 2)) 17))
+    (objc/send-p-void label (objc/sel "setStringValue:") (objc/ns-string (str text)))
+    (objc/send-l-void label (objc/sel "setAlignment:") (text-alignment (or alignment :left)))
+    (objc/send-r-void icon (objc/sel "setFrame:") (objc/rect (max 0 icon-x) (/ (- height 16) 2) 16 16))
+    ;; A reused cell is cleared when there is no icon.
+    (objc/send-p-void icon (objc/sel "setImage:") (ns-image image))
+    (objc/send-b-void icon (objc/sel "setHidden:") (nil? image))
+    cell))
+
+(defmethod set-native [(l ui/list-box-widget) (p (= :icon-fn)) f]
+  (reload! (table-of l)))
+
+(defmethod set-native [(t ui/tree-view-widget) (p (= :icon-fn)) f]
+  (reload! (table-of t)))

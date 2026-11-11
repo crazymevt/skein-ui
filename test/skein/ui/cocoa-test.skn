@@ -2,7 +2,9 @@
   (:require [skein.test :refer [deftest is are testing use-fixtures]]
             [skein.ui :as ui]
             [skein.ui.cocoa :as cocoa]
-            [skein.system :as system]))
+            [skein.system :as system]
+            [skein.io :as io]
+            [skein.ffi :as ffi]))
 
 ;; The Cocoa backend (step 4 of M2.14, D-097), on macOS only: the widgets as AppKit
 ;; controls, read back from AppKit and acted on as the user would.
@@ -482,3 +484,30 @@
       (ui/set-code-text! empty "x")
       (is (not (cocoa/code-placeholder-shown? empty))))
     (ui/close! w)))
+
+(deftest images-fonts-and-row-icons
+  (let [png (io/read-bytes "test/skein/ui/red-3x2.png")
+        i (ui/image-from-bytes png)
+        star (ui/system-image "star.fill")
+        g (ui/glyph-image "λ" {:size 20})]
+    (is (= [3 2] [(:width i) (:height i)]))
+    (is (some? star))
+    (is (nil? (ui/system-image "no.such.symbol.anywhere")))
+    (is (= [20 20] [(:width g) (:height g)]))
+    (is (contains? (set (ui/font-families)) "Helvetica"))
+    (let [f "/System/Library/Fonts/Supplemental/Courier New.ttf"]
+      (when (io/file-exists? f)
+        (is (= f (ui/register-font-file! f)) "registered already by the system: no error")))
+    (let [l (ui/list-box {:items ["a" "b"] :icon-fn (fn [x] (when (= x "a") star))})
+          t (ui/table-view {:items [{:n 1}] :columns [(ui/column "N" :n {:icon-fn (fn [_] g)})]})
+          v (ui/image-view {:image i})
+          w (ui/window {:title "Images" :width 300 :height 300} (ui/vbox {} l t v))]
+      (ui/show! w)
+      (is (= "a" (cocoa/cell-string l 0 0)))
+      (is (not (ffi/null? (cocoa/cell-image l 0 0))) "a's row has its icon")
+      (is (ffi/null? (cocoa/cell-image l 1 0)) "b's has none")
+      (is (not (ffi/null? (cocoa/cell-image t 0 0))))
+      (is (= "1" (cocoa/cell-string t 0 0)))
+      (ui/close! w))
+    (ui/free-image! i)
+    (is (thrown-with-msg? error "freed" (ui/image-view {:image i})))))

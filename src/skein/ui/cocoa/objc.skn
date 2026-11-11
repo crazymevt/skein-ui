@@ -205,6 +205,11 @@ and all of them run on the main thread, which no fiber waits to share."
 (ffi/defcfun ^:blocking send-pprange-void "objc_msgSend" void
   [self ptr, sel ptr, p ptr, q ptr, r ns-range])
 (ffi/defcfun ^:blocking send-range-p "objc_msgSend" ptr [self ptr, sel ptr, r ns-range])
+(ffi/defcfun ^:blocking send-llb "objc_msgSend" ptr [self ptr, sel ptr, a i64, b i64, c bool])
+(ffi/defcfun ct-register-fonts-for-url "CTFontManagerRegisterFontsForURL" bool
+  [url ptr, scope u32, error ptr])
+(ffi/defcfun cf-error-get-code "CFErrorGetCode" i64 [e ptr])
+(ffi/defcfun cf-release "CFRelease" void [o ptr])
 
 ;;; Blocks: a global block whose invoke function is a Skein callback, for the AppKit
 ;;; methods that take one (Apple's block ABI).
