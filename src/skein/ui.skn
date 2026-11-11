@@ -1247,8 +1247,12 @@ does, when the window's geometry isn't its normal one."))
   "The windows made and not yet closed, oldest first."
   (atom []))
 
+(def ^:private effective-appearance)
+
 (defmethod initialize :after [(w window-widget)]
   (check-window-state (:state w))
+  ;; Its first change of appearance is one, as a widget's is.
+  (when (realized? w) (set-slot! w :last-appearance (effective-appearance w)))
   (swap! open-windows conj w))
 
 (defn windows

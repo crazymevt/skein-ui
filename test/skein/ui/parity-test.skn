@@ -396,3 +396,9 @@
   (is (thrown-with-msg? error "a window's state" (ui/window {:state :huge})))
   (is (= {:position nil :size [3 4] :state :normal}
          (ui/window-frame (ui/restore-window-frame! (ui/window {}) "{:position nil :size [3 4] :state :normal}")))))
+
+(deftest a-windows-first-appearance-change
+  (let [seen (atom [])
+        w (ui/window {:on-appearance-changed (fn [e] (swap! seen conj (:value e)))} (ui/label {:text "x"}))]
+    (set-slot! w :appearance :dark)
+    (is (= [:dark] @seen) "the window's own, the first time too")))
