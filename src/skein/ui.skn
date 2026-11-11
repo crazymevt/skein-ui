@@ -1,0 +1,428 @@
+(ns skein.ui
+  "Native desktop user interfaces from Skein objects and events (Skein's M2.14, D-090,
+D-097), after the design of LGT, Jessie's Common Lisp toolkit.
+
+  (ui/use-backend! (headless/backend))
+  (def w (ui/window {:title \"Hello\"}
+           (ui/vbox {:spacing 8}
+             (ui/label {:text \"Name\"})
+             (ui/button {:label \"Save\" :on-clicked (fn [e] (save!))}))))
+  (ui/show! w)
+
+A widget is an instance of a class backed by the platform's own control. Constructors
+take an option map and then children; the classes have a -widget suffix (button-widget),
+for defclass and defmethod. Properties are cell slots: (:text label) reads one, and
+(set-slot! label :text \"Hi\") or (update-slot! slider :value + 5) changes it, and the
+native control follows (property-changed). Events are objects emitted under a signal
+(:clicked) on a widget: connect handlers with on, or :on-clicked in a constructor's
+options, or specialize handle-event. A handler is a function; written (fn [e] (save! e))
+it calls save! through its var, so redefining save! takes effect while the program runs.
+
+The backend protocol is a set of generic functions on a backend object (backend-realize,
+backend-set-property, ...), which skein.ui.headless, skein.ui.cocoa, skein.ui.win32 and
+skein.ui.gtk implement. The core calls them through backend-in-ui-thread.")
+
+;;; ------------------------------------------------------------------------------------
+;;; Backends
+
+(defclass backend []
+  "The superclass of UI backends: a backend implements the backend- generic functions.")
+
+(def ^:private current (atom nil))
+
+(defn use-backend!
+  "Make b the backend widgets are made with. Returns b."
+  [b]
+  (when-not (instance? backend b)
+    (error "use-backend! needs a UI backend, not" (pr-str b)))
+  (reset! current b)
+  b)
+
+(defn current-backend
+  "The backend in use."
+  []
+  (or @current (error "no UI backend: call (ui/use-backend! ...) first")))
+
+(defgeneric backend-in-ui-thread [backend f]
+  "Call f, a function of no arguments, on the backend's UI thread and return its value.")
+
+(defgeneric backend-realize [backend object]
+  "Make and return the native counterpart of object: a widget or a window. Its properties
+are set afterwards with backend-set-property.")
+
+(defgeneric backend-destroy [backend object]
+  "Destroy object's native counterpart. Its children have been destroyed already.")
+
+(defgeneric backend-set-property [backend object property value]
+  "Show value, the new value of object's property (a keyword such as :text), in its native
+counterpart.")
+
+(defgeneric backend-get-property [backend object property]
+  "The value of object's property as its native counterpart has it, for properties the core
+reads back.")
+
+(defgeneric backend-add-child [backend parent child]
+  "Put child's native counterpart inside parent's, at the end.")
+
+(defgeneric backend-remove-child [backend parent child]
+  "Take child's native counterpart out of parent's without destroying it.")
+
+(defgeneric backend-show [backend window]
+  "Show the window on the screen.")
+
+(defgeneric backend-close [backend window]
+  "Close the window: take it off the screen.")
+
+(defgeneric backend-run-loop [backend]
+  "Run the native event loop until backend-quit-loop.")
+
+(defgeneric backend-quit-loop [backend]
+  "Make backend-run-loop return.")
+
+(defn- in-ui
+  "f's value, called on the UI thread of the backend in use."
+  [f]
+  (backend-in-ui-thread (current-backend) f))
+
+;;; ------------------------------------------------------------------------------------
+;;; Events
+
+(defclass event []
+  "The superclass of events: what happened (signal, such as :clicked) to source."
+  (source :init nil)
+  (signal :init nil))
+
+(defclass action-event [event]
+  "Something was activated: a button clicked, a menu item chosen, Return in an entry.")
+
+(defclass value-event [event]
+  "A value changed: text edited, a slider moved, a check box toggled. :value is the new
+value."
+  (value :init nil))
+
+(defclass vetoable-event [event]
+  "An event a handler can refuse with veto, such as a window being asked to close."
+  (vetoed :cell :atom :init false))
+
+(defclass close-event [vetoable-event]
+  "A window is asked to close. veto keeps it open.")
+
+(defgeneric veto [event]
+  "Refuse the vetoable event: the window stays open. Returns the event.")
+
+(defmethod veto [(e vetoable-event)]
+  (set-slot! e :vetoed true)
+  e)
+
+(defn vetoed?
+  "True if a handler vetoed the event."
+  [e]
+  (boolean (and (instance? vetoable-event e) (:vetoed e))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Objects, properties and signals
+
+(defclass ui-object []
+  "Anything with a native counterpart: widgets and windows."
+  (native :cell :atom :init nil)
+  (handlers :cell :atom :init {})
+  (name :init nil)
+  (parent :cell :atom :init nil)
+  (children :cell :atom :init [])
+  (destroyed :cell :atom :init false))
+
+(def ^:private declared
+  "class -> {:properties [keyword ...] :signals {signal event-class}}, what each widget
+class declares itself."
+  (atom {}))
+
+(defn declare-widget!
+  "Declare which of class's cell slots are properties (keywords), and its signals, a map
+of signal to event class. Constructors take :on-<signal> options for them."
+  [class {:keys [properties signals]}]
+  (swap! declared assoc class {:properties (vec properties) :signals (or signals {})})
+  class)
+
+(defn- declared-for [object k]
+  (mapcat (fn [c] (get-in @declared [c k])) (reverse (class-precedence-list (class-of object)))))
+
+(defn properties
+  "The properties of object: the keywords of the cell slots its native control shows."
+  [object]
+  (vec (distinct (declared-for object :properties))))
+
+(defn signals
+  "object's signals, a map of signal to event class."
+  [object]
+  (into {} (declared-for object :signals)))
+
+(def ^:dynamic *syncing*
+  "True while a backend stores a value the user changed in a native control, which isn't
+sent back to it."
+  false)
+
+(defn sync-property!
+  "Store value, which the user changed in object's native control, as its property
+without sending it back (backends call this before they emit the change)."
+  [object property value]
+  (binding [*syncing* true]
+    (set-slot! object property value)))
+
+(defn realized?
+  "True if object has its native counterpart."
+  [object]
+  (and (some? (:native object)) (not (:destroyed object))))
+
+(defgeneric property-changed [object property value]
+  "Called when object's property changed to value (not by the native control itself):
+the default shows it in the native control. Specialize it to react to property changes.")
+
+(defmethod property-changed [(o ui-object) property value]
+  (when (realized? o)
+    (let [b (current-backend)]
+      (in-ui (fn [] (backend-set-property b o property value))))))
+
+(defn realize!
+  "Make object's native counterpart, give it object's properties, and watch them. make
+does this, so programs rarely call it."
+  [object]
+  (when-not (:native object)
+    (let [b (current-backend)
+          props (properties object)]
+      (in-ui (fn []
+               (set-slot! object :native (backend-realize b object))
+               (doseq [p props] (backend-set-property b object p (slot object p)))))
+      (doseq [p props]
+        (add-watch (cell object p) ::property
+                   (fn [_ _ old new]
+                     (when (and (not *syncing*) (not= old new))
+                       (property-changed object p new)))))))
+  object)
+
+(defmethod initialize :after [(o ui-object)]
+  (realize! o))
+
+(defgeneric destroy! [object]
+  "Destroy object's native counterpart, and its children's. The object stays, but can't
+be shown again.")
+
+(defmethod destroy! [(o ui-object)]
+  (when-not (:destroyed o)
+    (doseq [c (:children o)] (destroy! c))
+    (when (:native o)
+      (let [b (current-backend)]
+        (in-ui (fn [] (backend-destroy b o)))))
+    (set-slot! o :destroyed true))
+  nil)
+
+;;; Handlers
+
+(def ^:private handler-ids (atom 0))
+
+(defn on
+  "Call (f event) when object emits signal; handlers run in the order they were
+connected. Returns an id that off takes."
+  [object signal f]
+  (when-not (contains? (signals object) signal)
+    (error (str (pr-str (class-name (class-of object))) " has no signal " (pr-str signal))))
+  (let [id (swap! handler-ids inc)]
+    (update-slot! object :handlers update signal (fnil conj []) [id f])
+    id))
+
+(defn off
+  "Disconnect the handler with id from object's signal, or every handler of signal."
+  ([object signal]
+   (update-slot! object :handlers dissoc signal)
+   nil)
+  ([object signal id]
+   (update-slot! object :handlers update signal
+                 (fn [hs] (vec (remove (fn [[i _]] (= i id)) hs))))
+   nil))
+
+(defgeneric handle-event [object event]
+  "Called for each event object emits: the default runs the handlers connected to the
+event's signal. Specialize it to react to events in a subclass.")
+
+(defmethod handle-event [(o ui-object) e]
+  (doseq [[_ f] (get (:handlers o) (:signal e))]
+    (f e)))
+
+(defn emit!
+  "Emit event (made with its :source and :signal) on object: handle-event gets it.
+Returns the event, so a caller can ask whether it was vetoed."
+  [object event]
+  (handle-event object event)
+  event)
+
+(defn event-for
+  "A new event of the class object declares for signal, with the slots in kvs."
+  [object signal & kvs]
+  (let [class (or (get (signals object) signal)
+                  (error (str (pr-str (class-name (class-of object))) " has no signal "
+                              (pr-str signal))))]
+    (apply make class :source object :signal signal kvs)))
+
+;;; Children
+
+(defn add!
+  "Put child in the container parent, after its other children. Returns child."
+  [parent child]
+  (when (some? (:parent child))
+    (error "the widget is in a container already; remove! it first"))
+  (update-slot! parent :children conj child)
+  (set-slot! child :parent parent)
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-add-child b parent child))))
+  child)
+
+(defn remove!
+  "Take child out of its container parent. Returns child."
+  [parent child]
+  (update-slot! parent :children (fn [cs] (vec (remove (fn [c] (identical? c child)) cs))))
+  (set-slot! child :parent nil)
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-remove-child b parent child))))
+  child)
+
+(defn find-widget
+  "The widget named name (its :name option) in root or inside it, or nil."
+  [root name]
+  (if (= name (:name root))
+    root
+    (some (fn [c] (find-widget c name)) (:children root))))
+
+;;; Building widgets
+
+(defn- signal-option
+  "For an option key :on-clicked, the signal :clicked; else nil."
+  [k]
+  (let [n (name k)]
+    (when (and (> (count n) 3) (= "on-" (subs n 0 3)))
+      (keyword (subs n 3)))))
+
+(defn build
+  "Make a widget of class with the options in opts (its slots, and :on-<signal>
+handlers) and add the children to it. Constructors call this."
+  [class opts children]
+  (let [handlers (keep (fn [[k f]] (when-let [s (signal-option k)] [s f])) opts)
+        initargs (remove (fn [[k _]] (signal-option k)) opts)
+        w (apply make class (mapcat identity initargs))]
+    (doseq [[s f] handlers] (on w s f))
+    (doseq [c children] (add! w c))
+    w))
+
+;;; ------------------------------------------------------------------------------------
+;;; Widgets
+
+(defclass widget [ui-object]
+  "The superclass of widgets: what windows and containers hold."
+  (visible :cell :atom :init true :doc "Whether the widget is shown.")
+  (enabled :cell :atom :init true :doc "Whether the widget responds to the user.")
+  (tooltip :cell :atom :init nil :doc "Text shown when the pointer rests on it, or nil."))
+
+(declare-widget! widget {:properties [:visible :enabled :tooltip]})
+
+(defclass label-widget [widget]
+  "Text that the user can't edit."
+  (text :cell :atom :init ""))
+
+(declare-widget! label-widget {:properties [:text]})
+
+(defn label
+  "A label: (label {:text \"Name\"})."
+  ([] (label {}))
+  ([opts] (build label-widget opts nil)))
+
+(defclass button-widget [widget]
+  "A push button. It emits :clicked."
+  (label :cell :atom :init "")
+  (default :cell :atom :init false :doc "Whether Return presses it."))
+
+(declare-widget! button-widget {:properties [:label :default] :signals {:clicked action-event}})
+
+(defn button
+  "A button: (button {:label \"Save\" :on-clicked f})."
+  ([] (button {}))
+  ([opts] (build button-widget opts nil)))
+
+(defclass entry-widget [widget]
+  "A one-line text field. It emits :changed (a value-event) as the user edits, and
+:activate on Return."
+  (text :cell :atom :init "")
+  (placeholder :cell :atom :init nil :doc "Text shown, greyed, while it's empty."))
+
+(declare-widget! entry-widget {:properties [:text :placeholder]
+                               :signals {:changed value-event :activate action-event}})
+
+(defn entry
+  "An entry: (entry {:placeholder \"Your name\" :on-changed f})."
+  ([] (entry {}))
+  ([opts] (build entry-widget opts nil)))
+
+(defclass box-widget [widget]
+  "A container that lays its children out in a row or a column."
+  (orientation :init :vertical :doc ":vertical or :horizontal.")
+  (spacing :cell :atom :init 0 :doc "The space between children, in pixels.")
+  (padding :cell :atom :init 0 :doc "The space around the children, in pixels."))
+
+(declare-widget! box-widget {:properties [:spacing :padding]})
+
+(defn vbox
+  "A column of children: (vbox {:spacing 8} child ...)."
+  [opts & children]
+  (build box-widget (assoc opts :orientation :vertical) children))
+
+(defn hbox
+  "A row of children: (hbox {:spacing 8} child ...)."
+  [opts & children]
+  (build box-widget (assoc opts :orientation :horizontal) children))
+
+(defclass window-widget [ui-object]
+  "A top-level window. It emits :close-request (a close-event, which veto refuses) when
+asked to close."
+  (title :cell :atom :init "")
+  (width :cell :atom :init 400)
+  (height :cell :atom :init 300)
+  (shown :cell :atom :init false))
+
+(declare-widget! window-widget {:properties [:title :width :height]
+                                :signals {:close-request close-event}})
+
+(defn window
+  "A window: (window {:title \"Hello\"} content ...)."
+  [opts & children]
+  (build window-widget opts children))
+
+(defn show!
+  "Show the window. Returns it."
+  [w]
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-show b w))))
+  (set-slot! w :shown true)
+  w)
+
+(defn close!
+  "Ask the window to close: it emits :close-request, and closes unless a handler vetoes
+it. True if it closed."
+  [w]
+  (let [e (emit! w (event-for w :close-request))]
+    (if (vetoed? e)
+      false
+      (let [b (current-backend)]
+        (in-ui (fn [] (backend-close b w)))
+        (set-slot! w :shown false)
+        (destroy! w)
+        true))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Running
+
+(defn run!
+  "Run the backend's event loop until quit!."
+  []
+  (backend-run-loop (current-backend)))
+
+(defn quit!
+  "Make run! return."
+  []
+  (backend-quit-loop (current-backend)))

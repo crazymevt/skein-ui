@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+# skein-ui's tests run with Skein's main branch, checked out beside this repository and
+# bootstrapped (D-097): ../skein/skein test runs the project's test/ natively.
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      SBCL_VERSION: 2.5.10
+      ZIG_VERSION: 0.17.1
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: skein-ui
+
+      - uses: actions/checkout@v7
+        with:
+          repository: crazymevt/skein
+          path: skein
+
+      - name: Install SBCL (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sbcl
+
+      - name: Install SBCL (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o sbcl.tar.bz2 \
+            "https://downloads.sourceforge.net/project/sbcl/sbcl/${SBCL_VERSION}/sbcl-${SBCL_VERSION}-x86-64-linux-binary.tar.bz2"
+          tar xjf sbcl.tar.bz2
+          cd "sbcl-${SBCL_VERSION}-x86-64-linux"
+          sudo sh install.sh
+
+      - name: Install SBCL and make (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:RUNNER_TEMP "sbcl.msi"
+          curl.exe -fsSL -o $msi "https://downloads.sourceforge.net/project/sbcl/sbcl/$env:SBCL_VERSION/sbcl-$env:SBCL_VERSION-x86-64-windows-binary.msi"
+          Start-Process msiexec.exe -Wait -ArgumentList "/i", $msi, "/qn"
+          $exe = Get-ChildItem "C:\Program Files\Steel Bank Common Lisp" -Recurse -Filter sbcl.exe |
+            Select-Object -First 1
+          $exe.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "SBCL_HOME=$($exe.DirectoryName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          choco install make --no-progress -y
+
+      - name: Show SBCL version
+        run: sbcl --version
+
+      - name: Cache Quicklisp
+        uses: actions/cache@v6
+        with:
+          path: ~/quicklisp
+          key: quicklisp-${{ runner.os }}-v2
+
+      - name: Install Quicklisp
+        run: |
+          if [ ! -f "$HOME/quicklisp/setup.lisp" ]; then
+            curl -fsSL -o "$RUNNER_TEMP/quicklisp.lisp" https://beta.quicklisp.org/quicklisp.lisp
+            sbcl --noinform --no-userinit --non-interactive \
+              --load "$RUNNER_TEMP/quicklisp.lisp" --eval "(quicklisp-quickstart:install)"
+          fi
+
+      # Zig for the Phase 1 runtime: the official release archives, checked against the
+      # SHA-256 sums from https://ziglang.org/download/index.json, and cached.
+      - name: Cache Zig
+        id: zig-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}
+
+      - name: Install Zig (macOS)
+        if: runner.os == 'macOS' && steps.zig-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-macos-${ZIG_VERSION}.tar.xz"
+          echo "75f1bc7a1e9852f17ec9a0c1895f767c4ec56d46bc8a834920eece1d0359dd8d  $RUNNER_TEMP/zig.tar.xz" \
+            | shasum -a 256 -c -
+          mkdir -p ~/zig && tar xJf "$RUNNER_TEMP/zig.tar.xz" -C ~/zig --strip-components 1
+
+      - name: Install Zig (Linux)
+        if: runner.os == 'Linux' && steps.zig-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a  $RUNNER_TEMP/zig.tar.xz" \
+            | sha256sum -c -
+          mkdir -p ~/zig && tar xJf "$RUNNER_TEMP/zig.tar.xz" -C ~/zig --strip-components 1
+
+      - name: Install Zig (Windows)
+        if: runner.os == 'Windows' && steps.zig-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "zig.zip"
+          curl.exe -fsSL -o $zip "https://ziglang.org/download/$env:ZIG_VERSION/zig-x86_64-windows-$env:ZIG_VERSION.zip"
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne "b03f477a1943673e02aca0f570e8030dffd536ce1f45cbc4d3326ec31159562e") {
+            throw "zig.zip checksum mismatch: $hash"
+          }
+          $out = Join-Path $env:RUNNER_TEMP "zig-unpacked"
+          Expand-Archive $zip -DestinationPath $out
+          $dest = Join-Path $HOME "zig"
+          Move-Item (Join-Path $out "zig-x86_64-windows-$env:ZIG_VERSION") $dest
+
+      - name: Use Zig
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            cygpath -w "$HOME/zig" >> "$GITHUB_PATH"
+          else
+            echo "$HOME/zig" >> "$GITHUB_PATH"
+          fi
+          "$HOME/zig/zig" version
+
+      - name: Bootstrap Skein
+        run: cd skein && make compiler
+
+      - name: Run the tests (headless backend)
+        run: cd skein-ui && ../skein/skein test

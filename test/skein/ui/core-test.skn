@@ -1,0 +1,111 @@
+(ns skein.ui.core-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]))
+
+;; The core on the headless backend (step 1 of M2.14, D-097): properties as cell slots,
+;; events and handlers, vetoes, containers and windows.
+
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)))
+
+(deftest properties
+  (let [l (ui/label {:text "Hello" :tooltip "greeting"})]
+    (testing "the native control shows the initial properties"
+      (is (= "Hello" (headless/native-property l :text)))
+      (is (= "greeting" (headless/native-property l :tooltip)))
+      (is (= true (headless/native-property l :visible))))
+    (testing "set-slot! and update-slot! change the native control"
+      (set-slot! l :text "Goodbye")
+      (is (= "Goodbye" (:text l)))
+      (is (= "Goodbye" (headless/native-property l :text)))
+      (update-slot! l :text str "!")
+      (is (= "Goodbye!" (headless/native-property l :text)))
+      (set-slot! l :enabled false)
+      (is (= false (headless/native-property l :enabled))))
+    (is (= [:visible :enabled :tooltip :text] (ui/properties l)))))
+
+(deftest events-and-handlers
+  (let [clicks (atom [])
+        b (ui/button {:label "Go" :on-clicked (fn [e] (swap! clicks conj [:option (:signal e)]))})
+        id (ui/on b :clicked (fn [e] (swap! clicks conj [:on (identical? b (:source e))])))]
+    (headless/click! b)
+    (is (= [[:option :clicked] [:on true]] @clicks))
+    (ui/off b :clicked id)
+    (headless/click! b)
+    (is (= [[:option :clicked] [:on true] [:option :clicked]] @clicks))
+    (ui/off b :clicked)
+    (headless/click! b)
+    (is (= 3 (count @clicks)))
+    (is (thrown-with-msg? error "has no signal :typed" (ui/on b :typed (fn [e] nil))))))
+
+(deftest values-from-the-user
+  (let [seen (atom [])
+        sent-back (atom 0)
+        e (ui/entry {:placeholder "Your name"
+                     :on-changed (fn [ev] (swap! seen conj (:value ev)))
+                     :on-activate (fn [ev] (swap! seen conj :return))})]
+    (is (= "Your name" (headless/native-property e :placeholder)))
+    (headless/type-text! e "Ada")
+    (is (= "Ada" (:text e)))
+    (headless/press-return! e)
+    (is (= ["Ada" :return] @seen))))
+
+(defclass counting-button [ui/button-widget]
+  (pressed :cell :atom :init 0))
+
+(defmethod ui/handle-event [(b counting-button) e]
+  (update-slot! b :pressed inc)
+  (call-next-method))
+
+(defmethod ui/property-changed [(b counting-button) property value]
+  (call-next-method)
+  (when (= property :label) (update-slot! b :pressed + 100)))
+
+(deftest subclasses-and-methods
+  (let [b (ui/build counting-button {:label "Count"} nil)
+        handled (atom 0)]
+    (ui/on b :clicked (fn [e] (swap! handled inc)))
+    (headless/click! b)
+    (headless/click! b)
+    (is (= 2 (:pressed b)))
+    (is (= 2 @handled))
+    (set-slot! b :label "More")
+    (is (= "More" (headless/native-property b :label)))
+    (is (= 102 (:pressed b)))))
+
+(deftest containers-and-windows
+  (let [field (ui/entry {:name :name})
+        w (ui/window {:title "Form"}
+            (ui/vbox {:spacing 8}
+              (ui/label {:text "Name"})
+              field
+              (ui/hbox {} (ui/button {:label "OK" :name :ok}))))
+        box (first (:children w))]
+    (is (= 3 (count (:children box))))
+    (is (identical? box (:parent field)))
+    (is (= 3 (count (headless/native-children box))))
+    (is (identical? field (ui/find-widget w :name)))
+    (is (= "OK" (:label (ui/find-widget w :ok))))
+    (is (nil? (ui/find-widget w :missing)))
+    (ui/remove! box field)
+    (is (= 2 (count (headless/native-children box))))
+    (is (nil? (:parent field)))
+    (ui/add! box field)
+    (is (identical? field (last (:children box))))
+    (is (thrown-with-msg? error "in a container already" (ui/add! box field)))
+    (ui/show! w)
+    (is (headless/shown? w))
+    (testing "a close a handler vetoes leaves the window open"
+      (let [veto? (atom true)]
+        (ui/on w :close-request (fn [e] (when @veto? (ui/veto e))))
+        (is (not (headless/request-close! w)))
+        (is (headless/shown? w))
+        (reset! veto? false)
+        (is (headless/request-close! w))
+        (is (not (headless/shown? w)))
+        (is (headless/destroyed? w))
+        (is (headless/destroyed? field))))))
+
+(deftest no-backend
+  (ui/use-backend! (headless/backend))
+  (is (thrown-with-msg? error "needs a UI backend" (ui/use-backend! 5))))

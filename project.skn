@@ -1,0 +1,6 @@
+;; skein.ui, native desktop user interfaces for Skein, as a library: a project depends
+;; on it with :deps {skein/ui {:git "https://github.com/crazymevt/skein-ui" :tag "..."}}.
+{:name "skein-ui"
+ :version "0.1.0"
+ :paths ["src"]
+ :test-paths ["test"]}
