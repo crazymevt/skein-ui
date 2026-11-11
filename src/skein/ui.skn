@@ -302,7 +302,8 @@ input method. A handler that calls consume! keeps it from being inserted."
   "Anything that emits events to handlers: widgets, windows, menus, timers and the
 application."
   (handlers :cell :atom :init {})
-  (blocked :cell :atom :init {} :doc "signal (or :all) -> how many with-handlers-blocked block it."))
+  (blocked :cell :atom :init {}
+           :doc "signal (or :all) -> how many with-handlers-blocked block it."))
 
 (defclass ui-object [emitter]
   "Anything with a native counterpart: widgets, windows and menus."
@@ -1667,7 +1668,8 @@ for example when what the user typed isn't valid.")
 go in its content area, a vbox. run-dialog shows it modally and returns the response of
 the button clicked; it emits :response (a response-event) as one is clicked."
   (buttons :init [:cancel :ok]
-           :doc "Its buttons: responses such as :ok, or [label response]; the platform orders them.")
+           :doc "Its buttons: responses such as :ok, or [label response]; the platform
+orders them.")
   (resizable :cell :atom :init false)
   (response :cell :atom :init nil :doc "The response that closed it, or :close.")
   (content-area :cell :atom :init nil)

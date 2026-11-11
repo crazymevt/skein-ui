@@ -2470,7 +2470,8 @@ a widget with input signals other than a canvas, which handles its own."
         (1 2 3 4 25 26)
         (let [loc (objc/send-point e (objc/sel "locationInWindow"))
               point {:x (ffi/field loc objc/ns-point :x) :y (ffi/field loc objc/ns-point :y)}
-              frame-view (objc/send (objc/send window (objc/sel "contentView")) (objc/sel "superview"))
+              frame-view (objc/send (objc/send window (objc/sel "contentView"))
+                                    (objc/sel "superview"))
               hit (objc/send-pt frame-view (objc/sel "hitTest:") point)]
           (when-let [w (widget-of-view hit true)]
             (let [p (objc/send-point-p (menu-target w) (objc/sel "convertPoint:fromView:") point

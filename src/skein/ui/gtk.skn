@@ -88,7 +88,7 @@ with args, a map.")
 (def ^:private signal-kinds
   [:clicked :activate :changed :toggled :value-changed :resized :selected :switch-page
    :close-request :position :sort :items-changed :pressed :released :motion :enter :leave
-   :scroll :key-pressed :key-released :window-key :closed :menu-activate])
+   :scroll :key-pressed :key-released :window-key :closed :menu-activate :active])
 
 (defn- kind-of [data] (nth signal-kinds (ffi/address data)))
 
@@ -224,6 +224,7 @@ this namespace's), reporting it as kind. Returns o."
   "The GTK 4 backend."
   (main-thread :init nil :doc "The GThread of the main thread, where GTK was initialized.")
   (actions :init nil :doc "The GSimpleActionGroup of the menu items' actions, \"skein\".")
+  (css :init nil :doc "The GtkCssProvider of the widgets' fonts and colors.")
   (running :cell :atom :init false :doc "Whether ui/run!'s main loop runs."))
 
 (defn available?
@@ -238,7 +239,10 @@ this namespace's), reporting it as kind. Returns o."
     (error "the GTK backend needs GTK 4, which isn't installed"))
   (when-not (lib/gtk-init-check)
     (error "GTK 4 can't open the display"))
-  (make gtk-backend :main-thread (lib/g-thread-self) :actions (lib/g-simple-action-group-new)))
+  (let [css (lib/css-provider-new)]
+    (lib/style-add-provider-for-display (lib/display-get-default) css 600)   ; APPLICATION
+    (make gtk-backend :main-thread (lib/g-thread-self) :actions (lib/g-simple-action-group-new)
+          :css css)))
 
 (defn- main-thread? [b]
   (= (ffi/address (lib/g-thread-self)) (ffi/address (:main-thread b))))
@@ -292,8 +296,13 @@ for the user's doing."
   [o]
   (lib/g-object-ref-sink o))
 
+(def ^:private install-input!
+  "Give a widget with input signals its event controllers (defined below).")
+
 (defmethod ui/backend-realize [(b gtk-backend) o]
-  (lib/register! (make-native o) o))
+  (let [n (lib/register! (make-native o) o)]
+    (install-input! o n)
+    n))
 
 (defmethod ui/backend-destroy [(b gtk-backend) o]
   (let [n (native o)]
@@ -2388,3 +2397,201 @@ clicks OK (nil cancels it); a file chooser is cancelled."
   (let [a (ffi/address (native w))]
     (doseq [m [inner-fixed window-boxes menu-bar-heights window-of-bar window-shortcuts]]
       (swap! m dissoc a))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Fonts and colors: one CSS provider, a class for each widget that has its own
+
+(def ^:private css-classes
+  "A widget's GTK widget address -> its CSS class."
+  (atom {}))
+
+(def ^:private css-rules
+  "A CSS class -> the declarations of its rule."
+  (atom {}))
+
+(defn- css-color [d]
+  (let [[r g b a] (rgba-of d)]
+    (format "rgba(%d,%d,%d,%.3f)" (int (math/round (* 255 r))) (int (math/round (* 255 g)))
+            (int (math/round (* 255 b))) a)))
+
+(defn- css-font [f]
+  (let [f (ui/ensure-font f)]
+    (str (case (:family f) :system "" :monospace "font-family: monospace; "
+               (str "font-family: \"" (:family f) "\"; "))
+         (if (:size f) (str "font-size: " (:size f) "pt; ") "")
+         "font-weight: " (case (:weight f) :light 300 :medium 500 :semibold 600 :bold 700 400) "; "
+         (if (:italic f) "font-style: italic; " ""))))
+
+(defn- style-target [w]
+  (if (instance? ui/text-view-widget w) (text-view-of w) (native w)))
+
+(defn- restyle!
+  "Give the widget's GTK widget a CSS rule of its :font and, for a label, colors."
+  [w]
+  (let [n (style-target w)
+        a (ffi/address n)
+        class (or (get @css-classes a)
+                  (let [c (str "skein-" (count @css-classes))]
+                    (lib/widget-add-css-class n c)
+                    (swap! css-classes assoc a c)
+                    c))
+        declarations (str (if (:font w) (css-font (:font w)) "")
+                          (if (and (instance? ui/label-widget w) (:text-color w))
+                            (str "color: " (css-color (:text-color w)) "; ") "")
+                          (if (and (instance? ui/label-widget w) (:background w))
+                            (str "background-color: " (css-color (:background w)) "; ") ""))]
+    (swap! css-rules assoc class declarations)
+    (lib/css-provider-load (:css (ui/current-backend))
+                           (apply str (map (fn [[c d]] (str "." c " { " d "}\n")) @css-rules)))))
+
+(defmethod set-native [(w ui/widget) (p (= :font)) f]
+  (when (or f (get @css-classes (ffi/address (style-target w))))
+    (restyle! w)))
+
+(defmethod set-native [(l ui/label-widget) (p (= :text-color)) c]
+  (when (or c (get @css-classes (ffi/address (style-target l))))
+    (restyle! l)))
+
+(defmethod set-native [(l ui/label-widget) (p (= :background)) c]
+  (when (or c (get @css-classes (ffi/address (style-target l))))
+    (restyle! l)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Input events of the controls, context menus and focus
+
+(defn- input-target
+  "The GTK widget that gets a widget's keys and clicks, given its own GTK widget n."
+  [w n]
+  (cond (instance? ui/text-view-widget w) (get @text-views (ffi/address n))
+        (or (instance? ui/list-box-widget w) (instance? ui/tree-view-widget w))
+        (:view (get @list-parts (ffi/address n)))
+        :else n))
+
+(def ^:private right-clickable
+  "The addresses of the GTK widgets that have a click gesture of ours."
+  (atom #{}))
+
+(defn- add-click-gesture! [w target button]
+  (when-not (contains? @right-clickable (ffi/address target))
+    (let [g (lib/gesture-click-new)]
+      (lib/gesture-single-set-button g button)
+      (lib/controller-set-phase g 1)   ; capture: before the widget's own
+      (lib/register! g w)
+      (connect! g "pressed" :pressed press-imp)
+      (connect! g "released" :released press-imp)
+      (lib/widget-add-controller target g)
+      (swap! right-clickable conj (ffi/address target)))))
+
+(defn- install-input! [w n]
+  (when (and (contains? (ui/signals w) :key-down) (not (instance? ui/canvas-widget w))
+             (instance? ui/widget w))
+    (let [target (input-target w n)
+          keys (lib/key-controller-new)]
+      (lib/controller-set-phase keys 1)
+      (lib/register! keys w)
+      (connect! keys "key-pressed" :key-pressed key-imp)
+      (connect! keys "key-released" :key-released key-imp)
+      (lib/widget-add-controller target keys)
+      (add-click-gesture! w target 0))))
+
+(defmethod set-native [(w ui/widget) (p (= :context-menu)) m]
+  (when m (add-click-gesture! w (input-target w (native w)) 0)))
+
+(defn- emit-input! [w signal & kvs]
+  (let [e (apply ui/event-for w signal kvs)]
+    (ui/emit! w e)
+    (ui/consumed? e)))
+
+(defmethod native-input [(w ui/widget) kind controller args]
+  (let [mods (modifiers-of (lib/controller-current-state controller))
+        input (contains? (ui/signals w) :key-down)]
+    (case kind
+      (:pressed :released)
+      (let [button (case (lib/gesture-single-get-current-button controller)
+                     2 :middle 3 :right :left)
+            down (= kind :pressed)
+            consumed (or (and input (emit-input! w (if down :mouse-down :mouse-up)
+                                                 :x (:x args) :y (:y args) :button button
+                                                 :click-count (:n args) :modifiers mods))
+                         (and down (= button :right)
+                              (or (and input (emit-input! w :context-request :x (:x args)
+                                                          :y (:y args) :button button
+                                                          :click-count (:n args)
+                                                          :modifiers mods))
+                                  (when-let [m (:context-menu w)]
+                                    (ui/popup-menu! m w (:x args) (:y args))
+                                    true))))]
+        (when consumed (lib/gesture-set-state controller 1))   ; CLAIMED: the widget skips it
+        consumed)
+      (:key-pressed :key-released)
+      (let [keyval (:keyval args)
+            code (lib/keyval-to-unicode keyval)
+            text (if (pos? code) (str (char code)) "")
+            mods (modifiers-of (:state args))
+            down (= kind :key-pressed)]
+        (boolean
+         (or (emit-input! w (if down :key-down :key-up) :key (key-of keyval) :modifiers mods
+                          :text text)
+             (and down (pos? code) (>= code 32) (not (contains? mods :control))
+                  (emit-input! w :text-input :text text :modifiers mods)))))
+      false)))
+
+(defmethod ui/backend-focus [(b gtk-backend) w]
+  (lib/widget-grab-focus (input-target w (native w))))
+
+(defn- widget-of-gtk
+  "The widget a GTK widget (or one it is in) stands for, or nil."
+  [n]
+  (loop [n n]
+    (when-not (ffi/null? n)
+      (let [w (lib/object-for n)]
+        (if (and w (instance? ui/widget w)) w (recur (lib/widget-get-parent n)))))))
+
+(defmethod ui/backend-focused-widget [(b gtk-backend)]
+  (when-let [win (ui/backend-active-window b)]
+    (widget-of-gtk (lib/root-get-focus (native win)))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Windows' options and modal runs
+
+(defmethod set-native [(w ui/window-widget) (p (= :resizable)) v]
+  (lib/window-set-resizable (native w) (boolean v)))
+
+(defmethod set-native [(w ui/window-widget) (p (= :closable)) v]
+  (lib/window-set-deletable (native w) (boolean v)))
+
+(defmethod set-native [(w ui/window-widget) (p (= :min-size)) size]
+  ;; The window's content can't be made smaller than this.
+  (when-let [[mw mh] size]
+    (lib/widget-set-size-request (container-view w) mw mh)))
+
+(def ^:private modal-state
+  "A window's address -> {:done :value} while it runs modally."
+  (atom {}))
+
+(defmethod ui/backend-run-modal [(b gtk-backend) w]
+  (let [a (ffi/address (native w))]
+    (swap! modal-state assoc a {:done false})
+    (lib/window-set-modal (native w) true)
+    (while (not (:done (get @modal-state a)))
+      (lib/g-main-context-iteration (ffi/null) true))
+    (lib/window-set-modal (native w) false)
+    (let [v (:value (get @modal-state a))]
+      (swap! modal-state dissoc a)
+      v)))
+
+(defmethod ui/backend-end-modal [(b gtk-backend) w value]
+  (swap! modal-state assoc (ffi/address (native w)) {:done true :value value})
+  (lib/g-main-context-wakeup (ffi/null)))
+
+(defn native-resizable?
+  "True if the user can resize the window."
+  [w]
+  (lib/window-get-resizable (native w)))
+
+(defn send-key!
+  "Press the key (a character) in the widget, as GTK's key controller reports it. True if
+a handler consumed it."
+  [w ch]
+  (native-input w :key-pressed (lib/key-controller-new)
+                {:keyval (int ch) :state 0}))

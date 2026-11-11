@@ -251,7 +251,8 @@
         about (ui/menu-item {:role :about})
         settings (ui/menu-item {:role :preferences})
         file (ui/menu {:title "File"} save (ui/menu-separator) quit)
-        bar (ui/menu-bar {} file (ui/menu {:title "Edit"} wrap) (ui/menu {:title "Help"} about settings))]
+        bar (ui/menu-bar {} file (ui/menu {:title "Edit"} wrap)
+                         (ui/menu {:title "Help"} about settings))]
     (is (= ["" "File" "Edit" "Help"] (cocoa/menu-titles bar)) "the application menu first")
     (is (= ["Save" ""] (cocoa/menu-titles file)) "Quit moved to the application menu")
     (is (= ["About" "" "Settings…" "" "Hide" "Hide Others" "Show All" "" "Quit"]

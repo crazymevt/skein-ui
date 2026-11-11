@@ -285,3 +285,24 @@
   (is (= "from skein-ui's GTK backend" (ui/clipboard-text)))
   (is (instance? ui/color (ui/system-color :accent)))
   (is (boolean? (ui/dark-mode?))))
+
+(deftest lgt-basics
+  (let [l (ui/label {:text "Big" :font {:size 22 :weight :bold} :text-color :red})
+        e (ui/entry {})
+        keys (atom [])
+        w (ui/window {:title "Basics" :resizable false} (ui/vbox {} l e))]
+    (ui/on e :key-down (fn [ev] (swap! keys conj (:key ev))
+                         (when (= (:key ev) \x) (ui/consume! ev))))
+    (ui/show! w)
+    (gtk/settle!)
+    (is (< 25 (nth (gtk/native-frame l) 3)) "a 22-point label is tall")
+    (is (not (gtk/native-resizable? w)))
+    (is (not (gtk/send-key! e \a)))
+    (is (gtk/send-key! e \x) "a handler consumed it")
+    (is (= [\a \x] @keys))
+    (ui/close! w))
+  (testing "modal runs"
+    (let [w (ui/window {:title "Modal"} (ui/label {:text "x"}))]
+      (ui/after 0.1 (fn [] (ui/end-modal! w 42)))
+      (is (= 42 (ui/run-modal w)))
+      (ui/close! w))))

@@ -652,6 +652,20 @@ hasn't placed it."
                       s))))
         (range (g-menu-model-n-items m))))
 
+(ffi/defcfun ^:blocking css-provider-new "gtk_css_provider_new" ptr [])
+(ffi/defcfun ^:blocking css-provider-load "gtk_css_provider_load_from_string" void
+  [p ptr, css c-string])
+(ffi/defcfun ^:blocking style-add-provider-for-display
+  "gtk_style_context_add_provider_for_display" void [display ptr, provider ptr, priority u32])
+(ffi/defcfun ^:blocking widget-add-css-class "gtk_widget_add_css_class" void
+  [w ptr, class c-string])
+(ffi/defcfun ^:blocking window-set-resizable "gtk_window_set_resizable" void [w ptr, v bool])
+(ffi/defcfun ^:blocking window-get-resizable "gtk_window_get_resizable" bool [w ptr])
+(ffi/defcfun ^:blocking window-set-deletable "gtk_window_set_deletable" void [w ptr, v bool])
+(ffi/defcfun ^:blocking gesture-set-state "gtk_gesture_set_state" bool [g ptr, state i32])
+(ffi/defcfun ^:blocking g-signal-emit-key "g_signal_emit_by_name" void
+  [instance ptr, signal c-string & keyval u32, keycode u32, state u32, result ptr, end ptr])
+
 (defn owned-string
   "The Skein string of a C string GLib allocated (null for nil), freeing it."
   [p]
