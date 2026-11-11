@@ -15,6 +15,7 @@ and read the real controls."
             [skein.ui.cocoa.objc :as objc]
             [skein.ffi :as ffi]
             [skein.math :as math]
+            [skein.string :as string]
             [skein.system :as system]))
 
 ;;; ------------------------------------------------------------------------------------
@@ -73,6 +74,13 @@ widgets made of several views, such as a spin button.")
 
 (defgeneric native-expanded [w item expanded]
   "The user opened (expanded true) or closed the item (a pointer) in w's outline view.")
+
+(defgeneric native-draw [w]
+  "w's canvas view is drawing: emit :draw with a graphics context.")
+
+(defgeneric native-input [w signal button event]
+  "The user acted on w's canvas view: signal is the canvas's (:mouse-down, :key-up, ...),
+button the mouse button, event the NSEvent.")
 
 (defgeneric native-natural-size [w]
   "w's natural [width height]: by default its AppKit view's fitting size.")
@@ -165,6 +173,28 @@ widgets made of several views, such as a spin button.")
     (objc/ns-string (native-outline w :text item (column-index ov col)))
     (ffi/null)))
 
+(ffi/defcallback draw-imp void [self ptr, cmd ptr, rect objc/ns-rect]
+  (when-let [w (objc/object-for self)]
+    (native-draw w)))
+
+(ffi/defcallback accepts-focus-imp bool [self ptr, cmd ptr]
+  (boolean (when-let [w (objc/object-for self)] (:focusable w))))
+
+(def ^:private input-selectors
+  "Each canvas input method's signal and mouse button."
+  {"mouseDown:" [:mouse-down :left] "mouseUp:" [:mouse-up :left]
+   "mouseDragged:" [:mouse-drag :left] "rightMouseDown:" [:mouse-down :right]
+   "rightMouseUp:" [:mouse-up :right] "rightMouseDragged:" [:mouse-drag :right]
+   "otherMouseDown:" [:mouse-down :middle] "otherMouseUp:" [:mouse-up :middle]
+   "otherMouseDragged:" [:mouse-drag :middle] "mouseMoved:" [:mouse-move nil]
+   "mouseEntered:" [:mouse-enter nil] "mouseExited:" [:mouse-leave nil]
+   "scrollWheel:" [:scroll nil] "keyDown:" [:key-down nil] "keyUp:" [:key-up nil]})
+
+(ffi/defcallback input-imp void [self ptr, cmd ptr, event ptr]
+  (when-let [w (objc/object-for self)]
+    (let [[signal button] (get input-selectors (objc/sel-name cmd))]
+      (native-input w signal button event))))
+
 (defn- note-item
   "The item an outline view notification is about."
   [note]
@@ -219,7 +249,12 @@ widgets made of several views, such as a spin button.")
                        ["splitViewDidResizeSubviews:" selection-imp "v@:@"]
                        ["boundsDidChange:" selection-imp "v@:@"]
                        ["tabView:didSelectTabViewItem:" tab-selected-imp "v@:@@"]])
-  (objc/define-class! "SkeinFlippedView" "NSView" [["isFlipped" yes-imp "B@:"]]))
+  (objc/define-class! "SkeinFlippedView" "NSView" [["isFlipped" yes-imp "B@:"]])
+  (objc/define-class! "SkeinCanvasView" "NSView"
+                      (into [["isFlipped" yes-imp "B@:"]
+                             ["drawRect:" draw-imp "v@:{CGRect={CGPoint=dd}{CGSize=dd}}"]
+                             ["acceptsFirstResponder" accepts-focus-imp "B@:"]]
+                            (map (fn [name] [name input-imp "v@:@"]) (keys input-selectors)))))
 
 (defn backend
   "A new Cocoa backend. Make it on the main thread (in -main, or a test)."
@@ -1435,6 +1470,204 @@ down through the open ones."
       (ui/tree-item-activated-by-user! t (item-of (objc/send-l ov (objc/sel "itemAtRow:") row))))))
 
 ;;; ------------------------------------------------------------------------------------
+;;; Canvases: a flipped view whose drawRect: and input methods are Skein's
+
+(defmethod make-native [(c ui/canvas-widget)]
+  (let [n (objc/send-r (objc/alloc "SkeinCanvasView") (objc/sel "initWithFrame:")
+                       (objc/rect 0 0 100 100))
+        ;; NSTrackingMouseEnteredAndExited 1 | MouseMoved 2 | ActiveInKeyWindow 0x20 |
+        ;; InVisibleRect 0x200: :mouse-enter, :mouse-leave and :mouse-move.
+        area (objc/send-rlpp (objc/alloc "NSTrackingArea")
+                             (objc/sel "initWithRect:options:owner:userInfo:")
+                             (objc/rect 0 0 0 0) (+ 1 2 0x20 0x200) n (ffi/null))]
+    (objc/send-p-void n (objc/sel "addTrackingArea:") area)
+    (objc/release area)
+    n))
+
+(defmethod native-natural-size [(c ui/canvas-widget)]
+  [100 100])
+
+(defmethod ui/backend-redraw [(b cocoa-backend) c rect]
+  (if rect
+    (let [[x y w h] rect]
+      (objc/send-r-void (view c) (objc/sel "setNeedsDisplayInRect:") (objc/rect x y w h)))
+    (objc/send-b-void (view c) (objc/sel "setNeedsDisplay:") true)))
+
+(defn ns-font
+  "The NSFont of a font map (nil for the system font)."
+  [font]
+  (let [f (or font (ui/font))
+        size (f64 (or (:size f) (objc/send-double (objc/cls "NSFont") (objc/sel "systemFontSize"))))
+        weight (case (:weight f) :light -0.4 :medium 0.23 :semibold 0.3 :bold 0.4 0.0)
+        base (cond (= :system (:family f))
+                   (objc/send-dd (objc/cls "NSFont") (objc/sel "systemFontOfSize:weight:") size weight)
+                   (= :monospace (:family f))
+                   (objc/send-dd (objc/cls "NSFont") (objc/sel "monospacedSystemFontOfSize:weight:")
+                                 size weight)
+                   :else
+                   (let [named (objc/send-pd (objc/cls "NSFont") (objc/sel "fontWithName:size:")
+                                             (objc/ns-string (:family f)) size)]
+                     (if (ffi/null? named)
+                       (objc/send-dd (objc/cls "NSFont") (objc/sel "systemFontOfSize:weight:")
+                                     size weight)
+                       named)))]
+    (if (:italic f)
+      (objc/send-pl (objc/send (objc/cls "NSFontManager") (objc/sel "sharedFontManager"))
+                    (objc/sel "convertFont:toHaveTrait:") base 1) ; NSItalicFontMask
+      base)))
+
+(defn- text-attributes
+  "An NSDictionary of the font and, if given, the color for drawing or measuring text."
+  [font color]
+  (let [d (objc/send (objc/cls "NSMutableDictionary") (objc/sel "dictionary"))]
+    (objc/send-pp-void d (objc/sel "setObject:forKey:") (ns-font font) (objc/ns-string "NSFont"))
+    (when color
+      (objc/send-pp-void d (objc/sel "setObject:forKey:") (ns-color color)
+                         (objc/ns-string "NSColor")))
+    d))
+
+(defn- string-size [s font]
+  (let [[w h] (objc/size-vec (objc/send-p-size (objc/ns-string s) (objc/sel "sizeWithAttributes:")
+                                               (text-attributes font nil)))]
+    [(math/ceil w) (math/ceil h)]))
+
+(defmethod ui/backend-text-size [(b cocoa-backend) s font]
+  (string-size s font))
+
+(defclass cocoa-context [ui/graphics-context]
+  "A graphics context drawing with CoreGraphics in a canvas's view."
+  (cg :init nil :doc "The CGContextRef."))
+
+(defn- rgba
+  "[r g b a] of a color designator, a system color resolved now."
+  [d]
+  (let [c (ui/ensure-color d)
+        c (if (keyword? c) (color-of (ns-color c)) c)]
+    [(f64 (ui/color-red c)) (f64 (ui/color-green c)) (f64 (ui/color-blue c))
+     (f64 (ui/color-alpha c))]))
+
+(defmethod ui/gc-set-fill-color [(gc cocoa-context) c]
+  (let [[r g b a] (rgba c)] (objc/cg-set-fill (:cg gc) r g b a)))
+
+(defmethod ui/gc-set-stroke-color [(gc cocoa-context) c]
+  (let [[r g b a] (rgba c)] (objc/cg-set-stroke (:cg gc) r g b a)))
+
+(defmethod ui/gc-set-line-width [(gc cocoa-context) w]
+  (objc/cg-set-line-width (:cg gc) w))
+
+(defmethod ui/gc-set-line-style [(gc cocoa-context) cap join dash]
+  (objc/cg-set-line-cap (:cg gc) (case cap :round 1 :square 2 0))
+  (objc/cg-set-line-join (:cg gc) (case join :round 1 :bevel 2 0))
+  (if (seq dash)
+    (ffi/with-foreign [lengths (ffi/alloc f64 (count dash))]
+      (doseq [[i x] (map-indexed vector dash)] (ffi/put! lengths f64 (f64 x) i))
+      (objc/cg-set-line-dash (:cg gc) 0.0 lengths (count dash)))
+    (objc/cg-set-line-dash (:cg gc) 0.0 (ffi/null) 0)))
+
+(defmethod ui/gc-save [(gc cocoa-context)] (objc/cg-save (:cg gc)))
+(defmethod ui/gc-restore [(gc cocoa-context)] (objc/cg-restore (:cg gc)))
+(defmethod ui/gc-translate [(gc cocoa-context) dx dy] (objc/cg-translate (:cg gc) dx dy))
+(defmethod ui/gc-scale [(gc cocoa-context) sx sy] (objc/cg-scale (:cg gc) sx sy))
+(defmethod ui/gc-rotate [(gc cocoa-context) r] (objc/cg-rotate (:cg gc) r))
+
+(defmethod ui/gc-clip-rectangle [(gc cocoa-context) x y w h]
+  (objc/cg-clip-rect (:cg gc) (objc/rect x y w h)))
+
+(defmethod ui/gc-rectangle [(gc cocoa-context) x y w h mode]
+  (if (= mode :fill)
+    (objc/cg-fill-rect (:cg gc) (objc/rect x y w h))
+    (objc/cg-stroke-rect (:cg gc) (objc/rect x y w h))))
+
+(defmethod ui/gc-ellipse [(gc cocoa-context) x y w h mode]
+  (if (= mode :fill)
+    (objc/cg-fill-ellipse (:cg gc) (objc/rect x y w h))
+    (objc/cg-stroke-ellipse (:cg gc) (objc/rect x y w h))))
+
+(defmethod ui/gc-begin-path [(gc cocoa-context)] (objc/cg-begin-path (:cg gc)))
+(defmethod ui/gc-move-to [(gc cocoa-context) x y] (objc/cg-move-to (:cg gc) x y))
+(defmethod ui/gc-line-to [(gc cocoa-context) x y] (objc/cg-line-to (:cg gc) x y))
+
+(defmethod ui/gc-curve-to [(gc cocoa-context) x1 y1 x2 y2 x y]
+  (objc/cg-curve-to (:cg gc) x1 y1 x2 y2 x y))
+
+(defmethod ui/gc-arc [(gc cocoa-context) cx cy r start end]
+  ;; In a flipped view, CoreGraphics' counterclockwise is clockwise on the screen.
+  (objc/cg-arc (:cg gc) cx cy r start end 0))
+
+(defmethod ui/gc-close-path [(gc cocoa-context)] (objc/cg-close-path (:cg gc)))
+
+(defmethod ui/gc-draw-path [(gc cocoa-context) mode]
+  ;; kCGPathFill 0, kCGPathStroke 2, kCGPathFillStroke 3
+  (objc/cg-draw-path (:cg gc) (case mode :stroke 2 :fill-and-stroke 3 0)))
+
+(defmethod ui/gc-text [(gc cocoa-context) s x y font color]
+  (objc/send-point-p-void (objc/ns-string s) (objc/sel "drawAtPoint:withAttributes:")
+                          {:x (f64 x) :y (f64 y)} (text-attributes font color)))
+
+(defmethod ui/gc-text-size [(gc cocoa-context) s font]
+  (string-size s font))
+
+(defmethod ui/gc-image [(gc cocoa-context) image x y w h]
+  ;; NSCompositingOperationSourceOver 2; respectFlipped draws it the right way up.
+  (objc/send-rrldbp-void (ns-image image)
+                         (objc/sel "drawInRect:fromRect:operation:fraction:respectFlipped:hints:")
+                         (objc/rect x y w h) (objc/rect 0 0 0 0) 2 1.0 true (ffi/null)))
+
+(defn- current-cg []
+  (objc/send (objc/send (objc/cls "NSGraphicsContext") (objc/sel "currentContext"))
+             (objc/sel "CGContext")))
+
+(defmethod native-draw [(c ui/canvas-widget)]
+  (let [[_ _ w h] (objc/rect-vec (objc/send-rect (view c) (objc/sel "bounds")))
+        gc (make cocoa-context :cg (current-cg) :width w :height h)]
+    (when (:background c)
+      (ui/paint! gc (:background c)))
+    (ui/emit! c (ui/event-for c :draw :context gc :width w :height h))))
+
+(def ^:private named-keys
+  {36 :return 76 :return 53 :escape 48 :tab 51 :backspace 117 :delete 123 :left 124 :right
+   125 :down 126 :up 115 :home 119 :end 116 :page-up 121 :page-down 49 :space
+   122 :f1 120 :f2 99 :f3 118 :f4 96 :f5 97 :f6 98 :f7 100 :f8 101 :f9 109 :f10
+   103 :f11 111 :f12})
+
+(defn- event-modifiers
+  "The set of modifier keys an NSEvent had."
+  [e]
+  (let [flags (objc/send-long e (objc/sel "modifierFlags"))]
+    (set (keep (fn [[bit m]] (when (pos? (bit-and flags bit)) m))
+               [[0x20000 :shift] [0x40000 :control] [0x80000 :alt] [0x100000 :command]]))))
+
+(defmethod native-input [(c ui/canvas-widget) signal button e]
+  (let [n (view c)
+        mods (event-modifiers e)]
+    (if (or (= signal :key-down) (= signal :key-up))
+      (let [code (objc/send-long e (objc/sel "keyCode"))
+            chars (objc/string-of (objc/send e (objc/sel "charactersIgnoringModifiers")))
+            key (or (get named-keys code)
+                    (when (seq chars) (first (string/lower-case chars))))]
+        (ui/emit! c (ui/event-for c signal :key key :modifiers mods
+                                  :text (or (objc/string-of (objc/send e (objc/sel "characters"))) "")
+                                  :repeat (and (= signal :key-down)
+                                               (objc/send-bool e (objc/sel "isARepeat"))))))
+      (let [p (objc/send-point-p n (objc/sel "convertPoint:fromView:")
+                                 (let [w (objc/send-point e (objc/sel "locationInWindow"))]
+                                   {:x (ffi/field w objc/ns-point :x) :y (ffi/field w objc/ns-point :y)})
+                                 (ffi/null))
+            x (ffi/field p objc/ns-point :x)
+            y (ffi/field p objc/ns-point :y)]
+        (when (and (= signal :mouse-down) (:focusable c))
+          (objc/send-p-void (objc/send n (objc/sel "window")) (objc/sel "makeFirstResponder:") n))
+        (ui/emit! c (if (= signal :scroll)
+                      (ui/event-for c :scroll :x x :y y :modifiers mods
+                                    :delta-x (objc/send-double e (objc/sel "scrollingDeltaX"))
+                                    :delta-y (objc/send-double e (objc/sel "scrollingDeltaY"))
+                                    :precise (objc/send-bool e (objc/sel "hasPreciseScrollingDeltas")))
+                      (ui/event-for c signal :x x :y y :button button :modifiers mods
+                                    :click-count (if (or (= signal :mouse-down) (= signal :mouse-up))
+                                                   (objc/send-long e (objc/sel "clickCount"))
+                                                   0))))))))
+
+;;; ------------------------------------------------------------------------------------
 ;;; For tests: the real controls, read and acted on
 
 (defn native-frame
@@ -1597,3 +1830,36 @@ string value."
   "Open the tree's item in its outline view, as clicking its disclosure triangle does."
   [t item]
   (objc/send-p-void (table-of t) (objc/sel "expandItem:") (item-ptr t item)))
+
+(defn draw-into-image!
+  "Draw the canvas into a bitmap, as AppKit draws it on the screen, and return the
+bitmap's color at the point x, y of the view (from the top left)."
+  [c x y]
+  (let [n (view c)]
+    (objc/call-with-pool
+     (fn []
+       (let [rep (objc/send-r n (objc/sel "bitmapImageRepForCachingDisplayInRect:")
+                              (objc/send-rect n (objc/sel "bounds")))]
+         (objc/send-rp-void n (objc/sel "cacheDisplayInRect:toBitmapImageRep:")
+                            (objc/send-rect n (objc/sel "bounds")) rep)
+         (let [[_ _ w _] (objc/rect-vec (objc/send-rect n (objc/sel "bounds")))
+               scale (/ (objc/send-long rep (objc/sel "pixelsWide")) w)]
+           (color-of (objc/send-ll rep (objc/sel "colorAtX:y:")
+                                   (int (* scale x)) (int (* scale y))))))))))
+
+(defn send-mouse!
+  "Send the canvas's view a mouse event of type (an NSEventType: 1 down, 2 up) at x, y in
+the view (from the top left), as AppKit does for a click."
+  [c type x y]
+  (let [n (view c)
+        win (objc/send n (objc/sel "window"))
+        [_ _ _ h] (objc/rect-vec (objc/send-rect n (objc/sel "bounds")))
+        ;; to window coordinates (from the bottom left)
+        p (objc/send-point-p n (objc/sel "convertPoint:toView:") {:x (f64 x) :y (f64 y)} (ffi/null))
+        e (objc/send-mouse-event
+           (objc/cls "NSEvent")
+           (objc/sel (str "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:"
+                          "context:eventNumber:clickCount:pressure:"))
+           type {:x (ffi/field p objc/ns-point :x) :y (ffi/field p objc/ns-point :y)} 0 0.0
+           (objc/send-long win (objc/sel "windowNumber")) (ffi/null) 0 1 1.0)]
+    (objc/send-p-void n (objc/sel (if (= type 1) "mouseDown:" "mouseUp:")) e)))

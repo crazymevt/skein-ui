@@ -213,3 +213,31 @@
       (cocoa/select-rows-natively! tree [3])
       (is (= ["main.skn"] (:selection tree))))
     (ui/close! w)))
+
+(deftest canvases-draw-and-get-the-mouse
+  (let [clicks (atom [])
+        c (ui/canvas {:width 200 :height 100 :background :white
+                      :on-draw (fn [e]
+                                 (let [gc (:context e)]
+                                   (ui/fill-rectangle! gc 0 0 100 100 {:color "#ff0000"})
+                                   (ui/fill-circle! gc 150 50 20 {:color "#0000ff"})
+                                   (ui/draw-text! gc "Hi" 110 5 {:color :black})))
+                      :on-mouse-down (fn [e] (swap! clicks conj [(:x e) (:y e) (:button e)]))})
+        w (ui/window {} c)
+        ;; The bitmap is in the display's color space, so a color comes back near itself:
+        ;; judge by its strongest component.
+        strongest (fn [c] (let [rgb {:red (ui/color-red c) :green (ui/color-green c)
+                                     :blue (ui/color-blue c)}]
+                            (if (every? (fn [v] (> v 0.9)) (vals rgb))
+                              :white
+                              (key (apply max-key val rgb)))))]
+    (ui/show! w)
+    (is (= :red (strongest (cocoa/draw-into-image! c 50 50))) "the red square")
+    (is (= :blue (strongest (cocoa/draw-into-image! c 150 50))) "the blue circle")
+    (is (= :white (strongest (cocoa/draw-into-image! c 190 90))) "the white background")
+    (let [[w h] (ui/text-extent "abcdefghij" {:size 12})]
+      (is (< 50 w 75) "about 6 pixels a character at 12 points")
+      (is (< 13 h 18) "a line"))
+    (cocoa/send-mouse! c 1 30 40)
+    (is (= [[30.0 40.0 :left]] @clicks) "flipped: from the top left")
+    (ui/close! w)))

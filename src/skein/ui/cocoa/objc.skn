@@ -152,6 +152,49 @@ and all of them run on the main thread, which no fiber waits to share."
 (ffi/defcfun ^:blocking send-ppl "objc_msgSend" ptr [self ptr, sel ptr, a ptr, b ptr, n i64])
 (ffi/defcfun ^:blocking send-pbp-void "objc_msgSend" void [self ptr, sel ptr, a ptr, b bool, c ptr])
 (ffi/defcfun ^:blocking send-l-long "objc_msgSend" i64 [self ptr, sel ptr, n i64])
+(ffi/defcfun ^:blocking send-point "objc_msgSend" ns-point [self ptr, sel ptr])
+(ffi/defcfun ^:blocking send-point-p "objc_msgSend" ns-point [self ptr, sel ptr, p ns-point, a ptr])
+(ffi/defcfun ^:blocking send-point-p-void "objc_msgSend" void [self ptr, sel ptr, p ns-point, a ptr])
+(ffi/defcfun ^:blocking send-p-size "objc_msgSend" ns-size [self ptr, sel ptr, a ptr])
+(ffi/defcfun ^:blocking send-rlpp "objc_msgSend" ptr
+  [self ptr, sel ptr, r ns-rect, options u64, owner ptr, info ptr])
+(ffi/defcfun ^:blocking send-rrldbp-void "objc_msgSend" void
+  [self ptr, sel ptr, r ns-rect, from ns-rect, op u64, fraction f64, flipped bool, hints ptr])
+(ffi/defcfun ^:blocking send-dd "objc_msgSend" ptr [self ptr, sel ptr, a f64, b f64])
+(ffi/defcfun ^:blocking send-pd "objc_msgSend" ptr [self ptr, sel ptr, a ptr, d f64])
+(ffi/defcfun sel-name "sel_getName" c-string [sel ptr])
+(ffi/defcfun ^:blocking send-mouse-event "objc_msgSend" ptr
+  [self ptr, sel ptr, type u64, location ns-point, flags u64, time f64, window i64,
+   context ptr, number i64, clicks i64, pressure f32])
+(ffi/defcfun ^:blocking send-rp-void "objc_msgSend" void [self ptr, sel ptr, r ns-rect, a ptr])
+
+;;; CoreGraphics, for drawing in a canvas's view
+
+(ffi/defcfun cg-set-fill "CGContextSetRGBFillColor" void [c ptr, r f64, g f64, b f64, a f64])
+(ffi/defcfun cg-set-stroke "CGContextSetRGBStrokeColor" void [c ptr, r f64, g f64, b f64, a f64])
+(ffi/defcfun cg-set-line-width "CGContextSetLineWidth" void [c ptr, w f64])
+(ffi/defcfun cg-set-line-cap "CGContextSetLineCap" void [c ptr, cap i32])
+(ffi/defcfun cg-set-line-join "CGContextSetLineJoin" void [c ptr, join i32])
+(ffi/defcfun cg-set-line-dash "CGContextSetLineDash" void [c ptr, phase f64, lengths ptr, n u64])
+(ffi/defcfun cg-save "CGContextSaveGState" void [c ptr])
+(ffi/defcfun cg-restore "CGContextRestoreGState" void [c ptr])
+(ffi/defcfun cg-translate "CGContextTranslateCTM" void [c ptr, x f64, y f64])
+(ffi/defcfun cg-scale "CGContextScaleCTM" void [c ptr, x f64, y f64])
+(ffi/defcfun cg-rotate "CGContextRotateCTM" void [c ptr, a f64])
+(ffi/defcfun cg-clip-rect "CGContextClipToRect" void [c ptr, r ns-rect])
+(ffi/defcfun cg-fill-rect "CGContextFillRect" void [c ptr, r ns-rect])
+(ffi/defcfun cg-stroke-rect "CGContextStrokeRect" void [c ptr, r ns-rect])
+(ffi/defcfun cg-fill-ellipse "CGContextFillEllipseInRect" void [c ptr, r ns-rect])
+(ffi/defcfun cg-stroke-ellipse "CGContextStrokeEllipseInRect" void [c ptr, r ns-rect])
+(ffi/defcfun cg-begin-path "CGContextBeginPath" void [c ptr])
+(ffi/defcfun cg-move-to "CGContextMoveToPoint" void [c ptr, x f64, y f64])
+(ffi/defcfun cg-line-to "CGContextAddLineToPoint" void [c ptr, x f64, y f64])
+(ffi/defcfun cg-curve-to "CGContextAddCurveToPoint" void
+  [c ptr, x1 f64, y1 f64, x2 f64, y2 f64, x f64, y f64])
+(ffi/defcfun cg-arc "CGContextAddArc" void
+  [c ptr, x f64, y f64, r f64, start f64, end f64, clockwise i32])
+(ffi/defcfun cg-close-path "CGContextClosePath" void [c ptr])
+(ffi/defcfun cg-draw-path "CGContextDrawPath" void [c ptr, mode i32])
 
 (defn new-object
   "A new instance of the class named class-name: [[class alloc] init], owned (+1)."
