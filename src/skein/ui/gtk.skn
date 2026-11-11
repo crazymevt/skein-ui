@@ -2425,36 +2425,58 @@ clicks OK (nil cancels it); a file chooser is cancelled."
 (defn- style-target [w]
   (if (instance? ui/text-view-widget w) (text-view-of w) (native w)))
 
+(def ^:private size-scales {:small "85%" :mini "72%" :large "115%"})
+
+(defn- declarations
+  "The CSS declarations of the widget's own look: its font, control size, a label's
+colors, the palette's text and background colors, a container's surface or background."
+  [w]
+  (let [palette-text (when (ui/palette-color w :text) (ui/widget-color w :text))
+        palette-bg (when (ui/palette-color w :background) (ui/widget-color w :background))
+        label? (instance? ui/label-widget w)
+        fill (when (or (instance? ui/container-widget w) (instance? ui/window-widget w))
+               (or (ui/container-fill w)
+                   (when-let [role (ui/surface-color-role (:surface w))]
+                     (when (not= role :window-background) (ui/widget-color w role)))))]
+    (str (if (and (instance? ui/widget w) (:font w)) (css-font (:font w)) "")
+         (if-let [scale (and (instance? ui/widget w) (get size-scales (:control-size w)))]
+           (str "font-size: " scale "; ") "")
+         (if-let [c (or (when label? (:text-color w)) palette-text)]
+           (str "color: " (css-color c) "; ") "")
+         (if-let [c (or (when label? (:background w)) fill
+                        (when (or (instance? ui/entry-widget w) (instance? ui/text-view-widget w)
+                                  (instance? ui/list-box-widget w))
+                          palette-bg))]
+           (str "background-color: " (css-color c) "; ") ""))))
+
 (defn- restyle!
-  "Give the widget's GTK widget a CSS rule of its :font and, for a label, colors."
+  "Give the widget's GTK widget a CSS rule of its own look (declarations)."
   [w]
   (let [n (style-target w)
         a (ffi/address n)
-        class (or (get @css-classes a)
-                  (let [c (str "skein-" (count @css-classes))]
-                    (lib/widget-add-css-class n c)
-                    (swap! css-classes assoc a c)
-                    c))
-        declarations (str (if (:font w) (css-font (:font w)) "")
-                          (if (and (instance? ui/label-widget w) (:text-color w))
-                            (str "color: " (css-color (:text-color w)) "; ") "")
-                          (if (and (instance? ui/label-widget w) (:background w))
-                            (str "background-color: " (css-color (:background w)) "; ") ""))]
-    (swap! css-rules assoc class declarations)
-    (lib/css-provider-load (:css (ui/current-backend))
-                           (apply str (map (fn [[c d]] (str "." c " { " d "}\n")) @css-rules)))))
+        d (declarations w)]
+    (when (or (seq d) (get @css-classes a))
+      (let [class (or (get @css-classes a)
+                      (let [c (str "skein-" (count @css-classes))]
+                        (lib/widget-add-css-class n c)
+                        (swap! css-classes assoc a c)
+                        c))]
+        (swap! css-rules assoc class d)
+        (lib/css-provider-load (:css (ui/current-backend))
+                               (apply str (map (fn [[c d]] (str "." c " { " d "}\n"))
+                                               @css-rules)))))))
 
-(defmethod set-native [(w ui/widget) (p (= :font)) f]
-  (when (or f (get @css-classes (ffi/address (style-target w))))
-    (restyle! w)))
+(defmethod set-native [(w ui/widget) (p (= :font)) f] (restyle! w))
+(defmethod set-native [(w ui/widget) (p (= :control-size)) v] (restyle! w))
+(defmethod set-native [(l ui/label-widget) (p (= :text-color)) c] (restyle! l))
+(defmethod set-native [(l ui/label-widget) (p (= :background)) c] (restyle! l))
+(defmethod set-native [(c ui/container-widget) (p (= :surface)) v] (restyle! c))
+(defmethod set-native [(c ui/container-widget) (p (= :background)) v] (restyle! c))
+(defmethod set-native [(w ui/window-widget) (p (= :surface)) v] (restyle! w))
+(defmethod set-native [(w ui/window-widget) (p (= :background)) v] (restyle! w))
 
-(defmethod set-native [(l ui/label-widget) (p (= :text-color)) c]
-  (when (or c (get @css-classes (ffi/address (style-target l))))
-    (restyle! l)))
-
-(defmethod set-native [(l ui/label-widget) (p (= :background)) c]
-  (when (or c (get @css-classes (ffi/address (style-target l))))
-    (restyle! l)))
+(defmethod ui/backend-apply-palette [(b gtk-backend) w]
+  (restyle! w))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Input events of the controls, context menus and focus
@@ -2595,3 +2617,77 @@ a handler consumed it."
   [w ch]
   (native-input w :key-pressed (lib/key-controller-new)
                 {:keyval (int ch) :state 0}))
+
+;;; ------------------------------------------------------------------------------------
+;;; Appearance: GTK 4 has one dark-mode setting for the application. A subtree that asks
+;;; for :light or :dark gets the theme's variant as a style provider of its own widgets.
+
+(defn- inherited-appearance [w]
+  (some (fn [o] (let [a (:appearance o)] (when (or (= a :light) (= a :dark)) a)))
+        (take-while some? (iterate :parent w))))
+
+(defmethod ui/backend-widget-appearance [(b gtk-backend) w]
+  (or (inherited-appearance w) (if (ui/backend-dark-mode? b) :dark :light)))
+
+(defmethod ui/backend-color-in-appearance [(b gtk-backend) name w]
+  (let [dark (= :dark (ui/backend-widget-appearance b w))]
+    (ui/parse-color (or (when-let [[l d] (get ui/system-palette name)] (if dark d l))
+                        (get palette name)
+                        (get (get adwaita dark) name)
+                        (get (get adwaita dark) ({:sidebar-background :window-background
+                                                  :content-background :background
+                                                  :status-background :window-background
+                                                  :toolbar-background :window-background
+                                                  :activity-background :window-background
+                                                  :popover-background :background} name))
+                        "#808080"))))
+
+(def ^:private theme-providers
+  "[theme mode] -> a CSS provider of the theme's variant."
+  (atom {}))
+
+(def ^:private attached-themes
+  "A GTK widget's address -> the theme provider attached to its style context."
+  (atom {}))
+
+(defn- theme-name []
+  (ffi/with-foreign [out (ffi/alloc ptr 1)]
+    (lib/g-object-get-string (lib/settings-get-default) "gtk-theme-name" out (ffi/null))
+    (or (lib/owned-string (ffi/get out ptr)) "Adwaita")))
+
+(defn- theme-provider [mode]
+  (let [k [(theme-name) mode]]
+    (or (get @theme-providers k)
+        (let [p (lib/css-provider-new)]
+          (lib/css-provider-load-named p (first k) (when (= mode :dark) "dark"))
+          (swap! theme-providers assoc k p)
+          p))))
+
+(defn- apply-native-appearance!
+  "Attach to the widget's GTK widgets the theme variant its appearance asks for."
+  [w]
+  (when (and (instance? ui/widget w) (ui/realized? w))
+    (let [mode (inherited-appearance w)
+          provider (when mode (theme-provider mode))]
+      (doseq [n (lib/widgets-under (native w))]
+        (let [a (ffi/address n)
+              old (get @attached-themes a)
+              context (lib/widget-get-style-context n)]
+          (when (not= (when old (ffi/address old)) (when provider (ffi/address provider)))
+            (when old (lib/style-context-remove-provider context old))
+            (when provider (lib/style-context-add-provider context provider 599))
+            (swap! attached-themes assoc a provider)))))))
+
+(defmethod set-native [(w ui/widget) (p (= :appearance)) a]
+  (doseq [x (ui/widgets-in w)] (apply-native-appearance! x)))
+
+(defmethod set-native [(w ui/window-widget) (p (= :appearance)) a]
+  (doseq [x (ui/widgets-in w)] (apply-native-appearance! x)))
+
+(defmethod ui/backend-add-child :after [(b gtk-backend) parent (child ui/widget)]
+  (doseq [x (ui/widgets-in child)] (apply-native-appearance! x)))
+
+(defn has-css-rule?
+  "True if the widget has a CSS rule of its own look."
+  [w]
+  (seq (get @css-rules (get @css-classes (ffi/address (style-target w))))))

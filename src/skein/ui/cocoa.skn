@@ -2642,11 +2642,11 @@ consumed it."
       (let [code (case size :small 1 :mini 2 :large 3 0)]
         (objc/send-l-void n (objc/sel "setControlSize:") code)
         (when (and (nil? (:font w)) (objc/responds? n "setFont:"))
-          (objc/send-p-void n (objc/sel "setFont:")
-                            (objc/send-d (objc/cls "NSFont") (objc/sel "systemFontOfSize:")
-                                         (objc/send-l-double (objc/cls "NSFont")
-                                                             (objc/sel "systemFontSizeForControlSize:")
-                                                             code))))))))
+          (let [points (objc/send-l-double (objc/cls "NSFont")
+                                           (objc/sel "systemFontSizeForControlSize:") code)]
+            (objc/send-p-void n (objc/sel "setFont:")
+                              (objc/send-d (objc/cls "NSFont") (objc/sel "systemFontOfSize:")
+                                           points))))))))
 
 (def ^:private surface-materials
   "A surface role -> the NSVisualEffectMaterial that draws it."

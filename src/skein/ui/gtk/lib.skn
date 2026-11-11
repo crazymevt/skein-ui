@@ -666,6 +666,16 @@ hasn't placed it."
 (ffi/defcfun ^:blocking g-signal-emit-key "g_signal_emit_by_name" void
   [instance ptr, signal c-string & keyval u32, keycode u32, state u32, result ptr, end ptr])
 
+(ffi/defcfun ^:blocking css-provider-load-named "gtk_css_provider_load_named" void
+  [p ptr, name c-string, variant c-string])
+(ffi/defcfun ^:blocking widget-get-style-context "gtk_widget_get_style_context" ptr [w ptr])
+(ffi/defcfun ^:blocking style-context-add-provider "gtk_style_context_add_provider" void
+  [c ptr, provider ptr, priority u32])
+(ffi/defcfun ^:blocking style-context-remove-provider "gtk_style_context_remove_provider" void
+  [c ptr, provider ptr])
+(ffi/defcfun ^:blocking g-object-get-string "g_object_get" void
+  [o ptr, name c-string & out ptr, end ptr])
+
 (defn owned-string
   "The Skein string of a C string GLib allocated (null for nil), freeing it."
   [p]
