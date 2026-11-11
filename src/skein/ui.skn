@@ -2742,6 +2742,9 @@ widget), :tab-icon, :tab-tooltip, a close button unless :tab-closable is false, 
     (set-slot! bar :start start)
     (set-slot! bar :end end)))
 
+(defmethod destroy! :before [(pane tabbed-pane-widget)]
+  (when-let [bar (:tab-bar pane)] (destroy! bar)))
+
 (defn- tab-widgets [page]
   (filterv (fn [w] (instance? widget w)) [(:tab-label page) (:tab-accessory page)]))
 
@@ -2947,10 +2950,11 @@ true (consuming the key event) if it did. It runs for the pane's widgets by itse
       (call-next-method))))
 
 (defmethod measure [(bar tab-bar-widget)]
+  ;; Room for a few tabs: the bar scrolls the rest rather than widening the window.
   (let [[sw sh] (outer-size (:start bar))
         [ew eh] (outer-size (:end bar))
-        [nw nh] (let [b (current-backend)] (in-ui (fn [] (backend-natural-size b bar))))]
-    [(+ sw ew nw) (max nh (+ 8 sh) (+ 8 eh))]))
+        [_ nh] (let [b (current-backend)] (in-ui (fn [] (backend-natural-size b bar))))]
+    [(+ 160 sw ew) (max nh (+ 8 sh) (+ 8 eh))]))
 
 (defmethod arrange [(bar tab-bar-widget) width height]
   (let [[sw _] (outer-size (:start bar))
@@ -2959,6 +2963,12 @@ true (consuming the key event) if it did. It runs for the pane's widgets by itse
         ew (min (- width sw) ew)]
     (allocate-in-cell (:start bar) 0 0 sw height)
     (allocate-in-cell (:end bar) (- width ew) 0 ew height)))
+
+(defgeneric backend-tab-layout [backend pane width height]
+  "Place the tabs of a pane of width by height, once its tab bar has its allocation.")
+
+(defmethod backend-tab-layout [(b backend) pane width height]
+  nil)
 
 (defgeneric backend-tab-page-area [backend pane width height]
   "The [width height] of the area the pane's pages get in a pane of width by height.")
@@ -2976,6 +2986,7 @@ true (consuming the key event) if it did. It runs for the pane's widgets by itse
         [_ bh] (outer-size bar)
         bh (min height bh)]
     (allocate bar 0 (if (= :bottom (:tab-position pane)) (- height bh) 0) width bh)
+    (let [b (current-backend)] (in-ui (fn [] (backend-tab-layout b pane width height))))
     (let [[pw ph] (let [b (current-backend)] (in-ui (fn [] (backend-tab-page-area b pane width height))))]
       (doseq [p (:children pane)]
         (allocate-in-cell p 0 0 pw ph)))))
@@ -3652,6 +3663,23 @@ dismissed it."
   ([m widget x y]
    (let [b (current-backend)]
      (in-ui (fn [] (backend-popup-menu b m widget x y))))))
+
+(defn show-tab-menu
+  "Show a menu of the tabbed pane's pages, checking the one shown, at the end of its tab
+bar; choosing one shows it. Backends use it for the button that lists all the tabs."
+  [pane]
+  (let [bar (:tab-bar pane)
+        m (build menu-widget {} nil)]
+    (doseq [[i page] (map-indexed vector (:children pane))]
+      (add! m (build check-menu-item-widget
+                     {:label (tab-title pane page) :checked (= i (:selected-index pane))
+                      :on-activate (fn [_] (when (index-of (:children pane) page)
+                                             (select-page! pane page)))}
+                     nil)))
+    (try
+      (let [[_ _ bw bh] (or (:allocation bar) [0 0 0 0])]
+        (popup-menu! m bar (max 0 (- bw 24)) bh))
+      (finally (destroy! m)))))
 
 (def ^:private modifier-names
   {"primary" :primary "ctrl" :control "control" :control "cmd" :command "command" :command

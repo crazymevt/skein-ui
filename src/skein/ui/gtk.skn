@@ -88,7 +88,8 @@ with args, a map.")
 (def ^:private signal-kinds
   [:clicked :activate :changed :toggled :value-changed :resized :selected :switch-page
    :close-request :position :sort :items-changed :pressed :released :motion :enter :leave
-   :scroll :key-pressed :key-released :window-key :closed :menu-activate :active])
+   :scroll :key-pressed :key-released :window-key :closed :menu-activate :active
+   :page-reordered :tab-close])
 
 (defn- kind-of [data] (nth signal-kinds (ffi/address data)))
 
@@ -121,6 +122,16 @@ this namespace's), reporting it as kind. Returns o."
 (ffi/defcallback switch-page-imp void [notebook ptr, page ptr, number u32, data ptr]
   (when-let [w (lib/object-for notebook)]
     (native-signal w :switch-page notebook number)))
+
+(ffi/defcallback page-signal-imp void [notebook ptr, page ptr, number u32, data ptr]
+  (when-let [w (lib/object-for notebook)]
+    (native-signal w (kind-of data) notebook [page number])))
+
+(def ^:private tab-event!
+  "Handle an event in a tabbed pane, before its GtkNotebook does (defined below).")
+
+(ffi/defcallback legacy-imp bool [controller ptr, event ptr, data ptr]
+  (boolean (when-let [pane (lib/object-for controller)] (tab-event! pane event))))
 
 (def ^:private factory-owners
   "A list item factory's address -> [widget column-index]."
@@ -342,8 +353,10 @@ for the user's doing."
   (let [n (native w)
         p (:parent w)]
     ;; Its GTK parent is the GtkFixed it was put in (a notebook page's own), except in a
-    ;; split pane, which places its panes itself.
-    (when (and p (not (instance? ui/paned-widget p)))
+    ;; split pane, which places its panes itself, and a tab bar's, whose widgets are in the
+    ;; GtkNotebook's tabs and ends.
+    (when (and p (not (instance? ui/paned-widget p)) (not (instance? ui/tab-bar-widget p))
+               (not (instance? ui/tab-bar-widget w)))
       (lib/fixed-move (lib/widget-get-parent n) n (f64 x) (f64 y)))
     (lib/widget-set-size-request n width height)
     (layout-native w width height)))
@@ -1000,8 +1013,9 @@ inside it that holds its children."
 (defmethod ui/backend-add-child [(b gtk-backend) (n ui/notebook-widget) page]
   (let [wrapper (lib/fixed-new)]
     (lib/fixed-put wrapper (native page) 0.0 0.0)
-    (quietly (fn [] (lib/notebook-append-page (native n) wrapper
-                                              (lib/label-new (or (:tab-label page) "")))))))
+    (quietly (fn [] (lib/notebook-append-page
+                     (native n) wrapper
+                     (lib/label-new (let [l (:tab-label page)] (if (string? l) l ""))))))))
 
 (defmethod ui/backend-remove-child [(b gtk-backend) (n ui/notebook-widget) page]
   (let [wrapper (page-wrapper page)
@@ -1880,7 +1894,9 @@ windows that show it."
 
 (defmethod ui/backend-popup-menu [(b gtk-backend) m widget x y]
   (fill-menu! m)
-  (let [popover (lib/popover-menu-new (native m))
+  ;; A tab bar's point is in its pane, whose GtkNotebook draws the bar.
+  (let [widget (if (instance? ui/tab-bar-widget widget) (:pane widget) widget)
+        popover (lib/popover-menu-new (native m))
         state (make popup-state)]
     (lib/widget-set-parent popover (native widget))
     (lib/widget-insert-action-group popover "skein" (:actions b))
@@ -2691,3 +2707,358 @@ a handler consumed it."
   "True if the widget has a CSS rule of its own look."
   [w]
   (seq (get @css-rules (get @css-classes (ffi/address (style-target w))))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Stacks and tabbed panes. A tabbed pane is a GtkNotebook: it scrolls its tabs, lists
+;;; them in a popup and reorders them itself; each tab is a GtkBox of the page's icon,
+;;; label, accessory and close button, and the tab bar's start and end boxes are its action
+;;; widgets. A capture-phase legacy controller drags tabs to other panes of the drag group.
+
+(defmethod make-native [(s ui/stack-widget)] (owned (lib/fixed-new)))
+
+(defmethod make-native [(bar ui/tab-bar-widget)] (owned (lib/fixed-new)))
+
+(defn- install-tab-drag! [pane nb]
+  (let [c (lib/legacy-controller-new)]
+    (lib/controller-set-phase c 1)   ; capture: before the notebook's own gesture
+    (lib/register! c pane)
+    (lib/g-signal-connect-data c "event" legacy-imp (ffi/null) (ffi/null) 0)
+    (lib/widget-add-controller nb c)))
+
+(defmethod make-native [(pane ui/tabbed-pane-widget)]
+  (let [nb (call-next-method)]
+    (lib/notebook-set-scrollable nb true)
+    (lib/notebook-popup-enable nb)
+    (connect! nb "page-reordered" :page-reordered page-signal-imp)
+    (install-tab-drag! pane nb)
+    nb))
+
+(defmethod ui/backend-add-child [(b gtk-backend) (pane ui/tabbed-pane-widget) child]
+  ;; The tab bar's GtkFixed only holds its widgets until they go in the tabs and ends.
+  (when-not (instance? ui/tab-bar-widget child)
+    (call-next-method)))
+
+(defn- detach!
+  "Take the GTK widget n out of the box or fixed it is in. Returns n."
+  [n]
+  (let [parent (lib/widget-get-parent n)]
+    (when-not (ffi/null? parent)
+      (let [type (lib/type-name-of parent)]
+        (cond (= type "GtkBox") (lib/box-remove parent n)
+              (= type "GtkFixed") (lib/fixed-remove parent n)
+              :else (lib/widget-unparent n)))))
+  n)
+
+(defmethod ui/backend-remove-child [(b gtk-backend) (bar ui/tab-bar-widget) child]
+  (detach! (native child)))
+
+(defmethod ui/backend-set-page-label [(b gtk-backend) (pane ui/tabbed-pane-widget) page label]
+  ;; backend-tab-update shows the label.
+  nil)
+
+(def ^:private tab-closers
+  "A page's GTK widget address -> the close button of its tab."
+  (atom {}))
+
+(defn- tab-closer [page]
+  (let [a (ffi/address (native page))]
+    (or (get @tab-closers a)
+        (let [button (owned (lib/button-new-from-icon-name "window-close-symbolic"))]
+          (lib/widget-add-css-class button "flat")
+          (lib/register! button page)
+          (connect! button "clicked" :tab-close signal-imp)
+          (swap! tab-closers assoc a button)
+          button))))
+
+(defn- forget-closer! [page]
+  (let [a (ffi/address (native page))]
+    (when-let [button (get @tab-closers a)]
+      (detach! button)
+      (lib/unregister! button)
+      (lib/g-object-unref button)
+      (swap! tab-closers dissoc a))))
+
+(defmethod native-signal [(page ui/widget) (k (= :tab-close)) button arg]
+  (let [pane (:parent page)]
+    (when (and (instance? ui/tabbed-pane-widget pane) (:tab-closable page) (:enabled pane))
+      (ui/close-page! pane page))))
+
+(defmethod ui/backend-tab-update [(b gtk-backend) pane page]
+  (let [nb (native pane)
+        box (lib/box-new 0 6)
+        l (:tab-label page)
+        a (:tab-accessory page)]
+    (when-let [icon (:tab-icon page)]
+      (let [i (lib/image-new-from-paintable (texture icon))]
+        (lib/image-set-pixel-size i 16)
+        (lib/box-append box i)))
+    (lib/box-append box (if (instance? ui/widget l)
+                          (detach! (native l))
+                          (lib/label-new (ui/tab-title pane page))))
+    (when (instance? ui/widget a) (lib/box-append box (detach! (native a))))
+    (when (:tab-closable page) (lib/box-append box (detach! (tab-closer page))))
+    (lib/widget-set-tooltip-text box (:tab-tooltip page))
+    (lib/notebook-set-tab-label nb (page-wrapper page) box)
+    (lib/notebook-set-tab-reorderable nb (page-wrapper page) (boolean (:reorderable pane)))))
+
+(defmethod ui/backend-remove-child [(b gtk-backend) (pane ui/tabbed-pane-widget) page]
+  (forget-closer! page)
+  (call-next-method))
+
+(defmethod set-native [(pane ui/tabbed-pane-widget) (p (= :reorderable)) v]
+  (doseq [page (:children pane)]
+    (lib/notebook-set-tab-reorderable (native pane) (page-wrapper page) (boolean v))))
+
+(defmethod ui/backend-tab-move [(b gtk-backend) pane page old index]
+  (quietly (fn [] (lib/notebook-reorder-child (native pane) (page-wrapper page) index))))
+
+(defmethod native-signal [(pane ui/tabbed-pane-widget) (k (= :page-reordered)) nb arg]
+  (when-not (quiet?)
+    (let [[child number] arg
+          page (first (filter (fn [p] (= (ffi/address (page-wrapper p)) (ffi/address child)))
+                              (:children pane)))]
+      (when (and page (not= number (index-of (:children pane) page)))
+        (ui/page-moved-by-user! pane page number)))))
+
+(defn- page-decoration
+  "What the GtkNotebook adds around its pages, [width height] (its header, borders and
+margins), or nil without pages: measured with the pages' GtkStack far bigger than any
+header."
+  [pane]
+  (when-let [page (first (:children pane))]
+    (let [nb (native pane)
+          stack (lib/widget-get-parent (page-wrapper page))
+          big 100000]
+      (when-not (ffi/null? stack)
+        (lib/widget-set-size-request stack big big)
+        (let [[w h] (lib/natural-size nb)]
+          (lib/widget-set-size-request stack -1 -1)
+          (when-let [[_ _ aw ah] (:allocation pane)] (lib/widget-set-size-request nb aw ah))
+          [(max 0 (- w big)) (max 0 (- h big))])))))
+
+(defmethod native-natural-size [(bar ui/tab-bar-widget)]
+  [0 (or (second (page-decoration (:pane bar))) 34)])
+
+(defmethod ui/backend-tab-page-area [(b gtk-backend) pane width height]
+  ;; Pages sized for the core's bar would ask the GtkNotebook for more than it has.
+  (if-let [[dw dh] (page-decoration pane)]
+    [(max 0 (- width dw)) (max 0 (- height dh))]
+    (call-next-method)))
+
+(defmethod ui/backend-tab-layout [(b gtk-backend) pane width height]
+  (let [bar (:tab-bar pane)
+        nb (native pane)]
+    (doseq [[pack w] [[0 (:start bar)] [1 (:end bar)]]]   ; GTK_PACK_START, GTK_PACK_END
+      (when w
+        (let [n (native w)]
+          (when-not (= (ffi/address n) (ffi/address (lib/notebook-get-action-widget nb pack)))
+            (detach! n)
+            (lib/notebook-set-action-widget nb n pack)))))))
+
+(defn- gtk-ancestors
+  "The GTK widget n and the widgets it is in, up to (not including) stop, or to the top."
+  [n stop]
+  (loop [n n out []]
+    (if (or (ffi/null? n) (and stop (= (ffi/address n) (ffi/address stop))))
+      out
+      (recur (lib/widget-get-parent n) (conj out n)))))
+
+(defmethod ui/backend-tab-at-point [(b gtk-backend) pane x y]
+  (let [nb (native pane)
+        chain (set (map ffi/address (gtk-ancestors (lib/widget-pick nb (f64 x) (f64 y) 0) nil)))]
+    (first (filter (fn [page]
+                     (let [label (lib/notebook-get-tab-label nb (page-wrapper page))]
+                       ;; The label box, or the notebook's tab around it.
+                       (or (contains? chain (ffi/address label))
+                           (contains? chain (ffi/address (lib/widget-get-parent label))))))
+                   (:children pane)))))
+
+;; Dragging a tab to another pane of its drag group: GtkNotebook's own gesture still
+;; selects and reorders; the legacy controller sees the same press, motion and release.
+;; Points are in the window's coordinates; picking finds the pane under the pointer, so
+;; covered parts don't count, and a CSS outline marks it until the button goes up.
+
+(def ^:private tab-drags
+  "A tabbed pane's GTK widget address -> its tab drag: {:page :x :y :dragging :stopped
+:target}."
+  (atom {}))
+
+(defn- drag-key [pane] (ffi/address (native pane)))
+
+(defn- window-point
+  "Where the GdkEvent happened in the window of the GTK widget n, [x y], or nil."
+  [n event]
+  (ffi/with-foreign [x (ffi/alloc f64 1)]
+    (ffi/with-foreign [y (ffi/alloc f64 1)]
+      (when (lib/event-get-position event x y)
+        (let [ex (ffi/get x f64)
+              ey (ffi/get y f64)]
+          (lib/native-get-surface-transform (lib/widget-get-native n) x y)
+          [(- ex (ffi/get x f64)) (- ey (ffi/get y f64))])))))
+
+(defn- pane-point
+  "The window point x, y in the widget's own coordinates, or nil."
+  [w x y]
+  (let [n (native w)]
+    (lib/point-in (lib/widget-get-native n) n x y)))
+
+(defn- drop-target
+  "The pane other than pane that its tab dragged to the window point x, y would drop on,
+or nil."
+  [pane x y]
+  (when (:drag-group pane)
+    (let [picked (lib/widget-pick (lib/widget-get-native (native pane)) (f64 x) (f64 y) 0)
+          w (when-not (ffi/null? picked) (widget-of-gtk picked))
+          target (when w
+                   (first (filter (fn [o] (and (instance? ui/tabbed-pane-widget o)
+                                               (= (:drag-group o) (:drag-group pane))))
+                                  (take-while some? (iterate :parent w)))))]
+      (when (and target (ui/page-drop-target? target pane)) target))))
+
+(defn- show-drop-target! [pane target]
+  (let [k (drag-key pane)
+        old (get-in @tab-drags [k :target])]
+    (when-not (identical? target old)
+      (when (and old (not (:destroyed old)))
+        (lib/widget-remove-css-class (native old) "skein-drop-target"))
+      (swap! tab-drags assoc-in [k :target] target)
+      (when target
+        (when-not (contains? @css-rules "skein-drop-target")
+          (swap! css-rules assoc "skein-drop-target"
+                 "outline: 2px solid @accent_color; outline-offset: -2px; ")
+          (lib/css-provider-load (:css (ui/current-backend))
+                                 (apply str (map (fn [[c d]] (str "." c " { " d "}\n"))
+                                                 @css-rules))))
+        (lib/widget-add-css-class (native target) "skein-drop-target")))))
+
+(defn- end-tab-drag! [pane]
+  (show-drop-target! pane nil)
+  (swap! tab-drags dissoc (drag-key pane)))
+
+(defn- on-button?
+  "True if the point x, y in the pane is on a button in it (a tab's close button)."
+  [pane x y]
+  (let [nb (native pane)]
+    (boolean (some (fn [n] (= "GtkButton" (lib/type-name-of n)))
+                   (gtk-ancestors (lib/widget-pick nb (f64 x) (f64 y) 0) nb)))))
+
+(defn- tab-drag-press! [pane x y]
+  (end-tab-drag! pane)
+  (when (and (:drag-group pane) (:enabled pane))
+    (when-let [[px py] (pane-point pane x y)]
+      (let [page (ui/backend-tab-at-point (ui/current-backend) pane px py)]
+        (when (and page (not (on-button? pane px py)))
+          (swap! tab-drags assoc (drag-key pane) {:page page :x x :y y}))))))
+
+(defn- stop-native-reorder!
+  "End GtkNotebook's own reorder drag (which it commits when cancelled), keeping the page
+where it was: over another pane, the drag is no longer a reorder."
+  [pane page]
+  (let [index (index-of (:children pane) page)
+        controllers (lib/widget-observe-controllers (native pane))]
+    (doseq [i (range (lib/list-model-n-items controllers))]
+      (let [c (lib/list-model-get-item controllers i)]
+        (when (= "GtkGestureClick" (lib/type-name-of c)) (lib/controller-reset c))
+        (lib/g-object-unref c)))
+    (lib/g-object-unref controllers)
+    (let [now (index-of (:children pane) page)]
+      (when (and index now (not= index now)) (ui/move-page! pane page index)))))
+
+(defn- tab-drag-motion! [pane x y]
+  (let [k (drag-key pane)
+        d (get @tab-drags k)]
+    (when (and d (index-of (:children pane) (:page d)))
+      (when (or (:dragging d) (> (abs (- x (:x d))) 5) (> (abs (- y (:y d))) 5))
+        (swap! tab-drags assoc-in [k :dragging] true)
+        (show-drop-target! pane (drop-target pane x y))
+        (when (and (get-in @tab-drags [k :target]) (not (:stopped d)))
+          (swap! tab-drags assoc-in [k :stopped] true)
+          (stop-native-reorder! pane (:page d)))))))
+
+(defn- drop-index
+  "Where a tab dropped at the window point x, y goes in pane: before the tab there, else
+last."
+  [pane x y]
+  (let [page (when-let [[px py] (pane-point pane x y)]
+               (ui/backend-tab-at-point (ui/current-backend) pane px py))]
+    (if page (index-of (:children pane) page) (count (:children pane)))))
+
+(defn- tab-drag-release! [pane x y]
+  (let [d (get @tab-drags (drag-key pane))
+        target (:target d)]
+    (end-tab-drag! pane)
+    (when (and d target (not (:destroyed target)))
+      ;; GtkNotebook handles the same release after this controller: drop afterwards.
+      (let [index (drop-index target x y)]
+        (ui/backend-call-later (ui/current-backend)
+                               (fn [] (ui/page-dropped-by-user! (:page d) target index)))))))
+
+(defn- tab-event!
+  "A press, motion or release in the pane: drag tabs between panes, and report a
+right-click on a tab. True to stop the GtkNotebook from seeing it."
+  [pane event]
+  (let [type (lib/event-get-event-type event)]   ; GDK_MOTION_NOTIFY 1, BUTTON_PRESS 2, RELEASE 3
+    (when (contains? #{1 2 3} type)
+      (when-let [[x y] (window-point (native pane) event)]
+        (cond
+          (= type 1) (do (tab-drag-motion! pane x y) false)
+          (= type 3) (do (when (= 1 (lib/button-event-get-button event))
+                           (tab-drag-release! pane x y))
+                         false)
+          (= 1 (lib/button-event-get-button event)) (do (tab-drag-press! pane x y) false)
+          (= 3 (lib/button-event-get-button event))
+          (when-let [[px py] (pane-point pane x y)]
+            (when (ui/backend-tab-at-point (ui/current-backend) pane px py)
+              (ui/tab-context-requested! pane px py
+                                         (modifiers-of (lib/event-get-modifier-state event)))
+              true))
+          :else false)))))
+
+(defmethod ui/backend-destroy :before [(b gtk-backend) (pane ui/tabbed-pane-widget)]
+  (doseq [page (:children pane)] (forget-closer! page))
+  (swap! tab-drags dissoc (drag-key pane)))
+
+(defn native-tab
+  "What the page's tab shows: {:title :closable :tooltip}."
+  [page]
+  (let [pane (:parent page)
+        box (lib/notebook-get-tab-label (native pane) (page-wrapper page))
+        kids (lib/children-of box)
+        label (first (filter (fn [n] (= "GtkLabel" (lib/type-name-of n))) kids))]
+    {:title (if label (lib/label-get-text label) (ui/tab-title pane page))
+     :closable (boolean (some (fn [n] (= "GtkButton" (lib/type-name-of n))) kids))
+     :tooltip (lib/widget-get-tooltip-text box)}))
+
+(defn click-tab-close!
+  "Click the close button of the page's tab, as the user does."
+  [page]
+  (lib/emit! (tab-closer page) "clicked"))
+
+(defn reorder-tab!
+  "Drag the page's tab to index in its pane, as the user does: GtkNotebook moves it and
+emits page-reordered."
+  [page index]
+  (lib/notebook-reorder-child (native (:parent page)) (page-wrapper page) index))
+
+(defn tab-point
+  "The middle of the page's tab, [x y] in its pane."
+  [page]
+  (let [pane (:parent page)
+        label (lib/notebook-get-tab-label (native pane) (page-wrapper page))
+        [x y w h] (lib/bounds-in label (native pane))]
+    [(+ x (/ w 2)) (+ y (/ h 2))]))
+
+(defn drag-tab-to!
+  "Drag the page's tab onto the middle of the widget w and let go, as the user does,
+reporting window points as the pane's event controller would."
+  [page w]
+  (let [pane (:parent page)
+        win (lib/widget-get-native (native pane))
+        [px py] (tab-point page)
+        [sx sy] (lib/point-in (native pane) win px py)
+        [_ _ ww wh] (lib/bounds-in (native w) (native w))
+        [tx ty] (lib/point-in (native w) win (/ ww 2) (/ wh 2))]
+    (tab-drag-press! pane sx sy)
+    (tab-drag-motion! pane (/ (+ sx tx) 2) (/ (+ sy ty) 2))
+    (tab-drag-motion! pane tx ty)
+    (tab-drag-release! pane tx ty)))

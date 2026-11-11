@@ -48,7 +48,8 @@ This is Skein's milestone M2.14 (its D-090 and D-097), a port of the design of L
 Common Lisp toolkit. It has LGT's widgets except the web view: labels, buttons, toggles,
 check boxes, radio buttons, entries, text views, sliders, spin buttons, progress bars,
 spinners, combo boxes, list boxes, sortable tables, trees, images, color and date
-pickers, frames, notebooks, split panes, scrolled windows and canvases.
+pickers, frames, notebooks, stacks, tabbed panes (closable, reorderable tabs that drag
+between panes), split panes, scrolled windows and canvases.
 
 - **Backends:** `skein.ui.cocoa` (AppKit, on macOS), `skein.ui.gtk` (GTK 4, on Linux, and
   on macOS with Homebrew's `gtk4`) and `skein.ui.headless` (no screen, for tests). Win32

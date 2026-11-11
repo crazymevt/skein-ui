@@ -94,6 +94,10 @@ user acts."
 (ffi/defcfun ^:blocking widget-set-tooltip-text "gtk_widget_set_tooltip_text" void
   [w ptr, text c-string])
 (ffi/defcfun ^:blocking widget-get-parent "gtk_widget_get_parent" ptr [w ptr])
+(ffi/defcfun ^:blocking widget-get-tooltip-text "gtk_widget_get_tooltip_text" c-string
+  [w ptr])
+(ffi/defcfun ^:blocking widget-remove-css-class "gtk_widget_remove_css_class" void
+  [w ptr, c c-string])
 (ffi/defcfun ^:blocking widget-unparent "gtk_widget_unparent" void [w ptr])
 (ffi/defcfun ^:blocking widget-get-width "gtk_widget_get_width" i32 [w ptr])
 (ffi/defcfun ^:blocking widget-get-height "gtk_widget_get_height" i32 [w ptr])
@@ -117,6 +121,16 @@ hasn't placed it."
     (when (widget-compute-bounds w target r)
       [(ffi/field r graphene-rect :x) (ffi/field r graphene-rect :y)
        (ffi/field r graphene-rect :width) (ffi/field r graphene-rect :height)])))
+
+(defn point-in
+  "The point x, y in the GTK widget w's coordinates, in target's, as [x y], or nil."
+  [w target x y]
+  (ffi/with-foreign [p (ffi/alloc graphene-point)]
+    (ffi/with-foreign [out (ffi/alloc graphene-point)]
+      (ffi/put-field! p graphene-point :x (f32 x))
+      (ffi/put-field! p graphene-point :y (f32 y))
+      (when (widget-compute-point w target p out)
+        [(ffi/field out graphene-point :x) (ffi/field out graphene-point :y)]))))
 
 (defn natural-size
   "The natural [width height] of the GTK widget w, measured without a size request."
@@ -330,6 +344,35 @@ hasn't placed it."
 (ffi/defcfun ^:blocking notebook-get-tab-label-text "gtk_notebook_get_tab_label_text" c-string
   [n ptr, child ptr])
 (ffi/defcfun ^:blocking notebook-get-nth-page "gtk_notebook_get_nth_page" ptr [n ptr, i i32])
+(ffi/defcfun ^:blocking notebook-set-scrollable "gtk_notebook_set_scrollable" void
+  [n ptr, v bool])
+(ffi/defcfun ^:blocking notebook-popup-enable "gtk_notebook_popup_enable" void [n ptr])
+(ffi/defcfun ^:blocking notebook-set-tab-label "gtk_notebook_set_tab_label" void
+  [n ptr, child ptr, label ptr])
+(ffi/defcfun ^:blocking notebook-get-tab-label "gtk_notebook_get_tab_label" ptr
+  [n ptr, child ptr])
+(ffi/defcfun ^:blocking notebook-set-tab-reorderable "gtk_notebook_set_tab_reorderable" void
+  [n ptr, child ptr, v bool])
+(ffi/defcfun ^:blocking notebook-reorder-child "gtk_notebook_reorder_child" void
+  [n ptr, child ptr, i i32])
+(ffi/defcfun ^:blocking notebook-set-action-widget "gtk_notebook_set_action_widget" void
+  [n ptr, w ptr, pack i32])
+(ffi/defcfun ^:blocking notebook-get-action-widget "gtk_notebook_get_action_widget" ptr
+  [n ptr, pack i32])
+(ffi/defcfun ^:blocking button-new-from-icon-name "gtk_button_new_from_icon_name" ptr
+  [name c-string])
+(ffi/defcfun ^:blocking widget-pick "gtk_widget_pick" ptr [w ptr, x f64, y f64, flags i32])
+(ffi/defcfun ^:blocking widget-get-native "gtk_widget_get_native" ptr [w ptr])
+(ffi/defcfun ^:blocking native-get-surface-transform "gtk_native_get_surface_transform" void
+  [n ptr, x ptr, y ptr])
+(ffi/defcfun ^:blocking widget-observe-controllers "gtk_widget_observe_controllers" ptr
+  [w ptr])
+(ffi/defcfun ^:blocking controller-reset "gtk_event_controller_reset" void [c ptr])
+(ffi/defcfun ^:blocking legacy-controller-new "gtk_event_controller_legacy_new" ptr [])
+(ffi/defcfun ^:blocking event-get-event-type "gdk_event_get_event_type" i32 [e ptr])
+(ffi/defcfun ^:blocking event-get-modifier-state "gdk_event_get_modifier_state" u32 [e ptr])
+(ffi/defcfun ^:blocking event-get-position "gdk_event_get_position" bool [e ptr, x ptr, y ptr])
+(ffi/defcfun ^:blocking button-event-get-button "gdk_button_event_get_button" u32 [e ptr])
 
 (ffi/defcfun ^:blocking paned-new "gtk_paned_new" ptr [orientation i32])
 (ffi/defcfun ^:blocking paned-set-start-child "gtk_paned_set_start_child" void [p ptr, c ptr])

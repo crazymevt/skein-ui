@@ -329,3 +329,51 @@
     (is (= (ui/rgb 1 0 0) (ui/system-color :text l)))
     (is (gtk/has-css-rule? l) "the palette's text color is the label's CSS")
     (ui/close! w)))
+
+(deftest stacks-and-tabbed-panes
+  (let [a (ui/label {:text "one"})
+        b (ui/label {:text "two"})
+        s (ui/stack {} a b)
+        n (ui/vertical-notebook {} (ui/label {:text "general" :tab-label "General"})
+                                (ui/label {:text "other" :tab-label "Other"}))
+        w (ui/window {:title "Stacks"} (ui/vbox {} s n))]
+    (ui/show! w)
+    (gtk/settle!)
+    (is (not (gtk/native-visible? b)))
+    (ui/select-page! s b)
+    (is (gtk/native-visible? b))
+    (is (not (gtk/native-visible? a)))
+    (is (= 150 (nth (gtk/native-frame (:page-list n)) 2)) "the list of pages")
+    (ui/close! w))
+  (let [closed (atom [])
+        a (ui/text-view {:tab-label "Notes" :tab-tooltip "Your notes"})
+        b (ui/text-view {:tab-closable false})
+        c (ui/text-view {:tab-label "Third"})
+        p (ui/tabbed-pane {:drag-group :docs :on-page-closed (fn [e] (swap! closed conj (:index e)))}
+                          a b c)
+        q (ui/tabbed-pane {:drag-group :docs} (ui/text-view {:tab-label "Other"}))
+        w (ui/window {:width 800 :height 400} (ui/hbox {:homogeneous true} p q))]
+    (ui/add! (:end (ui/tab-bar p)) (ui/button {:label "+"}))
+    (ui/show! w)
+    (gtk/settle!)
+    (testing "tabs are GtkNotebook tabs"
+      (is (= {:title "Notes" :closable true :tooltip "Your notes"} (gtk/native-tab a)))
+      (is (= "Page 2" (:title (gtk/native-tab b))))
+      (is (not (:closable (gtk/native-tab b)))))
+    (testing "finding a tab by its point"
+      (let [[x y] (gtk/tab-point c)]
+        (is (identical? c (ui/tab-at-point p x y)))))
+    (testing "reordering in GTK moves the page"
+      (gtk/reorder-tab! a 2)
+      (is (= [b c a] (:children p))))
+    (testing "closing a tab"
+      (gtk/click-tab-close! c)
+      (is (= [1] @closed))
+      (is (= [b a] (:children p))))
+    (testing "dropping a tab on another pane"
+      (gtk/drag-tab-to! a q)
+      (gtk/settle!)
+      (is (= [b] (:children p)))
+      (is (identical? a (last (:children q))))
+      (is (= 1 (:selected-index q))))
+    (ui/close! w)))

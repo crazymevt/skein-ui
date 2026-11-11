@@ -231,6 +231,12 @@ consumed it (defined below).")
         (when-let [w (objc/object-for win)]
           (ui/notify-appearance-changed! w))))))
 
+(def ^:private tab-mouse!
+  "Handle a mouse event in a tab's button (defined below).")
+
+(ffi/defcallback tab-mouse-imp void [self ptr, cmd ptr, event ptr]
+  (tab-mouse! self (objc/sel-name cmd) event))
+
 (ffi/defcallback monitor-imp ptr [block ptr, event ptr]
   (if (route-input! event) (ffi/null) event))
 
@@ -316,6 +322,11 @@ consumed it (defined below).")
   (objc/define-class! "SkeinFlippedView" "NSView"
                       [["isFlipped" yes-imp "B@:"]
                        ["viewDidChangeEffectiveAppearance" appearance-imp "v@:"]])
+  ;; A tab: an NSButton that selects on mouse down and drags, rather than tracking.
+  (objc/define-class! "SkeinTabButton" "NSButton"
+                      (mapv (fn [name] [name tab-mouse-imp "v@:@"])
+                            ["mouseDown:" "mouseDragged:" "mouseUp:" "rightMouseDown:"
+                             "otherMouseDown:"]))
   (objc/define-class! "SkeinCanvasView" "NSView"
                       (into [["isFlipped" yes-imp "B@:"]
                              ["drawRect:" draw-imp "v@:{CGRect={CGPoint=dd}{CGSize=dd}}"]
@@ -1086,6 +1097,15 @@ keyword gives the platform's own, which follows dark mode."
 ;;; ------------------------------------------------------------------------------------
 ;;; Notebooks
 
+(def ^:private pane-tabs
+  "A tabbed pane's view address -> the tabless NSTabView of its pages."
+  (atom {}))
+
+(defn- tabs-of
+  "The NSTabView of the notebook's pages: its own view, or a tabbed pane's inner one."
+  [n]
+  (or (get @pane-tabs (ffi/address (view n))) (view n)))
+
 (defmethod make-native [(n ui/notebook-widget)]
   (let [tv (init-frame "NSTabView")]
     (objc/send-p-void tv (objc/sel "setDelegate:") (:text-delegate (ui/current-backend)))
@@ -1094,28 +1114,35 @@ keyword gives the platform's own, which follows dark mode."
 (defn- tab-item
   "The NSTabViewItem of the notebook's page at index."
   [n index]
-  (objc/send-l (view n) (objc/sel "tabViewItemAtIndex:") index))
+  (objc/send-l (tabs-of n) (objc/sel "tabViewItemAtIndex:") index))
+
+(defn- page-item
+  "The NSTabViewItem holding the notebook's page, or nil."
+  [n page]
+  (let [wrapper (objc/send (view page) (objc/sel "superview"))
+        items (objc/send (tabs-of n) (objc/sel "tabViewItems"))]
+    (first (filter (fn [item] (= (ffi/address (objc/send item (objc/sel "view")))
+                                 (ffi/address wrapper)))
+                   (map (fn [i] (objc/send-l items (objc/sel "objectAtIndex:") i))
+                        (range (objc/send-long items (objc/sel "count"))))))))
 
 (defmethod ui/backend-add-child [(b cocoa-backend) (n ui/notebook-widget) page]
   (let [item (objc/send-p (objc/alloc "NSTabViewItem") (objc/sel "initWithIdentifier:")
                           (ffi/null))
-        wrapper (flipped-view)]
+        wrapper (flipped-view)
+        label (:tab-label page)]
     (objc/send-p-void wrapper (objc/sel "addSubview:") (view page))
     (objc/send-p-void item (objc/sel "setView:") wrapper)
-    (objc/send-p-void item (objc/sel "setLabel:") (objc/ns-string (or (:tab-label page) "")))
-    (quietly (fn [] (objc/send-p-void (view n) (objc/sel "addTabViewItem:") item)))
+    (objc/send-p-void item (objc/sel "setLabel:") (objc/ns-string (if (string? label) label "")))
+    (quietly (fn [] (objc/send-p-void (tabs-of n) (objc/sel "addTabViewItem:") item)))
     (objc/release wrapper)
     (objc/release item)))
 
 (defmethod ui/backend-remove-child [(b cocoa-backend) (n ui/notebook-widget) page]
-  (let [wrapper (objc/send (view page) (objc/sel "superview"))
-        items (objc/send (view n) (objc/sel "tabViewItems"))
-        n-items (objc/send-long items (objc/sel "count"))]
+  (let [item (page-item n page)]
     (objc/send-void (view page) (objc/sel "removeFromSuperview"))
-    (doseq [i (range n-items)]
-      (let [item (objc/send-l items (objc/sel "objectAtIndex:") i)]
-        (when (= (ffi/address (objc/send item (objc/sel "view"))) (ffi/address wrapper))
-          (quietly (fn [] (objc/send-p-void (view n) (objc/sel "removeTabViewItem:") item))))))))
+    (when item
+      (quietly (fn [] (objc/send-p-void (tabs-of n) (objc/sel "removeTabViewItem:") item))))))
 
 (defmethod ui/backend-set-page-label [(b cocoa-backend) n page label]
   (when-let [i (index-of (:children n) page)]
@@ -1123,7 +1150,7 @@ keyword gives the platform's own, which follows dark mode."
 
 (defmethod set-native [(n ui/notebook-widget) (p (= :selected-index)) i]
   (when (< -1 (or i -1) (count (:children n)))
-    (quietly (fn [] (set-long! n "selectTabViewItemAtIndex:" i)))))
+    (quietly (fn [] (objc/send-l-void (tabs-of n) (objc/sel "selectTabViewItemAtIndex:") i)))))
 
 (defmethod set-native [(n ui/notebook-widget) (p (= :tab-position)) v]
   ;; NSTopTabsBezelBorder 0, NSLeftTabsBezelBorder 1, NSBottomTabsBezelBorder 2, right 3
@@ -1146,7 +1173,7 @@ keyword gives the platform's own, which follows dark mode."
 
 (defmethod native-selection-changed [(n ui/notebook-widget) item]
   (when-not (quiet?)
-    (let [i (objc/send-p-long (view n) (objc/sel "indexOfTabViewItem:") item)]
+    (let [i (objc/send-p-long (tabs-of n) (objc/sel "indexOfTabViewItem:") item)]
       (when (not= i (:selected-index n))
         (ui/page-changed-by-user! n i)))))
 
@@ -2318,22 +2345,26 @@ bitmap's color at the point x, y of the view (from the top left)."
            (color-of (objc/send-ll rep (objc/sel "colorAtX:y:")
                                    (int (* scale x)) (int (* scale y))))))))))
 
+(defn- mouse-event
+  "An NSEvent of type (an NSEventType) at x, y in the view n (from the top left)."
+  [n type x y]
+  (let [win (objc/send n (objc/sel "window"))
+        ;; to window coordinates (from the bottom left)
+        p (objc/send-point-p n (objc/sel "convertPoint:toView:") {:x (f64 x) :y (f64 y)}
+                             (ffi/null))]
+    (objc/send-mouse-event
+     (objc/cls "NSEvent")
+     (objc/sel (str "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:"
+                    "context:eventNumber:clickCount:pressure:"))
+     type {:x (ffi/field p objc/ns-point :x) :y (ffi/field p objc/ns-point :y)} 0 0.0
+     (objc/send-long win (objc/sel "windowNumber")) (ffi/null) 0 1 1.0)))
+
 (defn send-mouse!
   "Send the canvas's view a mouse event of type (an NSEventType: 1 down, 2 up) at x, y in
 the view (from the top left), as AppKit does for a click."
   [c type x y]
-  (let [n (view c)
-        win (objc/send n (objc/sel "window"))
-        [_ _ _ h] (objc/rect-vec (objc/send-rect n (objc/sel "bounds")))
-        ;; to window coordinates (from the bottom left)
-        p (objc/send-point-p n (objc/sel "convertPoint:toView:") {:x (f64 x) :y (f64 y)} (ffi/null))
-        e (objc/send-mouse-event
-           (objc/cls "NSEvent")
-           (objc/sel (str "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:"
-                          "context:eventNumber:clickCount:pressure:"))
-           type {:x (ffi/field p objc/ns-point :x) :y (ffi/field p objc/ns-point :y)} 0 0.0
-           (objc/send-long win (objc/sel "windowNumber")) (ffi/null) 0 1 1.0)]
-    (objc/send-p-void n (objc/sel (if (= type 1) "mouseDown:" "mouseUp:")) e)))
+  (objc/send-p-void (view c) (objc/sel (if (= type 1) "mouseDown:" "mouseUp:"))
+                    (mouse-event (view c) type x y)))
 
 (defn answer-next-dialog!
   "For tests: make the next modal dialog answer by itself, as the user clicking would: a
@@ -2749,3 +2780,509 @@ platform's dynamic one."
   "True if a container's surface is drawn by a visual effect view."
   [c]
   (some (fn [host] (some? (:material (get @backdrops (ffi/address host))))) (surface-hosts c)))
+
+;;; ------------------------------------------------------------------------------------
+;;; Stacks and tabbed panes. A tabbed pane is a flipped view holding its tab bar and a
+;;; tabless NSTabView of its pages. The bar is a flipped view whose tabs, NSButtons each
+;;; with a close button, sit in a scroll view, with buttons to scroll the rest and list
+;;; them all when they don't fit.
+
+(defmethod make-native [(s ui/stack-widget)] (flipped-view))
+
+(defmethod make-native [(pane ui/tabbed-pane-widget)]
+  (let [root (flipped-view)
+        tabs (init-frame "NSTabView")]
+    (objc/send-l-void tabs (objc/sel "setTabViewType:") 6)     ; NSNoTabsNoBorder
+    (objc/send-p-void tabs (objc/sel "setDelegate:") (:text-delegate (ui/current-backend)))
+    (objc/send-p-void root (objc/sel "addSubview:") tabs)
+    (objc/release tabs)
+    (also-register! tabs pane)
+    (swap! pane-tabs assoc (ffi/address root) tabs)
+    root))
+
+(defmethod ui/backend-destroy :before [(b cocoa-backend) (pane ui/tabbed-pane-widget)]
+  (let [a (ffi/address (view pane))]
+    (when-let [tabs (get @pane-tabs a)] (objc/unregister! tabs))
+    (swap! pane-tabs dissoc a)))
+
+(defmethod ui/backend-add-child [(b cocoa-backend) (pane ui/tabbed-pane-widget) child]
+  (if (instance? ui/tab-bar-widget child)
+    (objc/send-p-void (view pane) (objc/sel "addSubview:") (view child))
+    (call-next-method)))
+
+(defmethod set-native [(pane ui/tabbed-pane-widget) (p (= :tab-position)) v]
+  nil)
+
+(defmethod ui/backend-set-page-label [(b cocoa-backend) (pane ui/tabbed-pane-widget) page label]
+  ;; backend-tab-update shows the label.
+  nil)
+
+(def ^:private tab-bars
+  "A tab bar's view address -> {:scroll :document :overflow (the buttons that scroll and
+list the tabs) :headers {a page's view address -> {:view :label :close :covers}} :drag
+{:page :dragging :x :y} :drop-target :overlay}."
+  (atom {}))
+
+(def ^:private tab-controls
+  "A tab bar button's address -> [action page]."
+  (atom {}))
+
+(defn- bar-state [bar] (get @tab-bars (ffi/address (view bar))))
+
+(defn- update-bar-state! [bar f & args]
+  (swap! tab-bars (fn [m] (apply update m (ffi/address (view bar)) f args))))
+
+(defn- tab-control
+  "A button of the tab bar, of the class, doing action ([kind page])."
+  [bar title action class-name]
+  (let [b (init-frame class-name)]
+    (objc/send-p-void b (objc/sel "setTitle:") (objc/ns-string title))
+    (objc/send-l-void b (objc/sel "setBezelStyle:") 11)
+    (connect-action! b)
+    (also-register! b bar)
+    (swap! tab-controls assoc (ffi/address b) action)
+    b))
+
+(defmethod make-native [(bar ui/tab-bar-widget)]
+  (let [root (flipped-view)
+        scroll (init-frame "NSScrollView")
+        document (flipped-view)]
+    (objc/send-b-void scroll (objc/sel "setDrawsBackground:") false)
+    (objc/send-l-void scroll (objc/sel "setBorderType:") 0)
+    (objc/send-b-void scroll (objc/sel "setHasHorizontalScroller:") false)
+    (objc/send-p-void scroll (objc/sel "setDocumentView:") document)
+    (objc/send-p-void root (objc/sel "addSubview:") scroll)
+    (objc/release scroll)
+    (objc/release document)
+    (let [overflow (mapv (fn [[title kind label]]
+                           (let [b (tab-control bar title [kind nil] "NSButton")]
+                             (objc/send-p-void b (objc/sel "setAccessibilityLabel:")
+                                               (objc/ns-string label))
+                             (objc/send-b-void b (objc/sel "setHidden:") true)
+                             (objc/send-p-void root (objc/sel "addSubview:") b)
+                             (objc/release b)
+                             b))
+                         [["‹" :previous "Scroll tabs left"] ["›" :next "Scroll tabs right"]
+                          ["▾" :menu "All tabs"]])]
+      (swap! tab-bars assoc (ffi/address root)
+             {:scroll scroll :document document :overflow overflow :headers {}}))
+    root))
+
+(defn- forget-controls! [controls]
+  (doseq [c controls]
+    (objc/unregister! c)
+    (swap! tab-controls dissoc (ffi/address c))))
+
+(defmethod ui/backend-destroy :before [(b cocoa-backend) (bar ui/tab-bar-widget)]
+  (when-let [st (bar-state bar)]
+    (forget-controls! (concat (:overflow st)
+                              (mapcat (fn [info] (into [(:label info) (:close info)] (:covers info)))
+                                      (vals (:headers st)))))
+    (when-let [o (:overlay st)]
+      (objc/send-void o (objc/sel "removeFromSuperview"))
+      (objc/release o))
+    (swap! tab-bars dissoc (ffi/address (view bar)))))
+
+(defmethod native-natural-size [(bar ui/tab-bar-widget)]
+  [0 32])
+
+(defn- header-of [pane page]
+  (get-in (bar-state (:tab-bar pane)) [:headers (ffi/address (view page))]))
+
+(defn- tab-header!
+  "The views of the page's tab, made the first time."
+  [pane page]
+  (or (header-of pane page)
+      (let [bar (:tab-bar pane)
+            v (flipped-view)
+            label (tab-control bar "" [:select page] "SkeinTabButton")
+            close (tab-control bar "×" [:close page] "NSButton")
+            ;; Transparent tabs over a widget label or accessory that takes no input,
+            ;; so a click there still selects and drags the tab.
+            covers (mapv (fn [_]
+                           (let [c (tab-control bar "" [:select page] "SkeinTabButton")]
+                             (objc/send-b-void c (objc/sel "setTransparent:") true)
+                             c))
+                         [:label :accessory])
+            info {:view v :label label :close close :covers covers}]
+        (objc/send-l-void label (objc/sel "setButtonType:") 1)        ; push on, push off
+        (objc/send-b-void close (objc/sel "setBordered:") false)
+        (doseq [c (into [label close] covers)]
+          (objc/send-p-void v (objc/sel "addSubview:") c)
+          (objc/release c))
+        (objc/send-p-void (:document (bar-state bar)) (objc/sel "addSubview:") v)
+        (objc/release v)
+        (update-bar-state! bar assoc-in [:headers (ffi/address (view page))] info)
+        info)))
+
+(defn- show-tab-states! [pane]
+  (doseq [[i page] (map-indexed vector (:children pane))]
+    (when-let [info (header-of pane page)]
+      (objc/send-l-void (:label info) (objc/sel "setState:")
+                        (if (= i (:selected-index pane)) 1 0)))))
+
+(defmethod set-native :after [(pane ui/tabbed-pane-widget) (p (= :selected-index)) i]
+  (show-tab-states! pane))
+
+(defn- passive?
+  "True if w and the widgets in it take no input of their own."
+  [w]
+  (not-any? (fn [x] (contains? (ui/signals x) :key-down)) (ui/widgets-in w)))
+
+(defmethod ui/backend-tab-update [(b cocoa-backend) pane page]
+  (let [info (tab-header! pane page)
+        l (:tab-label page)
+        title (ui/tab-title pane page)
+        button (:label info)
+        icon (:tab-icon page)]
+    (objc/send-p-void button (objc/sel "setTitle:")
+                      (objc/ns-string (if (instance? ui/widget l) "" title)))
+    (objc/send-p-void button (objc/sel "setAccessibilityLabel:") (objc/ns-string title))
+    (objc/send-p-void button (objc/sel "setToolTip:")
+                      (if-let [t (:tab-tooltip page)] (objc/ns-string t) (ffi/null)))
+    (objc/send-p-void button (objc/sel "setImage:") (ns-image icon))
+    ;; The icon before the title (NSImageLeading), scaled down to fit.
+    (objc/send-l-void button (objc/sel "setImagePosition:") (if icon 7 0))
+    (objc/send-l-void button (objc/sel "setImageScaling:") 3)
+    (objc/send-b-void (:close info) (objc/sel "setHidden:") (not (:tab-closable page)))
+    (objc/send-p-void (:close info) (objc/sel "setAccessibilityLabel:")
+                      (objc/ns-string (str "Close " title)))
+    (doseq [w [l (:tab-accessory page)]]
+      (when (instance? ui/widget w)
+        (objc/send-p-void (:view info) (objc/sel "addSubview:") (view w))))
+    ;; The covers go on top again.
+    (doseq [c (:covers info)]
+      (objc/retain c)
+      (objc/send-void c (objc/sel "removeFromSuperview"))
+      (objc/send-p-void (:view info) (objc/sel "addSubview:") c)
+      (objc/release c))
+    (when-let [item (page-item pane page)]
+      (objc/send-p-void item (objc/sel "setLabel:") (objc/ns-string title)))
+    (show-tab-states! pane)))
+
+(def ^:private show-drop-target!
+  "Mark the pane a dragged tab would drop on (defined below).")
+
+(defmethod ui/backend-remove-child [(b cocoa-backend) (pane ui/tabbed-pane-widget) page]
+  (let [bar (:tab-bar pane)]
+    (when-let [info (and (instance? ui/widget page) (header-of pane page))]
+      (when (identical? page (:page (:drag (bar-state bar))))
+        (update-bar-state! bar dissoc :drag)
+        (show-drop-target! bar nil))
+      (forget-controls! (into [(:label info) (:close info)] (:covers info)))
+      (objc/send-void (:view info) (objc/sel "removeFromSuperview"))
+      (update-bar-state! bar update :headers dissoc (ffi/address (view page)))))
+  (call-next-method))
+
+(defn- descendant? [w ancestor]
+  (some (fn [o] (identical? o ancestor)) (take-while some? (iterate :parent w))))
+
+(defmethod ui/backend-tab-move [(b cocoa-backend) pane page old index]
+  (let [tabs (tabs-of pane)
+        item (page-item pane page)
+        focused (ui/backend-focused-widget b)]
+    (when item
+      (objc/retain item)
+      (quietly
+       (fn []
+         (objc/send-p-void tabs (objc/sel "removeTabViewItem:") item)
+         (objc/send-pl tabs (objc/sel "insertTabViewItem:atIndex:") item index)
+         (when-let [i (:selected-index pane)]
+           (objc/send-l-void tabs (objc/sel "selectTabViewItemAtIndex:") i))))
+      (objc/release item)
+      (show-tab-states! pane)
+      (when (and focused (descendant? focused pane))
+        (ui/backend-focus b focused)))))
+
+(defn- tab-width
+  "How wide the page's tab is: its title (at most 220), icon, close button and accessory."
+  [pane page]
+  (let [l (:tab-label page)
+        a (:tab-accessory page)]
+    (+ 20
+       (if (instance? ui/widget l)
+         (first (ui/outer-size l))
+         (min 220 (int (first (string-size (ui/tab-title pane page) nil)))))
+       (if (:tab-icon page) 20 0)
+       (if (:tab-closable page) 24 0)
+       (if a (+ 6 (first (ui/outer-size a))) 0))))
+
+(defn- layout-tab-header! [pane page x width height]
+  (when-let [info (header-of pane page)]
+    (let [l (:tab-label page)
+          a (:tab-accessory page)
+          cw (if (:tab-closable page) 24 0)
+          aw (if a (first (ui/outer-size a)) 0)
+          label-cell [8 4 (max 0 (- width cw aw 20)) (max 0 (- height 8))]
+          accessory-cell [(- width cw aw 6) 4 aw (max 0 (- height 8))]]
+      (objc/send-r-void (:view info) (objc/sel "setFrame:") (objc/rect x 0 width height))
+      ;; The tab's button spans the whole tab; the close button and accessory are on top.
+      (objc/send-r-void (:label info) (objc/sel "setFrame:")
+                        (objc/rect 1 3 (max 0 (- width 2)) (max 0 (- height 6))))
+      (objc/send-l-void (:label info) (objc/sel "setAlignment:") (text-alignment :left))
+      (objc/send-r-void (:close info) (objc/sel "setFrame:")
+                        (objc/rect (- width cw 5) 4 cw (max 0 (- height 8))))
+      (when a (apply ui/allocate-in-cell a accessory-cell))
+      (when (instance? ui/widget l) (apply ui/allocate-in-cell l label-cell))
+      (doseq [[c w cell] (map vector (:covers info) [l a] [label-cell accessory-cell])]
+        (objc/send-r-void c (objc/sel "setFrame:") (apply objc/rect cell))
+        (objc/send-b-void c (objc/sel "setHidden:")
+                          (not (and (instance? ui/widget w) (:visible w) (passive? w))))))))
+
+(defn- reveal-tab! [pane page]
+  (when-let [info (header-of pane page)]
+    (objc/send-r (:document (bar-state (:tab-bar pane))) (objc/sel "scrollRectToVisible:")
+                 (objc/send-rect (:view info) (objc/sel "frame")))))
+
+(defmethod ui/backend-tab-layout [(b cocoa-backend) pane width height]
+  (let [bar (:tab-bar pane)
+        {:keys [scroll document overflow]} (bar-state bar)
+        bh (or (last (:allocation bar)) 0)
+        sw (first (ui/outer-size (:start bar)))
+        ew (first (ui/outer-size (:end bar)))
+        widths (mapv (fn [page] (tab-width pane page)) (:children pane))
+        total (reduce + 0 widths)
+        over (> total (- width sw ew))
+        vw (max 0 (- width sw ew (if over 72 0)))]
+    (objc/send-r-void (tabs-of pane) (objc/sel "setFrame:")
+                      (objc/rect 0 (if (= :bottom (:tab-position pane)) 0 bh)
+                                 width (max 0 (- height bh))))
+    (objc/send-r-void scroll (objc/sel "setFrame:") (objc/rect sw 0 vw bh))
+    (objc/send-z-void document (objc/sel "setFrameSize:")
+                      {:width (f64 (max vw total)) :height (f64 bh)})
+    (doseq [[i c] (map-indexed vector overflow)]
+      (objc/send-b-void c (objc/sel "setHidden:") (not over))
+      (objc/send-r-void c (objc/sel "setFrame:") (objc/rect (+ sw vw (* i 24)) 3 24
+                                                            (max 0 (- bh 6)))))
+    (reduce (fn [x [page w]] (layout-tab-header! pane page x w bh) (+ x w))
+            0 (map vector (:children pane) widths))
+    (objc/send-void scroll (objc/sel "tile"))
+    (when-let [page (ui/selected-page pane)] (reveal-tab! pane page))))
+
+(defmethod ui/backend-tab-reveal [(b cocoa-backend) pane page]
+  (reveal-tab! pane page))
+
+(defmethod ui/backend-tab-at-point [(b cocoa-backend) pane x y]
+  (let [bar (:tab-bar pane)
+        {:keys [scroll document]} (bar-state bar)
+        [sx sy sw sh] (objc/rect-vec (objc/send-rect scroll (objc/sel "frame")))]
+    (when (and (<= sx x) (< x (+ sx sw)) (<= sy y) (< y (+ sy sh)))
+      (let [p (objc/send-point-p document (objc/sel "convertPoint:fromView:")
+                                 {:x (f64 x) :y (f64 y)} (view bar))
+            dx (ffi/field p objc/ns-point :x)
+            dy (ffi/field p objc/ns-point :y)]
+        (first (filter (fn [page]
+                         (when-let [info (header-of pane page)]
+                           (let [[hx hy hw hh] (objc/rect-vec (objc/send-rect (:view info)
+                                                                              (objc/sel "frame")))]
+                             (and (<= hx dx) (< dx (+ hx hw)) (<= hy dy) (< dy (+ hy hh))))))
+                       (:children pane)))))))
+
+(defn- scroll-tabs! [bar delta]
+  (let [{:keys [scroll document]} (bar-state bar)
+        [x _ w _] (objc/rect-vec (objc/send-rect (objc/send scroll (objc/sel "contentView"))
+                                                 (objc/sel "bounds")))
+        [_ _ total _] (objc/rect-vec (objc/send-rect document (objc/sel "frame")))]
+    (objc/send-point-void document (objc/sel "scrollPoint:")
+                          {:x (f64 (max 0 (min (max 0 (- total w)) (+ x delta)))) :y 0.0})))
+
+(defmethod native-action [(bar ui/tab-bar-widget) sender]
+  (let [pane (:pane bar)
+        [kind page] (get @tab-controls (ffi/address sender))
+        live (and page (index-of (:children pane) page))]
+    (when (:enabled pane)
+      (cond
+        (= kind :select) (when live (ui/select-page! pane page))
+        (= kind :close)
+        (when (and live (:tab-closable page))
+          ;; Closing takes the button away while AppKit still dispatches its click.
+          (objc/retain sender)
+          (try (ui/close-page! pane page)
+               (finally (ui/backend-call-later (ui/current-backend)
+                                               (fn [] (objc/release sender))))))
+        (= kind :previous) (scroll-tabs! bar -120)
+        (= kind :next) (scroll-tabs! bar 120)
+        (= kind :menu) (ui/show-tab-menu pane)
+        :else nil))))
+
+(defn- event-point
+  "Where the NSEvent happened in the view's coordinates, as [x y]."
+  [v e]
+  (let [w (objc/send-point e (objc/sel "locationInWindow"))
+        p (objc/send-point-p v (objc/sel "convertPoint:fromView:")
+                             {:x (ffi/field w objc/ns-point :x) :y (ffi/field w objc/ns-point :y)}
+                             (ffi/null))]
+    [(ffi/field p objc/ns-point :x) (ffi/field p objc/ns-point :y)]))
+
+(defn- drop-target
+  "The pane other than the bar's that its tab dragged to the NSEvent's point would drop
+on, or nil: hit-testing finds the pane under the pointer, so covered panes don't count."
+  [bar e]
+  (let [from (:pane bar)
+        win (objc/send (view bar) (objc/sel "window"))]
+    (when (and (:drag-group from) (not (ffi/null? win)))
+      (let [loc (objc/send-point e (objc/sel "locationInWindow"))
+            frame-view (objc/send (objc/send win (objc/sel "contentView")) (objc/sel "superview"))
+            hit (objc/send-pt frame-view (objc/sel "hitTest:")
+                              {:x (ffi/field loc objc/ns-point :x)
+                               :y (ffi/field loc objc/ns-point :y)})
+            w (widget-of-view hit)
+            pane (when w
+                   (first (filter (fn [o] (and (instance? ui/tabbed-pane-widget o)
+                                               (= (:drag-group o) (:drag-group from))))
+                                  (take-while some? (iterate :parent w)))))]
+        (when (and pane (ui/page-drop-target? pane from)) pane)))))
+
+(defn- show-drop-target! [bar target]
+  (let [st (bar-state bar)]
+    (when-not (identical? target (:drop-target st))
+      (when-let [o (:overlay st)]
+        (objc/send-void o (objc/sel "removeFromSuperview"))
+        (objc/release o))
+      (if target
+        (let [o (init-frame "NSBox")
+              accent (ns-color :accent)]
+          (objc/send-l-void o (objc/sel "setBoxType:") 4)              ; NSBoxCustom
+          (objc/send-l-void o (objc/sel "setTitlePosition:") 0)
+          (objc/send-d-void o (objc/sel "setBorderWidth:") 2.0)
+          (objc/send-d-void o (objc/sel "setCornerRadius:") 4.0)
+          (objc/send-p-void o (objc/sel "setBorderColor:") accent)
+          (objc/send-p-void o (objc/sel "setFillColor:")
+                            (objc/send-d accent (objc/sel "colorWithAlphaComponent:") 0.15))
+          (objc/send-r-void o (objc/sel "setFrame:")
+                            (objc/send-rect (view target) (objc/sel "bounds")))
+          (objc/send-p-void (view target) (objc/sel "addSubview:") o)
+          (update-bar-state! bar assoc :drop-target target :overlay o))
+        (update-bar-state! bar assoc :drop-target nil :overlay nil)))))
+
+(defn- drop-index
+  "Where a tab dropped at the NSEvent's point goes in pane: before the tab there, else
+last."
+  [pane e]
+  (let [[x y] (event-point (view (:tab-bar pane)) e)
+        page (ui/tab-at-point pane x y)]
+    (if page (index-of (:children pane) page) (count (:children pane)))))
+
+(defn- tab-dragged! [bar e]
+  (let [pane (:pane bar)
+        d (:drag (bar-state bar))]
+    (when (and d (index-of (:children pane) (:page d)))
+      (let [[x y] (event-point (view bar) e)]
+        (when (or (:dragging d) (> (abs (- x (:x d))) 5) (> (abs (- y (:y d))) 5))
+          (update-bar-state! bar assoc-in [:drag :dragging] true)
+          (show-drop-target! bar (drop-target bar e))
+          (when (and (:reorderable pane) (nil? (:drop-target (bar-state bar))))
+            (let [target (ui/tab-at-point pane x y)]
+              (when (and target (not (identical? target (:page d))))
+                (ui/page-moved-by-user! pane (:page d) (index-of (:children pane) target))
+                (ui/flush-layouts!)))
+            ;; Reaching an end of the visible tabs scrolls to show more.
+            (let [[sx _ sw _] (objc/rect-vec (objc/send-rect (:scroll (bar-state bar))
+                                                             (objc/sel "frame")))]
+              (cond (< x (+ sx 12)) (scroll-tabs! bar -20)
+                    (> x (- (+ sx sw) 12)) (scroll-tabs! bar 20)
+                    :else nil))))))))
+
+(defn- tab-released! [bar e]
+  (let [st (bar-state bar)
+        d (:drag st)
+        target (:drop-target st)]
+    (update-bar-state! bar dissoc :drag)
+    (show-drop-target! bar nil)
+    (when (and d target (not (:destroyed target)))
+      ;; Moving the page takes this button away: drop once AppKit is done with the event.
+      (let [index (drop-index target e)]
+        (ui/backend-call-later (ui/current-backend)
+                               (fn [] (ui/page-dropped-by-user! (:page d) target index)))))))
+
+(defn- tab-mouse! [button selector e]
+  (let [bar (objc/object-for button)
+        [kind page] (get @tab-controls (ffi/address button))
+        pane (when bar (:pane bar))
+        live (and pane page (index-of (:children pane) page))]
+    (when (and pane (:enabled pane))
+      (cond
+        (or (= selector "rightMouseDown:")
+            (and (= selector "mouseDown:") (contains? (event-modifiers e) :control)))
+        (let [[x y] (event-point (view bar) e)]
+          (ui/tab-context-requested! pane x y (event-modifiers e)))
+        (= selector "mouseDown:")
+        (when (and live (= kind :select))
+          (ui/select-page! pane page)
+          (let [[x y] (event-point (view bar) e)]
+            (update-bar-state! bar assoc :drag {:page page :dragging false :x x :y y})))
+        (= selector "mouseDragged:") (tab-dragged! bar e)
+        (= selector "mouseUp:") (tab-released! bar e)
+        (= selector "otherMouseDown:")
+        (when (and live (:tab-closable page) (= 2 (objc/send-long e (objc/sel "buttonNumber"))))
+          (objc/retain button)
+          (try (ui/close-page! pane page)
+               (finally (ui/backend-call-later (ui/current-backend)
+                                               (fn [] (objc/release button))))))
+        :else nil))))
+
+(defn native-tab
+  "What the page's tab shows: {:title :selected :closable :tooltip}."
+  [page]
+  (let [info (header-of (:parent page) page)
+        b (:label info)]
+    {:title (objc/string-of (objc/send b (objc/sel "title")))
+     :selected (= 1 (objc/send-long b (objc/sel "state")))
+     :closable (not (objc/send-bool (:close info) (objc/sel "isHidden")))
+     :tooltip (objc/string-of (objc/send b (objc/sel "toolTip")))}))
+
+(defn native-tab-point
+  "The middle of the page's tab, [x y] in its tab bar's view."
+  ([page] (native-tab-point page (:tab-bar (:parent page))))
+  ([page in]
+   (let [v (:view (header-of (:parent page) page))
+         [_ _ w h] (objc/rect-vec (objc/send-rect v (objc/sel "bounds")))
+         p (objc/send-point-p v (objc/sel "convertPoint:toView:")
+                              {:x (f64 (/ w 2)) :y (f64 (/ h 2))} (view in))]
+     [(ffi/field p objc/ns-point :x) (ffi/field p objc/ns-point :y)])))
+
+(defn native-page-area
+  "The frame of the tabbed pane's page area, [x y width height] in the pane's view."
+  [pane]
+  (mapv (fn [x] (int (math/round x)))
+        (objc/rect-vec (objc/send-rect (tabs-of pane) (objc/sel "frame")))))
+
+(defn send-tab-mouse!
+  "Send the page's tab a mouse event of type (an NSEventType: 1 down, 6 drag, 2 up, 3
+right down) at x, y in its tab bar's view, as AppKit does."
+  [page type x y]
+  (let [pane (:parent page)
+        button (:label (header-of pane page))]
+    (objc/send-p-void button (objc/sel (case type 1 "mouseDown:" 6 "mouseDragged:" 2 "mouseUp:"
+                                             3 "rightMouseDown:"))
+                      (mouse-event (view (:tab-bar pane)) type x y))))
+
+(defn click-tab!
+  "Click the page's tab, as the user would."
+  [page]
+  (let [[x y] (native-tab-point page)]
+    (send-tab-mouse! page 1 x y)
+    (send-tab-mouse! page 2 x y)))
+
+(defn drag-tab!
+  "Drag the page's tab to the middle of the widget (another tab's page, or a pane) and
+let go, as the user would."
+  [page to]
+  (let [[x y] (native-tab-point page)
+        bar (view (:tab-bar (:parent page)))
+        [tx ty] (if (instance? ui/tabbed-pane-widget (:parent to))
+                  (native-tab-point to (:tab-bar (:parent page)))
+                  (let [[_ _ w h] (objc/rect-vec (objc/send-rect (view to) (objc/sel "bounds")))
+                        p (objc/send-point-p (view to) (objc/sel "convertPoint:toView:")
+                                             {:x (f64 (/ w 2)) :y (f64 (/ h 2))} bar)]
+                    [(ffi/field p objc/ns-point :x) (ffi/field p objc/ns-point :y)]))]
+    (send-tab-mouse! page 1 x y)
+    (send-tab-mouse! page 6 (/ (+ x tx) 2) (/ (+ y ty) 2))
+    (send-tab-mouse! page 6 tx ty)
+    (send-tab-mouse! page 2 tx ty)))
+
+(defn click-tab-close!
+  "Click the close button of the page's tab, as the user would."
+  [page]
+  (objc/send-p-void (:close (header-of (:parent page) page)) (objc/sel "performClick:")
+                    (ffi/null)))

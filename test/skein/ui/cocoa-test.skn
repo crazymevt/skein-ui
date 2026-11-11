@@ -343,3 +343,60 @@
     (ui/close! w))
   (is (< (first (ui/preferred-size (ui/button {:label "Go" :control-size :mini})))
          (first (ui/preferred-size (ui/button {:label "Go"}))))))
+
+(deftest stacks-and-tabbed-panes
+  (let [a (ui/label {:text "one"})
+        b (ui/label {:text "two"})
+        s (ui/stack {} a b)
+        n (ui/vertical-notebook {} (ui/label {:text "general" :tab-label "General"})
+                                (ui/label {:text "other" :tab-label "Other"}))
+        w (ui/window {:title "Stacks"} (ui/vbox {} s n))]
+    (ui/show! w)
+    (is (cocoa/native-bool b "isHidden"))
+    (ui/select-page! s b)
+    (is (not (cocoa/native-bool b "isHidden")))
+    (is (cocoa/native-bool a "isHidden"))
+    (is (= 150 (nth (cocoa/native-frame (:page-list n)) 2)) "the list of pages")
+    (ui/close! w))
+  (let [closed (atom [])
+        a (ui/text-view {:tab-label "Notes" :tab-tooltip "Your notes"})
+        b (ui/text-view {:tab-closable false})
+        c (ui/text-view {:tab-label "Third"})
+        p (ui/tabbed-pane {:drag-group :docs :on-page-closed (fn [e] (swap! closed conj (:index e)))}
+                          a b c)
+        q (ui/tabbed-pane {:drag-group :docs} (ui/text-view {:tab-label "Other"}))
+        w (ui/window {:width 800 :height 400} (ui/hbox {:homogeneous true} p q))]
+    (ui/show! w)
+    (testing "tabs are buttons"
+      (is (= {:title "Notes" :selected true :closable true :tooltip "Your notes"}
+             (cocoa/native-tab a)))
+      (is (= "Page 2" (:title (cocoa/native-tab b))))
+      (is (not (:closable (cocoa/native-tab b)))))
+    (testing "the pages are below the tab bar"
+      (let [[_ _ _ bh] (:allocation (ui/tab-bar p))]
+        (is (<= 28 bh 40))
+        (is (= bh (second (cocoa/native-page-area p))))))
+    (testing "clicking a tab shows its page"
+      (cocoa/click-tab! b)
+      (is (= 1 (:selected-index p)))
+      (is (:selected (cocoa/native-tab b)))
+      (is (not (:selected (cocoa/native-tab a)))))
+    (testing "finding a tab by its point"
+      (let [[x y] (cocoa/native-tab-point c)]
+        (is (identical? c (ui/tab-at-point p x y)))))
+    (testing "dragging a tab over another reorders them"
+      (cocoa/drag-tab! a c)
+      (is (= [b c a] (:children p)))
+      (is (identical? a (ui/selected-page p)) "the dragged tab shows")
+      (is (< (first (cocoa/native-tab-point c)) (first (cocoa/native-tab-point a)))))
+    (testing "closing a tab"
+      (cocoa/click-tab-close! c)
+      (is (= [1] @closed))
+      (is (= [b a] (:children p))))
+    (testing "dropping a tab on another pane"
+      (cocoa/drag-tab! a q)
+      (cocoa/run-for! 0.1)
+      (is (= [b] (:children p)))
+      (is (identical? a (last (:children q))))
+      (is (:selected (cocoa/native-tab a))))
+    (ui/close! w)))
