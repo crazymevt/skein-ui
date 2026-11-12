@@ -91,6 +91,8 @@
                 before (subs @model 0 p)
                 line (count (filter (fn [c] (= c \newline)) before))]
             (is (= line (ui/position-line b p)))
+            (is (= (ui/utf16-length before) (ui/buffer-utf16-position b p)) "UTF-16 units")
+            (is (= p (ui/buffer-position-from-utf16 b (ui/utf16-length before))))
             (is (= (inc (count (filter (fn [c] (= c \newline)) @model)))
                    (ui/buffer-line-count b))))))
       (while (ui/can-undo? b) (ui/undo! b))
@@ -156,3 +158,67 @@
         (is (= [56 0 1 16] (ui/caret-rectangle v)))
         (ui/close-surface! c)))
     (ui/close! w)))
+
+;; A code view's runs against a model (Skein's M3.6, D-108): the runs kept in one sorted
+;; vector, moved and replaced as the code view did before it kept them in chunks.
+
+(defn- model-shift [runs start old-end new-end]
+  (if (and (= start old-end) (= start new-end))
+    runs
+    (let [delta (- new-end old-end)]
+      (into [] (comp (map (fn [[s e a]]
+                            [(if (>= s old-end) (+ s delta) (min s start))
+                             (cond (>= e old-end) (+ e delta) (> e start) start :else e)
+                             a]))
+                     (filter (fn [[s e _]] (< s e))))
+            runs))))
+
+(defn- model-replace [runs start end new]
+  (let [piece (fn [s e a] (when (< s e) [s e a]))
+        old (mapcat (fn [[s e a]]
+                      (if (or (<= e start) (>= s end))
+                        [[s e a]]
+                        (remove nil? [(piece s (min e start) a) (piece (max s end) e a)])))
+                    runs)
+        new (remove nil? (map (fn [[s e a]] (piece (max start s) (min end e) a)) new))]
+    (vec (sort-by first (concat old new)))))
+
+(defn- random-runs
+  "About n runs in text of length len, mostly short and apart, some long and overlapping."
+  [n len]
+  (vec (sort-by first
+                (for [_ (range n)
+                      :let [s (rand-int (max 1 len))
+                            e (min len (+ s 1 (if (< (rand) 0.05) (rand-int 400) (rand-int 8))))]
+                      :when (< s e)]
+                  [s e {:style (rand-nth [:a :b :c])}]))))
+
+(deftest runs-against-a-model
+  (dotimes [seed 6]
+    (let [text (apply str (repeatedly 3000 (fn [] (rand-nth ["a" "b" " " "\n" "(" ")"]))))
+          b (ui/make-text-buffer {:text text})
+          v (ui/code-view {:buffer b})
+          shuffled (shuffle (random-runs 900 (count text)))
+          model (atom (vec (sort-by first shuffled)))]
+      (ui/set-text-runs! v shuffled)
+      (is (= @model (ui/text-runs v)) "set-text-runs! sorts them, keeping equal starts' order")
+      (dotimes [_ 150]
+        (let [n (ui/buffer-length b)]
+          (if (< (rand) 0.5)
+            (let [s (rand-int (inc n))
+                  e (min n (+ s (if (< (rand) 0.3) (rand-int 50) 0)))
+                  t (apply str (repeatedly (rand-int 6) (fn [] (rand-nth ["x" "\n" " "]))))]
+              (ui/replace-buffer-range! b s e t)
+              (swap! model model-shift s e (+ s (count t))))
+            (let [s (rand-int (inc n))
+                  e (min n (+ s (rand-int 200)))
+                  new (random-runs (rand-int 30) n)]
+              (ui/replace-text-runs! v s e new)
+              (swap! model model-replace s e new)))
+          (is (= @model (ui/text-runs v)))
+          (let [n (ui/buffer-length b)
+                p (rand-int (max 1 n))
+                expected (when-let [[_ _ a] (first (filter (fn [[s e _]] (and (<= s p) (< p e)))
+                                                           @model))]
+                           (ui/resolve-run-attributes v a))]
+            (is (= expected (ui/text-style-at v p)))))))))

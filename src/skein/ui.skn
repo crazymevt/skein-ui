@@ -4751,6 +4751,8 @@ buffer-change-event) for each change. Make one with make-text-buffer."
   (astral :cell :atom :init 0
           :doc "How many characters are outside the Basic Multilingual Plane (two UTF-16
 units each).")
+  (astral-positions :cell :atom :init []
+                    :doc "Where those characters are, in order: for counting UTF-16 units.")
   (revision :cell :atom :init 0 :doc "A number that grows with every change.")
   (history-limit :cell :atom :init 1000
                  :doc "How many changes undo! can take back; 0 keeps no history.")
@@ -4871,6 +4873,11 @@ that keep their own."
 (defn- astral-count [s]
   (count (filter (fn [c] (> (int c) 0xFFFF)) s)))
 
+(defn- astral-offsets
+  "Where the characters of s outside the Basic Multilingual Plane are, plus offset."
+  [s offset]
+  (into [] (comp (map-indexed (fn [i c] (when (> (int c) 0xFFFF) (+ offset i)))) (remove nil?)) s))
+
 ;; The undo history: a record is a vector of edits [start removed inserted], oldest first.
 
 (defn- merge-edit
@@ -4930,7 +4937,15 @@ Backspace does, so undo! takes them back together. Returns the end of the new te
          (set-slot! b :starts (into (into (subvec starts 0 ls) new-starts)
                                     (map (fn [x] (+ x delta)) (subvec starts (inc le)))))
          (update-slot! b :length + delta)
-         (update-slot! b :astral + (- (astral-count text) (astral-count removed)))
+         (let [old (:astral-positions b)
+               added (astral-offsets text start)]
+           (when (or (seq old) (seq added))
+             (set-slot! b :astral-positions
+                        (-> (into [] (take-while (fn [p] (< p start))) old)
+                            (into added)
+                            (into (comp (drop-while (fn [p] (< p end))) (map (fn [p] (+ p delta))))
+                                  old)))
+             (set-slot! b :astral (count (:astral-positions b)))))
          (update-slot! b :revision inc)
          (record-change! b start removed text merge)
          (emit! b (event-for b :changed :start start :old-end end :new-end (+ start (count text))
@@ -4955,22 +4970,35 @@ Backspace does, so undo! takes them back together. Returns the end of the new te
 
 ;; Characters and UTF-16 units, for backends whose strings count UTF-16 units
 
+(defn- astral-before
+  "How many of the buffer's characters before position are outside the Basic Multilingual
+Plane: a binary search of their positions."
+  [b position]
+  (let [ps (:astral-positions b)]
+    (loop [lo 0 hi (count ps)]
+      (if (< lo hi)
+        (let [mid (quot (+ lo hi) 2)]
+          (if (< (nth ps mid) position) (recur (inc mid) hi) (recur lo mid)))
+        lo))))
+
 (defn buffer-utf16-position
   "position in the buffer counted in UTF-16 units, as NSString and Windows count."
   [b position]
   (if (zero? (:astral b))
     position
-    (+ position (astral-count (buffer-text b 0 position)))))
+    (+ position (astral-before b position))))
 
 (defn buffer-position-from-utf16
-  "The character position in the buffer of the UTF-16 offset units."
+  "The character position in the buffer of the UTF-16 offset units (the character after,
+for an offset inside one)."
   [b units]
   (if (zero? (:astral b))
     (min units (:length b))
-    (loop [i 0 u 0]
-      (if (or (>= u units) (>= i (:length b)))
-        i
-        (recur (inc i) (+ u (if (> (int (buffer-char b i)) 0xFFFF) 2 1)))))))
+    (loop [lo 0 hi (:length b)]
+      (if (< lo hi)
+        (let [mid (quot (+ lo hi) 2)]
+          (if (< (buffer-utf16-position b mid) units) (recur (inc mid) hi) (recur lo mid)))
+        lo))))
 
 (defn utf16-length
   "The number of UTF-16 units the string s takes."
@@ -5086,7 +5114,8 @@ Changing it restyles the view, as a theme change needs.")
   (cursor :cell :atom :init 0 :doc "Where the caret is: the moving end of the selection.")
   (anchor :cell :atom :init 0 :doc "The fixed end of the selection; the cursor's if empty.")
   (goal-column :cell :atom :init nil)
-  (runs :cell :atom :init [] :doc "The styled runs, [start end attributes], by start.")
+  (run-chunks :cell :atom :init []
+              :doc "The styled runs in chunks (text-runs gives them as [start end attributes]).")
   (styled :cell :atom :init nil :doc "[start end] of the text whose runs the backend shows.")
   (hexpand :cell :atom :init true)
   (vexpand :cell :atom :init true))
@@ -5147,9 +5176,10 @@ code view's text, whose text there has no style otherwise.")
         (>= position old-end) (+ position (- new-end old-end))
         :else start))
 
-(defn- shift-runs
-  "runs moved for a change replacing start to old-end with start to new-end. A run that
-continues past an insertion grows to cover it, as typing in a word does."
+(defn- shift-run-list
+  "runs, a vector of [start end attributes], moved for a change replacing start to old-end
+with start to new-end. A run that continues past an insertion grows to cover it, as typing
+in a word does; one inside a deletion goes."
   [runs start old-end new-end]
   (if (and (= start old-end) (= start new-end))
     runs
@@ -5160,6 +5190,89 @@ continues past an insertion grows to cover it, as typing in a word does."
                              a]))
                      (filter (fn [[s e _]] (< s e))))
             runs))))
+
+;; A code view keeps its runs in chunks, so that an edit, and replacing the runs of a few
+;; lines, costs what it changes rather than what the text has. The chunks are in order, each
+;; [base runs end]: at most run-chunk-size runs sorted by start, their positions relative
+;; to base (the first one's start), and end the furthest any of them reaches. An edit moves
+;; the chunks after it by changing their bases, and rebuilds only the chunk it falls in.
+
+(def ^:private run-chunk-size 256)
+
+(defn- make-run-chunk
+  "A chunk of runs, absolute and sorted by start (at least one)."
+  [runs]
+  (let [base (first (first runs))]
+    [base (mapv (fn [[s e a]] [(- s base) (- e base) a]) runs)
+     (- (reduce (fn [m r] (max m (second r))) base runs) base)]))
+
+(defn- chunk-run-list [[base runs _]]
+  (map (fn [[s e a]] [(+ s base) (+ e base) a]) runs))
+
+(defn- chunk-start [c] (first c))
+
+(defn- chunk-end [c] (+ (first c) (nth c 2)))
+
+(defn- chunk-runs
+  "Runs, absolute and sorted by start, in chunks."
+  [runs]
+  (mapv make-run-chunk (partition-all run-chunk-size runs)))
+
+(defn- unchunk-runs [chunks]
+  (into [] (mapcat chunk-run-list) chunks))
+
+(defn- shift-chunks
+  "The chunks moved for a change replacing start to old-end with start to new-end, as
+shift-run-list moves runs."
+  [chunks start old-end new-end]
+  (if (and (= start old-end) (= start new-end))
+    chunks
+    (let [delta (- new-end old-end)]
+      (into [] (mapcat (fn [c]
+                         (cond (< (chunk-end c) start) [c]
+                               (>= (chunk-start c) old-end) [(assoc c 0 (+ (first c) delta))]
+                               :else (let [rs (shift-run-list (vec (chunk-run-list c))
+                                                              start old-end new-end)]
+                                       (if (seq rs) [(make-run-chunk rs)] [])))))
+            chunks))))
+
+(defn- chunk-runs-between
+  "The runs in chunks that overlap start to end, clipped to it, by start."
+  [chunks start end]
+  (into [] (comp (filter (fn [c] (and (< (chunk-start c) end) (> (chunk-end c) start))))
+                 (mapcat chunk-run-list)
+                 (filter (fn [[s e _]] (and (< s end) (> e start))))
+                 (map (fn [[s e a]] [(max s start) (min e end) a])))
+        chunks))
+
+(defn- replace-chunk-runs
+  "The chunks with the runs between start and end replaced by runs (inside it, sorted or
+not): the runs that overlap the range are cut at it, and only the chunks from the first
+that overlaps it, or that it falls in, to the last are made again."
+  [chunks start end runs]
+  (let [n (count chunks)
+        touched (keep-indexed (fn [i c] (when (and (< (chunk-start c) end) (> (chunk-end c) start))
+                                          i))
+                              chunks)
+        ;; The last chunk starting at or before start: where new runs go between chunks.
+        home (loop [i (dec n)] (if (and (>= i 0) (> (chunk-start (nth chunks i)) start))
+                                 (recur (dec i))
+                                 i))
+        lo (max 0 (reduce min (if (neg? home) 0 home) touched))
+        hi (min (dec n) (reduce max (max home lo) touched))
+        piece (fn [s e a] (when (< s e) [s e a]))
+        old (if (pos? n)
+              (mapcat (fn [[s e a]]
+                        (if (or (<= e start) (>= s end))
+                          [[s e a]]
+                          (remove nil? [(piece s (min e start) a) (piece (max s end) e a)])))
+                      (mapcat chunk-run-list (subvec chunks lo (inc hi))))
+              [])
+        new (remove nil? (map (fn [[s e a]] (piece (max start s) (min end e) a)) runs))
+        region (chunk-runs (vec (sort-by first (concat old new))))]
+    (if (pos? n)
+      (into (into (subvec chunks 0 lo) region) (subvec chunks (inc hi)))
+      region)))
 
 (def ^:private restyle!)
 (def ^:private ensure-styled!)
@@ -5179,7 +5292,7 @@ continues past an insertion grows to cover it, as typing in a word does."
       (when-not (:destroyed v)
         (set-slot! v :cursor (shift-position (:cursor v) start old-end new-end))
         (set-slot! v :anchor (shift-position (:anchor v) start old-end new-end))
-        (set-slot! v :runs (shift-runs (:runs v) start old-end new-end))
+        (set-slot! v :run-chunks (shift-chunks (:run-chunks v) start old-end new-end))
         (when-let [[a z] (:styled v)]
           (set-slot! v :styled [(shift-position a start old-end new-end)
                                 (shift-position z start old-end new-end)]))
@@ -5215,7 +5328,7 @@ continues past an insertion grows to cover it, as typing in a word does."
                  (attach-view! v new)
                  (set-slot! v :cursor 0)
                  (set-slot! v :anchor 0)
-                 (set-slot! v :runs [])
+                 (set-slot! v :run-chunks [])
                  (set-slot! v :styled nil)))))
 
 (defmethod destroy! :before [(v code-view-widget)]
@@ -5406,14 +5519,12 @@ left, scrolled part included, gutter excluded), where a click there puts the car
 (defn text-runs
   "The code view's styled runs, [start end attributes] by start."
   [v]
-  (:runs v))
+  (unchunk-runs (:run-chunks v)))
 
 (defn- runs-between
   "The runs of the view overlapping start to end, clipped to it."
   [v start end]
-  (into [] (comp (filter (fn [[s e _]] (and (< s end) (> e start))))
-                 (map (fn [[s e a]] [(max s start) (min e end) a])))
-        (:runs v)))
+  (chunk-runs-between (:run-chunks v) start end))
 
 (defn resolve-run-attributes
   "A run's attributes with its :style replaced by the style's attributes from the view's
@@ -5464,7 +5575,12 @@ map of :style (a name in :text-styles giving defaults for the rest), :color and
 :background (color designators), :bold, :italic and :underline. Text outside any run has
 the plain style. Only what shows is styled at once; the rest as it scrolls into view."
   [v runs]
-  (set-slot! v :runs (vec (sort-by first (filter (fn [[s e _]] (< s e)) (map normalize-run runs)))))
+  (let [rs (into [] (comp (map normalize-run) (filter (fn [[s e _]] (< s e)))) runs)
+        sorted (if (every? (fn [i] (<= (first (nth rs i)) (first (nth rs (inc i)))))
+                           (range (dec (count rs))))
+                 rs
+                 (vec (sort-by first rs)))]
+    (set-slot! v :run-chunks (chunk-runs sorted)))
   (let [old (:styled v)]
     (set-slot! v :styled nil)
     (when (and old (realized? v))
@@ -5478,22 +5594,14 @@ the plain style. Only what shows is styled at once; the rest as it scrolls into 
   "Replace the code view's runs between start and end with runs, which should lie in that
 range, and show the change where it shows: how to restyle part of a large text."
   [v start end runs]
-  (let [piece (fn [s e a] (when (< s e) [s e a]))
-        old (mapcat (fn [[s e a]]
-                      (if (or (<= e start) (>= s end))
-                        [[s e a]]
-                        (remove nil? [(piece s (min e start) a) (piece (max s end) e a)])))
-                    (:runs v))
-        new (remove nil? (map (fn [[s e a]] (piece (max start s) (min end e) a))
-                              (map normalize-run runs)))]
-    (set-slot! v :runs (vec (sort-by first (concat old new)))))
+  (set-slot! v :run-chunks (replace-chunk-runs (:run-chunks v) start end (map normalize-run runs)))
   (restyle! v start end)
   runs)
 
 (defn text-style-at
   "The attributes of the run at position in the code view, its style resolved, or nil."
   [v position]
-  (when-let [[_ _ a] (first (filter (fn [[s e _]] (and (<= s position) (< position e))) (:runs v)))]
+  (when-let [[_ _ a] (first (chunk-runs-between (:run-chunks v) position (inc position)))]
     (resolve-run-attributes v a)))
 
 (defmethod property-changed :after [(v code-view-widget) property value]

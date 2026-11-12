@@ -1,0 +1,173 @@
+(ns code-view
+  "How fast a code view highlights a large file as it's edited (Skein's M3.6, D-108): the
+first 10,000 lines of skein-ui's own sources in a code view, colored by a line lexer as
+Lisp Studio's highlighter colors (comments, strings, keywords, numbers and every bracket,
+about 48,000 runs), then typed into a keystroke at a time in the middle, with a Return
+now and then. After each keystroke the highlighter lexes the changed lines again, and on
+until a line ends as it did before, and replaces their runs, as an editor does. Prints the
+time to color the file, and each keystroke's time with its coloring (median, 95th
+percentile, worst). With --emoji the file starts with a character outside the Basic
+Multilingual Plane, which Cocoa's positions (in UTF-16 units) must count.
+
+From skein-ui's folder:
+
+  ../skein/skein run --release bench/code-view.skn            # headless
+  ../skein/skein run --release bench/code-view.skn --cocoa    # a window on macOS
+  ../skein/skein run --release bench/code-view.skn --gtk
+  ../skein/skein run --release bench/code-view.skn --cocoa --emoji"
+  (:require [skein.ui :as ui]
+            [skein.ui.headless :as headless]
+            [skein.ui.cocoa :as cocoa]
+            [skein.ui.gtk :as gtk]
+            [skein.io :as io]
+            [skein.string :as string]
+            [skein.time :as time]
+            [skein.math :as math]))
+
+(def ^:private line-count 10000)
+
+(defn- source-text [emoji]
+  (let [lines (mapcat (fn [f] (string/split-lines (io/read-file f)))
+                      ["src/skein/ui.skn" "src/skein/ui/cocoa.skn" "src/skein/ui/gtk.skn"])]
+    (str (when emoji ";; 😀 ") (string/join "\n" (take line-count lines)))))
+
+;;; A line lexer. A line starts and ends in a state: :code, or :string inside a string that
+;;; goes on to the next line.
+
+(def ^:private special
+  #{"def" "defn" "defn-" "defmacro" "defmethod" "defgeneric" "defclass" "let" "fn" "if"
+    "when" "when-let" "if-let" "cond" "case" "loop" "recur" "do" "try" "catch" "finally"
+    "ns" "doseq" "for" "and" "or" "not"})
+
+(defn- symbol-char? [c]
+  (not (contains? #{\space \tab \( \) \[ \] \{ \} \" \; \,} c)))
+
+(defn- lex-line
+  "[runs state]: the runs of text (offsets in it) lexed from state, and its end state."
+  [text state]
+  (let [n (count text)
+        string-end (fn [i] (loop [i i]
+                             (cond (>= i n) nil
+                                   (= \\ (nth text i)) (recur (+ i 2))
+                                   (= \" (nth text i)) (inc i)
+                                   :else (recur (inc i)))))]
+    (loop [i 0 state state runs (transient [])]
+      (cond
+        (= state :string)
+        (if-let [e (string-end i)]
+          (recur e :code (conj! runs [i e {:style :string}]))
+          [(persistent! (conj! runs [i n {:style :string}])) :string])
+        (>= i n) [(persistent! runs) :code]
+        :else
+        (let [c (nth text i)]
+          (cond
+            (= c \;) [(persistent! (conj! runs [i n {:style :comment}])) :code]
+            (= c \") (recur (inc i) :string (conj! runs [i (inc i) {:style :string}]))
+            (contains? #{\( \) \[ \] \{ \}} c) (recur (inc i) :code
+                                                      (conj! runs [i (inc i) {:style :paren}]))
+            (symbol-char? c)
+            (let [e (loop [j i] (if (and (< j n) (symbol-char? (nth text j))) (recur (inc j)) j))
+                  word (subs text i e)
+                  style (cond (= c \:) :keyword
+                              (contains? special word) :special
+                              (re-matches #"-?\d+(\.\d+)?" word) :number
+                              :else nil)]
+              (recur e :code (if style (conj! runs [i e {:style style}]) runs)))
+            :else (recur (inc i) :code runs)))))))
+
+;;; The highlighter: the state each line starts in, kept up to date with the buffer.
+
+(defn- lex-lines!
+  "Lex the buffer's lines from first, at least through last, and on until a line ends in the
+state the next already starts in; record the states and replace the lines' runs in v.
+states is an atom of a vector with one state per line, and one more."
+  [v states first-line last-line]
+  (let [b (:buffer v)
+        n (ui/buffer-line-count b)]
+    (loop [line first-line state (get @states first-line :code) runs (transient [])]
+      (let [base (ui/line-start b line)
+            [line-runs end] (lex-line (ui/line-text b line) state)
+            runs (reduce (fn [rs [s e a]] (conj! rs [(+ base s) (+ base e) a])) runs line-runs)
+            next-line (inc line)
+            settled (and (>= line last-line) (= end (get @states next-line)))]
+        (swap! states assoc next-line end)
+        (if (or settled (>= next-line n))
+          (ui/replace-text-runs! v (ui/line-start b first-line) (ui/line-end b line)
+                                 (persistent! runs))
+          (recur next-line end runs))))))
+
+(defn- newlines [s] (count (filter (fn [c] (= c \newline)) s)))
+
+(defn- follow-changes!
+  "Keep states in step with the buffer's lines, and lex what each change touched."
+  [v states]
+  (ui/on (:buffer v) :changed
+         (fn [e]
+           (let [b (:source e)
+                 line (ui/position-line b (:start e))
+                 removed (newlines (:removed-text e))
+                 added (newlines (:inserted-text e))]
+             (when (not= removed added)
+               (swap! states (fn [st] (into (into (subvec st 0 (inc line))
+                                                  (repeat added :unknown))
+                                            (subvec st (+ line 1 removed))))))
+             (lex-lines! v states line (+ line added))))))
+
+;;; Timing
+
+(defn- ms [ns] (/ (math/round (/ ns 10000.0)) 100.0))
+
+(defn- report [label times]
+  (let [sorted (vec (sort times))
+        at (fn [q] (nth sorted (min (dec (count sorted)) (int (* q (count sorted))))))]
+    (println (str label ": median " (ms (at 0.5)) " ms, 95th percentile " (ms (at 0.95))
+                  " ms, worst " (ms (peek sorted)) " ms (" (count sorted) " keystrokes)"))))
+
+(defn- timed [f]
+  (let [t0 (time/now-ns)]
+    (f)
+    (- (time/now-ns) t0)))
+
+(defn -main [& args]
+  (let [which (cond (some #{"--cocoa"} args) :cocoa (some #{"--gtk"} args) :gtk :else :headless)
+        pump (case which
+               :cocoa (fn [] (cocoa/run-for! 0.01))
+               :gtk (fn [] (gtk/run-for! 0.01))
+               :headless (fn [] nil))]
+    (ui/use-backend! (case which
+                       :cocoa (cocoa/backend)
+                       :gtk (gtk/backend)
+                       :headless (headless/backend)))
+    (let [text (source-text (some #{"--emoji"} args))
+          b (ui/make-text-buffer {:text text :history-limit 1000})
+          v (ui/code-view {:buffer b
+                           :text-styles {:comment {:color :gray :italic true}
+                                         :string {:color :red}
+                                         :keyword {:color :purple}
+                                         :special {:color :blue :bold true}
+                                         :number {:color :orange}
+                                         :paren {:color :gray}}})
+          w (ui/window {:title "code-view bench" :width 800 :height 600} v)
+          states (atom (vec (repeat (inc (ui/buffer-line-count b)) :unknown)))]
+      (ui/show! w)
+      (pump)
+      (println (str "backend: " (name which) ", " (ui/buffer-line-count b) " lines, "
+                    (ui/buffer-length b) " characters"))
+      (let [t (timed (fn [] (swap! states assoc 0 :code)
+                       (lex-lines! v states 0 (dec (ui/buffer-line-count b)))))]
+        (println (str "coloring the file: " (ms t) " ms, " (count (ui/text-runs v)) " runs")))
+      (follow-changes! v states)
+      (let [middle (ui/line-start b (quot line-count 2))
+            typed "(defn fresh [x] (str \"hello \" x :done 42))"]
+        (ui/set-cursor! v middle)
+        (ui/scroll-to-position! v middle)
+        (pump)
+        (let [times (mapv (fn [i]
+                            (let [c (nth typed (mod i (count typed)))
+                                  s (if (zero? (mod (inc i) 30)) "\n" (str c))
+                                  t (timed (fn [] (ui/replace-selection! v s)))]
+                              (when (zero? (mod i 10)) (pump))
+                              t))
+                          (range 300))]
+          (report "typing" times)))
+      (ui/close! w))))
