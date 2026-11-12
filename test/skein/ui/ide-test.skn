@@ -2,7 +2,8 @@
   (:require [skein.test :refer [deftest is are testing use-fixtures]]
             [skein.ui :as ui]
             [skein.ui.headless :as headless]
-            [skein.io :as io]))
+            [skein.io :as io]
+            [skein.string :as string]))
 
 ;; What Skein Studio needs of skein-ui (Skein's M3.6, D-108), on the headless backend: the
 ;; row and cell at a point, snapshots, and a buffer's revision for unsaved changes.
@@ -153,3 +154,87 @@ stored blocks."
       (shown v 200 100)
       (ui/replace-selection! v "typed")
       (is (> (:revision b) r) "a view's edits change its buffer's revision"))))
+
+;; Rich text (Skein's M3.6, D-108): Hiccup rendered into a code view's text and runs.
+
+(defn- runs-at
+  "The attributes of the rich text's runs covering position, merged."
+  [r position]
+  (reduce merge {} (keep (fn [[s e a]] (when (and (<= s position) (< position e)) a))
+                         (ui/text-runs r))))
+
+(deftest rich-text-renders-hiccup
+  (let [r (ui/rich-text {:content [[:h2 "Result"]
+                                   [:p "Call " [:code "(f 1)"] " or see "
+                                    [:a {:href "https://x.test"} "the docs"] "."]
+                                   [:ul [:li "one"] [:li [:b "two"]]]
+                                   [:ol [:li "first" [:ul [:li "inner"]]] [:li "second"]]
+                                   [:pre {:lang "skein"} "(defn f [x]\n  x)\n"]
+                                   [:table [:tr [:th "a"] [:th "bee"]]
+                                           [:tr [:td "1"] [:td "2"]]]]})
+        text (ui/code-text r)
+        at (fn [s] (string/index-of text s))]
+    (is (= (str "Result\nCall (f 1) or see the docs.\n•\tone\n•\ttwo\n1.\tfirst\n•\tinner\n"
+                "2.\tsecond\n(defn f [x]\n  x)\na\tbee\n1\t2")
+           text))
+    (is (not (:editable r)) "the user reads it")
+    (testing "headings and paragraphs"
+      (is (= {:bold true :size 19.5 :space-above 0 :space-below 4} (runs-at r 0)))
+      (is (= 6 (:space-below (runs-at r (at "Call"))))))
+    (testing "inline code and links"
+      (is (= :monospace (:family (runs-at r (at "(f 1)")))))
+      (is (= [:link true] ((juxt :color :underline) (runs-at r (at "the docs")))))
+      (is (= [[(at "the docs") (+ (at "the docs") 8) "https://x.test"]] (:links r))))
+    (testing "lists hang their bullets, nested lists further in"
+      (is (= [24 -18 [24]] ((juxt :indent :first-indent :tabs) (runs-at r (at "one")))))
+      (is (:bold (runs-at r (at "two"))))
+      (is (= 48 (:indent (runs-at r (at "inner"))))))
+    (testing "a code block: monospace, its background, space around it"
+      (let [first-line (runs-at r (at "(defn"))
+            last-line (runs-at r (at "  x)"))]
+        (is (= [:monospace "#80808024" 8 6]
+               ((juxt :family :block-background :indent :space-above) first-line)))
+        (is (= 6 (:space-below last-line)))
+        (is (nil? (:space-above last-line)))))
+    (testing "a table: columns at tab stops past the widest cell, its titles bold"
+      ;; headless characters are 8 pixels wide: the first column's widest is 8, then 24 more.
+      (is (= [32] (:tabs (runs-at r (at "a\tbee")))))
+      (is (:bold (runs-at r (at "bee"))))
+      (is (not (:bold (runs-at r (dec (count text)))))))
+    (testing "the wrong elements"
+      (is (thrown-with-msg? error "inline elements" (ui/rich-text {:content [[:p [:div "x"]]]})))
+      (is (thrown-with-msg? error "blocks are" (ui/rich-text {:content [[:div "x"]]})))
+      (is (thrown-with-msg? error "Hiccup" (ui/rich-text {:content ["just text"]}))))))
+
+(deftest rich-text-links-and-appending
+  (let [seen (atom [])
+        r (ui/rich-text {:content [[:p "See " [:a {:href "u1"} "here"] " now"]]
+                         :on-link-activated (fn [e] (swap! seen conj [(:href e) (:text e)]))})
+        w (ui/window {:width 400 :height 200} r)]
+    (ui/show! w)
+    (ui/flush-layouts!)
+    (testing "a click on a link activates it; a click beside it doesn't"
+      ;; "See here now": here is characters 4 to 8, x 32 to 64 at 8 pixels a character.
+      (headless/mouse! r :mouse-up 40 4 {:button :left :click-count 1})
+      (is (= [["u1" "here"]] @seen))
+      (headless/mouse! r :mouse-up 70 4 {:button :left :click-count 1})
+      (headless/mouse! r :mouse-up 30 4 {:button :left :click-count 1})
+      (is (= 1 (count @seen)))
+      (ui/set-selection! r 0 3)
+      (headless/mouse! r :mouse-up 40 4 {:button :left :click-count 1})
+      (is (= 1 (count @seen)) "not when the click selected text"))
+    (testing "appending renders only the new blocks"
+      (let [before (count (headless/applied-runs r))]
+        (ui/append-content! r [[:p "And " [:a {:href "u2"} "there"]] [:pre "x"]])
+        (is (= "See here now\nAnd there\nx" (ui/code-text r)))
+        (is (= 3 (count (:content r))))
+        (is (= ["u1" "u2"] (mapv (fn [[_ _ h]] h) (:links r))))
+        (is (= :monospace (:family (runs-at r 23))))
+        (is (some (fn [run] (= [13 22 {:space-below 6}] run)) (ui/text-runs r))
+            "the new paragraph's, after the newline that separates it")
+        (is (< before (count (headless/applied-runs r))))))
+    (testing "setting the content renders it all again"
+      (set-slot! r :content [[:p "fresh"]])
+      (is (= "fresh" (ui/code-text r)))
+      (is (= [] (:links r))))
+    (ui/close! w)))

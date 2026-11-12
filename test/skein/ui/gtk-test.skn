@@ -2,7 +2,8 @@
   (:require [skein.test :refer [deftest is are testing use-fixtures]]
             [skein.ui :as ui]
             [skein.ui.gtk :as gtk]
-            [skein.io :as io]))
+            [skein.io :as io]
+            [skein.string :as string]))
 
 ;; The GTK 4 backend (step 5 of M2.14, D-097), where GTK 4 is installed and can open a
 ;; display (Linux CI runs it under Xvfb): the widgets as GTK's, read back from GTK and
@@ -239,6 +240,41 @@
       (gtk/run-for! 0.3)
       (is (= "Augusta" (:name (first (:items t)))))
       (is (= "Augusta" (gtk/cell-string t 0 0))))
+    (ui/close! w)))
+
+(deftest rich-text
+  ;; Skein's M3.6, D-108.
+  (let [seen (atom [])
+        r (ui/rich-text {:content [[:h2 "Result"]
+                                   [:p "Call " [:code "(f 1)"] " or see "
+                                    [:a {:href "https://x.test"} "the docs"] "."]
+                                   [:ul [:li "one"] [:li "two"]]
+                                   [:pre "(defn f [x]\n  x)"]
+                                   [:table [:tr [:th "Name"] [:th "Age"]]
+                                           [:tr [:td "Ada"] [:td "36"]]]]
+                         :on-link-activated (fn [e] (swap! seen conj (:href e)))})
+        w (ui/window {:width 400 :height 300} r)
+        at (fn [s] (string/index-of (ui/code-text r) s))
+        tags (fn [p] (gtk/code-tag-attributes r p))]
+    (ui/show! w)
+    (gtk/run-for! 0.3)
+    (is (= (ui/code-text r) (gtk/code-native-text r)))
+    (testing "headings, code, lists and tables in GTK's tags"
+      (is (= 19.5 (:size (tags 0))))
+      (is (= :monospace (:family (tags (at "(f 1)")))))
+      (is (= [24 -18] ((juxt :indent :first-indent) (tags (at "one")))))
+      (is (some? (:block-background (tags (at "(defn"))))))
+    (testing "a click on a link, through the view's click gesture"
+      (gtk/click-code-position! r (+ 2 (at "the docs")))
+      (is (= ["https://x.test"] @seen))
+      (gtk/click-code-position! r (at "Call"))
+      (is (= 1 (count @seen))))
+    (testing "appending"
+      (ui/append-content! r [[:p "More, " [:a {:href "u2"} "there"]]])
+      (gtk/run-for! 0.3)
+      (is (= (ui/code-text r) (gtk/code-native-text r)))
+      (gtk/click-code-position! r (+ 1 (at "there")))
+      (is (= ["https://x.test" "u2"] @seen)))
     (ui/close! w)))
 
 (deftest rows-at-points-and-snapshots

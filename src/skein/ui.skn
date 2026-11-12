@@ -5165,6 +5165,18 @@ top left, scrolled part included, gutter excluded).")
 (defgeneric backend-code-gutter-width [backend view]
   "The width of the code view's line-number gutter.")
 
+(defgeneric backend-native-links? [backend]
+  "Whether the platform's text view has links of its own, reported with
+link-clicked-by-user!, rather than the core finding them from clicks.")
+
+(defmethod backend-native-links? [(b backend)] false)
+
+(defgeneric backend-show-links [backend view links]
+  "Show links, [start end href] each, in a rich text's native view as the platform's
+links, where it has them: all of them, replacing those shown before.")
+
+(defmethod backend-show-links [(b backend) view links] nil)
+
 (defgeneric backend-code-apply-runs [backend view start end runs]
   "Show runs, [start end attributes] with styles resolved, between start and end of the
 code view's text, whose text there has no style otherwise.")
@@ -5780,6 +5792,272 @@ the view, or nil. Platforms whose native view does the editing keys don't call i
             (set-selection! v (:anchor v) p)
             (set-cursor! v p)))
         :else nil))))
+
+;;; ------------------------------------------------------------------------------------
+;;; Rich text (Skein's M3.6, D-108): formatted text to read, as chat and Markdown show,
+;;; from Hiccup data, rendered into the text and styled runs of a code view the user can't
+;;; edit: blocks :h1 to :h6, :p, :ul and :ol of :li, :pre and :table of :tr, :th and :td;
+;;; inline :b, :i, :code and :a.
+
+(defclass link-event [event]
+  "A link in rich text was clicked: :href is where it goes, :text its text."
+  (href :init nil)
+  (text :init ""))
+
+(def ^:private heading-scales {:h1 1.8 :h2 1.5 :h3 1.25 :h4 1.1 :h5 1.0 :h6 0.9})
+
+(def ^:private block-tags #{:h1 :h2 :h3 :h4 :h5 :h6 :p :ul :ol :pre :table})
+
+(defn- element-parts
+  "[tag attrs children] of a Hiccup element: children without nils, seqs spliced."
+  [el]
+  (when-not (and (vector? el) (keyword? (first el)))
+    (error "rich text is Hiccup: an element is a vector starting with a keyword, not"
+           (pr-str el)))
+  (let [[tag & more] el
+        attrs (if (map? (first more)) (first more) {})
+        kids (if (map? (first more)) (rest more) more)
+        splice (fn splice [xs] (mapcat (fn [x] (cond (nil? x) []
+                                                     (and (sequential? x) (not (vector? x)))
+                                                     (splice x)
+                                                     :else [x]))
+                                       xs))]
+    [tag attrs (vec (splice kids))]))
+
+(defn- plain-text
+  "The text of inline content, without its formatting."
+  [kids]
+  (apply str (map (fn [k] (if (vector? k) (plain-text (nth (element-parts k) 2)) (str k))) kids)))
+
+(defn- rich-builder
+  "A builder of rich text from start: text pieces, runs and links, kept in volatiles."
+  [start]
+  {:pos (volatile! start) :pieces (volatile! (transient [])) :runs (volatile! (transient []))
+   :links (volatile! (transient []))})
+
+(defn- emit-text!
+  "Add text, styled by attrs, to the builder. Returns where it ends."
+  [bld text attrs]
+  (let [s @(:pos bld)
+        e (+ s (count text))]
+    (when (pos? (count text))
+      (vswap! (:pieces bld) conj! text)
+      (when (seq attrs) (vswap! (:runs bld) conj! [s e attrs]))
+      (vreset! (:pos bld) e))
+    e))
+
+(defn- emit-run! [bld s e attrs]
+  (when (< s e) (vswap! (:runs bld) conj! [s e attrs])))
+
+(defn- emit-inlines!
+  "Add inline content (strings and :b, :i, :code and :a elements) with attrs."
+  [bld kids attrs opts]
+  (doseq [k kids]
+    (if-not (vector? k)
+      (emit-text! bld (str k) attrs)
+      (let [[tag a kids] (element-parts k)]
+        (case tag
+          :b (emit-inlines! bld kids (assoc attrs :bold true) opts)
+          :i (emit-inlines! bld kids (assoc attrs :italic true) opts)
+          :code (emit-inlines! bld kids (merge attrs (:code-style opts)) opts)
+          :a (let [s @(:pos bld)]
+               (emit-inlines! bld kids (merge attrs (:link-style opts)) opts)
+               (vswap! (:links bld) conj! [s @(:pos bld) (:href a)]))
+          (error "rich text's inline elements are :b, :i, :code and :a, not" (pr-str tag)))))))
+
+(defn- emit-blocks!
+  "Add blocks to the builder, each after a newline unless it is the first of all. indent
+is the left margin of the blocks, inside lists."
+  [bld blocks opts indent]
+  (doseq [block blocks]
+    (let [[tag a kids] (element-parts block)
+          base (:size opts)]
+      (when (> @(:pos bld) (:start opts)) (emit-text! bld "\n" nil))
+      (let [s @(:pos bld)
+            margin (if (pos? indent) {:indent indent} {})]
+        (case tag
+          (:h1 :h2 :h3 :h4 :h5 :h6)
+          (do (emit-inlines! bld kids {:bold true :size (* base (get heading-scales tag))} opts)
+              (emit-run! bld s @(:pos bld)
+                         (merge margin {:space-above (if (> s (:start opts)) 8 0) :space-below 4})))
+          :p
+          (do (emit-inlines! bld kids {} opts)
+              (emit-run! bld s @(:pos bld) (merge margin {:space-below 6})))
+          (:ul :ol)
+          (let [level-indent (+ indent 24)]
+            (doseq [[i item] (map-indexed vector kids)]
+              (let [[itag _ ikids] (element-parts item)]
+                (when-not (= itag :li)
+                  (error "a list's elements are :li, not" (pr-str itag)))
+                (when (pos? i) (emit-text! bld "\n" nil))
+                (let [ls @(:pos bld)
+                      block? (fn [k] (and (vector? k) (contains? block-tags (first k))))
+                      inline (vec (take-while (complement block?) ikids))
+                      nested (drop (count inline) ikids)]
+                  (emit-text! bld (if (= tag :ul) "•\t" (str (inc i) ".\t")) nil)
+                  (emit-inlines! bld inline {} opts)
+                  (emit-run! bld ls @(:pos bld) {:indent level-indent :first-indent -18
+                                                 :tabs [level-indent] :space-below 2})
+                  (when (seq nested)
+                    (emit-blocks! bld nested (assoc opts :start (dec @(:pos bld)))
+                                  level-indent))))))
+          :pre
+          (let [code (string/replace (plain-text kids) #"\n+$" "")
+                lines (string/split code #"\n" -1)]
+            (emit-text! bld code {:family :monospace})
+            ;; Each line a paragraph of the block: the first with space above, the last below.
+            (loop [ls s [line & more] lines first true]
+              (let [le (+ ls (count line))]
+                (emit-run! bld ls (max (inc ls) le)
+                           (merge {:block-background (:block-background opts) :indent (+ indent 8)}
+                                  (when first {:space-above 6})
+                                  (when-not (seq more) {:space-below 6})))
+                (when (seq more) (recur (inc le) more false)))))
+          :table
+          (let [rows (mapv (fn [r] (let [[rtag _ cells] (element-parts r)]
+                                     (when-not (= rtag :tr)
+                                       (error "a table's elements are :tr, not" (pr-str rtag)))
+                                     (mapv element-parts cells)))
+                           kids)
+                width (fn [[ctag _ ckids]]
+                        ((:measure opts) (plain-text ckids) (if (= ctag :th) {:bold true} {})))
+                columns (reduce max 0 (map count rows))
+                column-width (fn [c] (reduce max 0 (keep (fn [row] (when-let [cell (get row c)]
+                                                                     (width cell)))
+                                                         rows)))
+                widths (mapv column-width (range columns))
+                stops (vec (rest (reductions + 0 (map (fn [w] (+ w 24)) (butlast widths)))))]
+            (doseq [[i row] (map-indexed vector rows)]
+              (when (pos? i) (emit-text! bld "\n" nil))
+              (let [rs @(:pos bld)]
+                (doseq [[j [ctag _ ckids]] (map-indexed vector row)]
+                  (when (pos? j) (emit-text! bld "\t" nil))
+                  (when-not (contains? #{:th :td} ctag)
+                    (error "a table row's elements are :th and :td, not" (pr-str ctag)))
+                  (emit-inlines! bld ckids (if (= ctag :th) {:bold true} {}) opts))
+                (emit-run! bld rs (max (inc rs) @(:pos bld))
+                           (merge {:tabs stops}
+                                  (when (= i (dec (count rows))) {:space-below 6}))))))
+          (error "rich text's blocks are :h1 to :h6, :p, :ul, :ol, :pre and :table, not"
+                 (pr-str tag)))))))
+
+(defn render-rich-text
+  "Hiccup blocks as rich text from position start (a newline first unless it is 0):
+{:text :runs :links}, runs [start end attributes] and links [start end href]. opts are
+:size (the base font's, points), :measure (a function of a string and attributes giving
+its width, for tables' columns), :code-style and :link-style (attributes of inline code
+and links) and :block-background (a code block's)."
+  ([blocks opts] (render-rich-text blocks opts 0))
+  ([blocks opts start]
+   (let [bld (rich-builder start)
+         ;; A translucent gray shows on light and dark backgrounds alike.
+         opts (merge {:size 13 :measure (fn [s a] (* 7 (count s)))
+                      :code-style {:family :monospace :background "#8080802e"}
+                      :link-style {:color :link :underline true}
+                      :block-background "#80808024"}
+                     opts
+                     {:start 0})]
+     (when (pos? start) (emit-text! bld "\n" nil))
+     (emit-blocks! bld blocks (assoc opts :start @(:pos bld)) 0)
+     {:text (apply str (persistent! @(:pieces bld)))
+      :runs (persistent! @(:runs bld))
+      :links (persistent! @(:links bld))})))
+
+(defclass rich-text-widget [code-view-widget]
+  "Formatted text to read, as chat and Markdown show (rich-text): :content is a vector of
+Hiccup blocks, rendered into a code view the user can select and copy from but not edit.
+Clicking a link emits :link-activated (a link-event with its :href)."
+  (content :cell :atom :init [] :doc "The Hiccup blocks shown.")
+  (rendered :cell :atom :init nil :doc "The content the text was last made from.")
+  (links :cell :atom :init [] :doc "[start end href] of each link in the text.")
+  (editable :cell :atom :init false)
+  (line-numbers :cell :atom :init false)
+  (wrap :cell :atom :init true)
+  (font :cell :atom :init {:family :system :size 13 :weight :regular :italic false}))
+
+(declare-widget! rich-text-widget {:properties [:content]
+                                   :signals {:link-activated link-event}})
+
+(defn- rich-opts [r]
+  (let [b (current-backend)
+        font (:font r)
+        size (or (:size font) 13)]
+    {:size size
+     :measure (fn [s a]
+                (let [f (merge font (when (:bold a) {:weight :bold}))]
+                  (first (in-ui (fn [] (backend-text-size b s f))))))}))
+
+(defn- show-links! [r]
+  (when (realized? r)
+    (let [b (current-backend)
+          links (:links r)]
+      (in-ui (fn [] (backend-show-links b r links))))))
+
+(defn- render-content! [r]
+  (let [content (vec (:content r))
+        {:keys [text runs links]} (render-rich-text content (rich-opts r))]
+    (set-slot! r :rendered content)
+    (set-slot! r :links links)
+    (set-buffer-text! (:buffer r) text)
+    (set-text-runs! r runs)
+    (show-links! r)))
+
+(defmethod initialize :after [(r rich-text-widget)]
+  (set-slot! (:buffer r) :history-limit 0)
+  (render-content! r))
+
+(defmethod property-changed :after [(r rich-text-widget) property value]
+  (when (and (= property :content) (not (identical? value (:rendered r))))
+    (render-content! r))
+  (when (= property :font)
+    (render-content! r)))
+
+(defn rich-text
+  "Rich text: (rich-text {:content [[:h2 \"Result\"] [:p \"Call \" [:code \"(f 1)\"]]]
+:on-link-activated f}). Blocks are :h1 to :h6, :p, :ul and :ol (of :li, which may hold
+blocks after their text), :pre (code) and :table (of :tr, of :th and :td); inline, :b, :i,
+:code and [:a {:href url} ...]. An element's second item may be a map of attributes."
+  ([] (rich-text {}))
+  ([opts] (build rich-text-widget opts nil)))
+
+(defn append-content!
+  "Add blocks to the end of the rich text's content, as an answer streams in: only they
+are rendered. Returns the rich text."
+  [r blocks]
+  (let [blocks (vec blocks)
+        start (text-length r)
+        {:keys [text runs links]} (render-rich-text blocks (rich-opts r) start)
+        content (into (vec (:content r)) blocks)]
+    (insert-into-buffer! (:buffer r) start text)
+    (replace-text-runs! r start (text-length r) runs)
+    (update-slot! r :links into links)
+    (set-slot! r :rendered content)
+    (set-slot! r :content content)
+    (show-links! r)
+    r))
+
+(defn link-at
+  "[start end href] of the rich text's link at position, or nil."
+  [r position]
+  (first (filter (fn [[s e _]] (and (<= s position) (< position e))) (:links r))))
+
+(defn link-clicked-by-user!
+  "Backends call this when the user clicked the rich text's character at position: if it
+is in a link, it emits :link-activated. Returns the event, or nil."
+  [r position]
+  (when-let [[s e href] (link-at r position)]
+    (emit! r (event-for r :link-activated :href href :text (buffer-text (:buffer r) s e)))))
+
+(defmethod handle-event :after [(r rich-text-widget) (e mouse-event)]
+  ;; A click (no drag) on a link; where the platform's text view has links of its own,
+  ;; the backend reports them instead.
+  (when (and (= :mouse-up (:signal e)) (= :left (:button e)) (<= (:click-count e) 1)
+             (not (consumed? e)) (selection-empty? r)
+             (not (backend-native-links? (current-backend))))
+    (let [p (position-at-point r (:x e) (:y e))
+          [px _ _] (point-at-position r p)]
+      ;; The character clicked: the one before the caret's place if the click was left of it.
+      (link-clicked-by-user! r (if (and (pos? p) (< (:x e) px)) (dec p) p)))))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Web views: an embedded browser, the platform's engine (WKWebView, WebKitGTK), with

@@ -52,6 +52,13 @@ pickers, frames, notebooks, stacks, tabbed panes (closable, reorderable tabs tha
 between panes), split panes, scrolled windows, canvases, popovers, completion popups, and
 code views on shared text buffers (undo, styled runs, line numbers).
 
+For Skein Studio (Skein's M3.6, D-108) it adds rich text from Hiccup data
+(`ui/rich-text`, with `append-content!` and `:link-activated`), runs with fonts and
+paragraphs (`:size`, `:family`, `:indent`, `:first-indent`, `:space-above`,
+`:space-below`, `:block-background`, `:tabs`), editable table cells (`:editable`
+columns, `:cell-edited`), the row and cell at a point (`item-at-point`,
+`cell-at-point`) and window snapshots (`snapshot`, as PNG bytes or a file).
+
 - **Backends:** `skein.ui.cocoa` (AppKit, on macOS), `skein.ui.gtk` (GTK 4, on Linux, and
   on macOS with Homebrew's `gtk4`) and `skein.ui.headless` (no screen, for tests). Win32
   comes next.

@@ -205,6 +205,7 @@ and all of them run on the main thread, which no fiber waits to share."
 (ffi/defcfun ^:blocking send-ll-rect "objc_msgSend" ns-rect [self ptr, sel ptr, a i64, b i64])
 (ffi/defcfun ^:blocking send-ll-void "objc_msgSend" void [self ptr, sel ptr, a i64, b i64])
 (ffi/defcfun ^:blocking send-plp "objc_msgSend" ptr [self ptr, sel ptr, a ptr, n i64, b ptr])
+(ffi/defcfun ^:blocking send-ppl-bool "objc_msgSend" bool [self ptr, sel ptr, a ptr, b ptr, n u64])
 (ffi/defcfun ^:blocking send-range-range "objc_msgSend" ns-range [self ptr, sel ptr, r ns-range])
 (ffi/defcfun ^:blocking send-ldp "objc_msgSend" ptr [self ptr, sel ptr, n i64, d f64, p ptr])
 (ffi/defcfun ^:blocking send-dll-void "objc_msgSend" void [self ptr, sel ptr, d f64, a i64, b i64])

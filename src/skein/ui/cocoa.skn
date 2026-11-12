@@ -126,6 +126,14 @@ button the mouse button, event the NSEvent.")
         (when-not (:state-transition w)
           (ui/state-changed-by-user! w (ui/backend-window-state (ui/current-backend) w)))))))
 
+(defgeneric native-link-clicked [w units]
+  "The user clicked a link of w's text view at units (UTF-16) into its text.")
+
+(ffi/defcallback link-clicked-imp bool [self ptr, cmd ptr, tv ptr, link ptr, units u64]
+  (if-let [w (objc/object-for tv)]
+    (boolean (native-link-clicked w units))
+    false))
+
 (ffi/defcallback text-changed-imp void [self ptr, cmd ptr, note ptr]
   (let [field (objc/send note (objc/sel "object"))]
     (when-let [w (objc/object-for field)]
@@ -403,6 +411,7 @@ consumed it (defined below).")
                         "B@:@{CGRect={CGPoint=dd}{CGSize=dd}}"]])
   (objc/define-class! "SkeinTextDelegate" "NSObject"
                       [["controlTextDidChange:" text-changed-imp "v@:@"]
+                       ["textView:clickedOnLink:atIndex:" link-clicked-imp "B@:@@Q"]
                        ["textDidChange:" text-changed-imp "v@:@"]
                        ["comboBoxSelectionDidChange:" selection-imp "v@:@"]
                        ["splitViewDidResizeSubviews:" selection-imp "v@:@"]
@@ -2718,6 +2727,10 @@ text answer and clicks OK, or clicks Cancel for nil; a file chooser is cancelled
         (instance? ui/text-view-widget w) (text-view-of w)
         :else (view w)))
 
+(def ^:private point-target
+  "The view a widget's mouse points are in: its menu target's, or a code view's text view,
+whose content position-at-point takes (defined with code views).")
+
 (defmethod set-native [(w ui/widget) (p (= :context-menu)) m]
   ;; A combo box's NSPopUpButton keeps its items in its menu: leave that alone.
   (when-not (instance? ui/combo-box-widget w)
@@ -2798,7 +2811,7 @@ a widget with input signals other than a canvas, which handles its own."
                                     (objc/sel "superview"))
               hit (objc/send-pt frame-view (objc/sel "hitTest:") point)]
           (when-let [w (widget-of-view hit true)]
-            (let [p (objc/send-point-p (menu-target w) (objc/sel "convertPoint:fromView:") point
+            (let [p (objc/send-point-p (point-target w) (objc/sel "convertPoint:fromView:") point
                                        (ffi/null))
                   x (ffi/field p objc/ns-point :x)
                   y (ffi/field p objc/ns-point :y)
@@ -3882,6 +3895,9 @@ that report the user's changes ignore it."
 (defn- parts [w] (get @code-parts (ffi/address (view w))))
 (defn- code-text-view [w] (:inner (parts w)))
 
+(defn- point-target [w]
+  (if (instance? ui/code-view-widget w) (code-text-view w) (menu-target w)))
+
 (defn- u16 [w position] (ui/buffer-utf16-position (:buffer w) position))
 (defn- from-u16 [w units] (ui/buffer-position-from-utf16 (:buffer w) units))
 
@@ -4393,6 +4409,52 @@ block (NSTextBlock) the text view's whole width for a background."
                        (objc/ns-string "NSParagraphStyle") (paragraph-style a)
                        (objc/send-range-range text (objc/sel "paragraphRangeForRange:") r)))))
                 (objc/send-void storage (objc/sel "endEditing")))))))))))
+
+;;; Rich text's links: the text storage's own (NSLinkAttributeName), which AppKit shows
+;;; with a pointing hand and reports clicks on (textView:clickedOnLink:atIndex:).
+
+(defmethod ui/backend-native-links? [(b cocoa-backend)] true)
+
+(defmethod ui/backend-show-links [(b cocoa-backend) w links]
+  (defer-native!
+   (fn []
+     (when-not (:destroyed w)
+       (let [storage (objc/send (code-text-view w) (objc/sel "textStorage"))
+             n (ui/text-length w)]
+         (pushing!
+          (fn []
+            (objc/send-void storage (objc/sel "beginEditing"))
+            (objc/send-prange-void storage (objc/sel "removeAttribute:range:")
+                                   (objc/ns-string "NSLink") {:location 0 :length (u16 w n)})
+            (doseq [[i [s e _]] (map-indexed vector links)]
+              (let [x (u16 w (min s n))]
+                (objc/send-pprange-void storage (objc/sel "addAttribute:value:range:")
+                                        (objc/ns-string "NSLink") (objc/ns-string (str i))
+                                        {:location x :length (- (u16 w (min e n)) x)})))
+            (objc/send-void storage (objc/sel "endEditing")))))))))
+
+(defmethod native-link-clicked [(w ui/rich-text-widget) units]
+  (some? (ui/link-clicked-by-user! w (from-u16 w units))))
+
+(defmethod native-link-clicked [w units] false)
+
+(defn click-link!
+  "For tests: tell the rich text's text view its link at position was clicked, as AppKit
+does."
+  [w position]
+  (let [tv (code-text-view w)]
+    (objc/send-ppl-bool (objc/send tv (objc/sel "delegate"))
+                        (objc/sel "textView:clickedOnLink:atIndex:")
+                        tv (objc/ns-string "") (u16 w position))))
+
+(defn link-at-native
+  "For tests: the NSLink attribute's value at position in the code view's text storage, or
+nil."
+  [w position]
+  (let [v (objc/send-plp (objc/send (code-text-view w) (objc/sel "textStorage"))
+                         (objc/sel "attribute:atIndex:effectiveRange:")
+                         (objc/ns-string "NSLink") (u16 w position) (ffi/null))]
+    (when-not (ffi/null? v) (objc/string-of v))))
 
 ;;; The pointer over the text, and the placeholder
 

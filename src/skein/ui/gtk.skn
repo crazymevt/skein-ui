@@ -2737,9 +2737,14 @@ colors, the palette's text and background colors, a container's surface or backg
   "The addresses of the GTK widgets that have a click gesture of ours."
   (atom #{}))
 
+(def ^:private input-gestures
+  "A GTK widget's address -> the click gesture of ours on it, for tests."
+  (atom {}))
+
 (defn- add-click-gesture! [w target button]
   (when-not (contains? @right-clickable (ffi/address target))
     (let [g (lib/gesture-click-new)]
+      (swap! input-gestures assoc (ffi/address target) g)
       (lib/gesture-single-set-button g button)
       (lib/controller-set-phase g 1)   ; capture: before the widget's own
       (lib/register! g w)
@@ -2770,8 +2775,22 @@ colors, the palette's text and background colors, a container's surface or backg
       (ui/emit! w e))
     (ui/consumed? e)))
 
+(defn- content-point
+  "A code view's point in its text view (the widget's own), in its content: the buffer's
+coordinates, as position-at-point takes."
+  [w x y]
+  (ffi/with-foreign [bx (ffi/alloc i32 1)]
+    (ffi/with-foreign [by (ffi/alloc i32 1)]
+      ;; GTK_TEXT_WINDOW_WIDGET 1
+      (lib/text-view-window-to-buffer-coords (text-view-of w) 1 (int x) (int y) bx by)
+      [(ffi/get bx i32) (ffi/get by i32)])))
+
 (defmethod native-input [(w ui/widget) kind controller args]
   (let [mods (modifiers-of (lib/controller-current-state controller))
+        ;; A code view's clicks are in its content, as its geometry is.
+        args (if (and (instance? ui/code-view-widget w) (contains? args :x))
+               (let [[x y] (content-point w (:x args) (:y args))] (assoc args :x x :y y))
+               args)
         input (contains? (ui/signals w) :key-down)]
     (case kind
       (:pressed :released)
@@ -3538,7 +3557,9 @@ which has it already."
   (show-buffer-text! w))
 
 (defmethod set-native [(w ui/code-view-widget) (p (= :editable)) v]
-  (lib/text-view-set-editable (text-view-of w) (boolean v)))
+  (lib/text-view-set-editable (text-view-of w) (boolean v))
+  ;; No caret in text the user can only read, as AppKit shows none.
+  (lib/text-view-set-cursor-visible (text-view-of w) (boolean v)))
 
 (defmethod set-native [(w ui/code-view-widget) (p (= :wrap)) v]
   (lib/text-view-set-wrap-mode (text-view-of w) (if v 3 0)))
@@ -3697,6 +3718,11 @@ which has it already."
                          {:font (:font w) :align :right
                           :color (ui/widget-color w (if (= line current) :text :gutter-text))}))))))
 
+(defn- left-margin
+  "The GTK left margin of a run's paragraph attributes: where its leftmost line starts."
+  [attrs]
+  (+ (or (:indent attrs) 0) (min 0 (or (:first-indent attrs) 0))))
+
 (defn- tag-for [w attrs]
   (or (get-in (code-parts-of w) [:tags attrs])
       (let [tag (lib/text-tag-new (ffi/null))
@@ -3712,7 +3738,10 @@ which has it already."
           (lib/g-object-set-string tag "family" (case f :system "Sans" :monospace "Monospace" f)
                                    (ffi/null)))
         ;; A paragraph's: GTK takes them from the tags at each line's start.
-        (when-let [x (:indent attrs)] (set-int "left-margin" x))
+        ;; A negative indent in Pango hangs the lines after the first, so a first line
+        ;; pulled left starts the margin, and the others hang from it.
+        (when (or (:indent attrs) (:first-indent attrs))
+          (set-int "left-margin" (left-margin attrs)))
         (when-let [x (:first-indent attrs)] (set-int "indent" x))
         (when-let [x (:space-above attrs)] (set-int "pixels-above-lines" x))
         (when-let [x (:space-below attrs)] (set-int "pixels-below-lines" x))
@@ -3721,7 +3750,9 @@ which has it already."
         (when-let [tabs (:tabs attrs)]
           (let [array (lib/pango-tab-array-new (count tabs) true)]
             (doseq [[i t] (map-indexed vector tabs)]
-              (lib/pango-tab-array-set-tab array i 0 (int (math/round t))))   ; PANGO_TAB_LEFT
+              ;; Pango's stops are from the left margin; a run's, from the text's left edge.
+              (lib/pango-tab-array-set-tab array i 0                             ; PANGO_TAB_LEFT
+                                           (max 1 (int (math/round (- t (left-margin attrs)))))))
             (lib/g-object-set-pointer tag "tabs" array (ffi/null))
             (lib/pango-tab-array-free array)))
         (lib/text-tag-table-add (lib/text-buffer-get-tag-table (code-buffer w)) tag)
@@ -3786,6 +3817,21 @@ which has it already."
   "Type s at the code view's GtkTextView cursor, as the keyboard does."
   [w s]
   (lib/text-buffer-insert-at-cursor (code-buffer w) s -1))
+
+(defn click-code-position!
+  "Click the code view's text a little inside the character at position, as GTK's click
+gesture reports a click: pressed, then released."
+  [w position]
+  (let [tv (text-view-of w)
+        [x y _] (ui/backend-code-point-at-position (ui/current-backend) w position)]
+    (ffi/with-foreign [wx (ffi/alloc i32 1)]
+      (ffi/with-foreign [wy (ffi/alloc i32 1)]
+        ;; GTK_TEXT_WINDOW_WIDGET 1: from the content to the text view's own
+        (lib/text-view-buffer-to-window-coords tv 1 (+ x 2) (+ y 4) wx wy)
+        (let [g (get @input-gestures (ffi/address tv))]
+          (doseq [signal ["pressed" "released"]]
+            (lib/g-signal-emit-press g signal 1 (f64 (ffi/get wx i32)) (f64 (ffi/get wy i32))
+                                     (ffi/null))))))))
 
 (defn code-tag-attributes
   "The attributes of the code view's tags at position, merged: what GTK shows there."

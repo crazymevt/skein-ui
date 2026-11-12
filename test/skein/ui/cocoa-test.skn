@@ -269,6 +269,44 @@
       (is (= [1 "Name" "Bobby"] (last @seen))))
     (ui/close! w)))
 
+(deftest rich-text
+  ;; Skein's M3.6, D-108.
+  (let [seen (atom [])
+        r (ui/rich-text {:content [[:h2 "Result"]
+                                   [:p "Call " [:code "(f 1)"] " or see "
+                                    [:a {:href "https://x.test"} "the docs"] "."]
+                                   [:ul [:li "one"] [:li "two"]]
+                                   [:pre "(defn f [x]\n  x)"]
+                                   [:table [:tr [:th "Name"] [:th "Age"]]
+                                           [:tr [:td "Ada"] [:td "36"]]]]
+                         :on-link-activated (fn [e] (swap! seen conj (:href e)))})
+        w (ui/window {:width 400 :height 300} r)
+        text (fn [] (ui/code-text r))
+        at (fn [s] (string/index-of (text) s))]
+    (ui/show! w)
+    (cocoa/run-for! 0.05)
+    (is (= (text) (cocoa/native-code-text r)))
+    (testing "headings, code, lists and tables in the text storage"
+      (is (= 19.5 (:size (cocoa/code-text-attributes r 0))))
+      (is (:monospace (cocoa/code-text-attributes r (at "(f 1)"))))
+      (is (not (:monospace (cocoa/code-text-attributes r (at "Call")))) "proportional text")
+      (is (= [24.0 -18.0] ((juxt :indent :first-indent) (cocoa/code-text-attributes r (at "one")))))
+      (is (:block-background (cocoa/code-text-attributes r (at "(defn"))))
+      (is (= 1 (count (:tabs (cocoa/code-text-attributes r (at "Ada")))))))
+    (testing "links are AppKit's, and their clicks are reported"
+      (is (= "0" (cocoa/link-at-native r (+ 2 (at "the docs")))))
+      (is (nil? (cocoa/link-at-native r (at "Call"))))
+      (is (cocoa/click-link! r (+ 2 (at "the docs"))))
+      (is (= ["https://x.test"] @seen)))
+    (testing "appending"
+      (ui/append-content! r [[:p "More, " [:a {:href "u2"} "there"]]])
+      (cocoa/run-for! 0.05)
+      (is (= (text) (cocoa/native-code-text r)))
+      (is (= "1" (cocoa/link-at-native r (+ 1 (at "there")))))
+      (cocoa/click-link! r (+ 1 (at "there")))
+      (is (= ["https://x.test" "u2"] @seen)))
+    (ui/close! w)))
+
 (deftest rows-at-points-and-snapshots
   ;; Skein's M3.6, D-108.
   (let [l (ui/list-box {:items ["a" "b" "c"]})
