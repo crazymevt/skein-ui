@@ -535,7 +535,9 @@
         (ui/show-completion-popup! c v {:items ["cab" "car" "cat"]})
         (gtk/settle!)
         (is (gtk/native-surface-shown? c))
-        (is (identical? v (ui/focused-widget)) "the view keeps the keyboard")
+        ;; The window's own focus: on macOS another application may be in front, and
+        ;; then no window is active and focused-widget is nil.
+        (is (identical? v (gtk/native-focus w)) "the view keeps the keyboard")
         (ui/close-surface! c)
         (gtk/settle!)
         (is (not (gtk/native-surface-shown? c)))))

@@ -2836,6 +2836,12 @@ coordinates, as position-at-point takes."
   (when-let [win (ui/backend-active-window b)]
     (widget-of-gtk (lib/root-get-focus (native win)))))
 
+(defn native-focus
+  "The widget that has the keyboard in the window w, or will when w is active: GTK's
+focus widget, which focused-widget gives only for the active window."
+  [w]
+  (widget-of-gtk (lib/root-get-focus (native w))))
+
 ;;; ------------------------------------------------------------------------------------
 ;;; Windows' options and modal runs
 
