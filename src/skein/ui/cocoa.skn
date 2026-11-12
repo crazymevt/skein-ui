@@ -66,6 +66,9 @@ widgets made of several views, such as a spin button.")
 (defgeneric native-double-action [w sender]
   "The user double-clicked a row of w's table or outline view.")
 
+(defgeneric native-cell-edited [w field]
+  "The user finished editing the text field of a cell of w's table view.")
+
 (defgeneric native-column-clicked [w column]
   "The user clicked the title of column, an NSTableColumn of w's table.")
 
@@ -174,6 +177,13 @@ the user drags it to another place."
 (ffi/defcallback double-action-imp void [self ptr, cmd ptr, sender ptr]
   (when-let [w (objc/object-for sender)]
     (native-double-action w sender)))
+
+(ffi/defcallback cell-edited-imp void [self ptr, cmd ptr, field ptr]
+  ;; The field's table view is the first view it is in that stands for a widget.
+  (when-let [w (loop [v (objc/send field (objc/sel "superview"))]
+                 (when-not (ffi/null? v)
+                   (or (objc/object-for v) (recur (objc/send v (objc/sel "superview"))))))]
+    (native-cell-edited w field)))
 
 (ffi/defcallback column-clicked-imp void [self ptr, cmd ptr, tv ptr, col ptr]
   (when-let [w (objc/object-for tv)]
@@ -358,6 +368,7 @@ consumed it (defined below).")
   (objc/define-class! "SkeinWaker" "NSObject" [["drain:" drain-imp "v@:@"]])
   (objc/define-class! "SkeinTarget" "NSObject" [["action:" action-imp "v@:@"]
                                                 ["doubleAction:" double-action-imp "v@:@"]
+                                                ["cellEdited:" cell-edited-imp "v@:@"]
                                                 ["timerFired:" timer-fired-imp "v@:@"]
                                                 ["quitAction:" quit-imp "v@:@"]
                                                 ["autoAnswer:" auto-answer-imp "v@:@"]])
@@ -1638,6 +1649,33 @@ NSTableColumn."
 (defmethod native-natural-size [(t ui/table-view-widget)]
   [(max 160 (reduce + 0 (map (fn [c] (or (:width c) 100)) (:columns t)))) 120])
 
+(defmethod native-cell-edited [(t ui/table-view-widget) field]
+  ;; Report the edit, then show the cell's text from :items, which a handler may have set.
+  (let [tv (table-of t)
+        row (objc/send-p-long tv (objc/sel "rowForView:") field)
+        col (objc/send-p-long tv (objc/sel "columnForView:") field)]
+    (when (and (>= row 0) (>= col 0))
+      (let [index (column-index tv (objc/send-l (objc/send tv (objc/sel "tableColumns"))
+                                                (objc/sel "objectAtIndex:") col))]
+        (ui/cell-edited-by-user! t row index
+                                 (objc/string-of (objc/send field (objc/sel "stringValue"))))
+        (when (< row (count (:items t)))
+          (objc/send-p-void field (objc/sel "setStringValue:")
+                            (objc/ns-string (native-cell-text t row index))))))))
+
+(defmethod native-double-action [(t ui/table-view-widget) tv]
+  ;; A double-click on an editable cell edits it; elsewhere it activates the row.
+  (let [row (objc/send-long tv (objc/sel "clickedRow"))
+        col (objc/send-long tv (objc/sel "clickedColumn"))
+        index (when (>= col 0)
+                (column-index tv (objc/send-l (objc/send tv (objc/sel "tableColumns"))
+                                              (objc/sel "objectAtIndex:") col)))]
+    (if (and (>= row 0) index (:editable (get (vec (:columns t)) index)))
+      (objc/send-llpb-void tv (objc/sel "editColumn:row:withEvent:select:") col row (ffi/null) true)
+      (let [row (activated-row tv)]
+        (when (>= row 0)
+          (ui/row-activated-by-user! t row 2))))))
+
 (defmethod native-column-clicked [(t ui/table-view-widget) col]
   (ui/column-clicked-by-user! t (column-index (table-of t) col)))
 
@@ -2523,6 +2561,28 @@ table's or tree's view, as its mouse events give points."
   (let [r (objc/send-ll-rect (table-of w) (objc/sel "frameOfCellAtColumn:row:") column row)]
     [(+ (ffi/field r objc/ns-rect :x) (/ (ffi/field r objc/ns-rect :width) 2))
      (+ (ffi/field r objc/ns-rect :y) (/ (ffi/field r objc/ns-rect :height) 2))]))
+
+(defn- cell-field [w row column]
+  (objc/send (objc/send-llb (table-of w) (objc/sel "viewAtColumn:row:makeIfNecessary:")
+                            column row true)
+             (objc/sel "textField")))
+
+(defn cell-editable?
+  "Whether AppKit lets the user edit the cell at row and column (a place in the view)."
+  [w row column]
+  (objc/call-with-pool (fn [] (objc/send-bool (cell-field w row column) (objc/sel "isEditable")))))
+
+(defn edit-cell-natively!
+  "Edit a table's cell at row and column (a place in the view) to text, as the user does:
+start editing it, type the text over it and press Return."
+  [t row column text]
+  (let [tv (table-of t)]
+    (objc/send-llpb-void tv (objc/sel "editColumn:row:withEvent:select:")
+                         column row (ffi/null) true)
+    (let [editor (objc/send (cell-field t row column) (objc/sel "currentEditor"))]
+      (when (ffi/null? editor) (error "AppKit didn't start editing the cell"))
+      (objc/send-p-void editor (objc/sel "setString:") (objc/ns-string text))
+      (objc/send-p-void editor (objc/sel "insertNewline:") (ffi/null)))))
 
 (defn move-column-natively!
   "Drag a table's column from one place to another, as the user would."
@@ -4407,6 +4467,16 @@ selection."
                       (objc/rect offset (max 0 (/ (- height 17) 2)) (max 0 (- width offset 2)) 17))
     (objc/send-p-void label (objc/sel "setStringValue:") (objc/ns-string (str text)))
     (objc/send-l-void label (objc/sel "setAlignment:") (text-alignment (or alignment :left)))
+    ;; Cells are reused across columns: each is editable as its column says, and tells the
+    ;; target when editing ends.
+    (let [editable (and (instance? ui/table-view-widget w)
+                        (boolean (:editable (get (vec (:columns w)) index))))]
+      (objc/send-b-void label (objc/sel "setEditable:") editable)
+      (when editable
+        (objc/send-p-void label (objc/sel "setTarget:") (:target (ui/current-backend)))
+        (objc/send-p-void label (objc/sel "setAction:") (objc/sel "cellEdited:"))
+        (objc/send-b-void (objc/send label (objc/sel "cell"))
+                          (objc/sel "setSendsActionOnEndEditing:") true)))
     (objc/send-r-void icon (objc/sel "setFrame:") (objc/rect (max 0 icon-x) (/ (- height 16) 2) 16 16))
     ;; A reused cell is cleared when there is no icon.
     (objc/send-p-void icon (objc/sel "setImage:") (ns-image image))

@@ -60,6 +60,36 @@
     (is (thrown-with-msg? error "has rows at points"
                           (ui/item-at-point (ui/button {:label "B"}) 0 0)))))
 
+(deftest editing-cells
+  (let [seen (atom [])
+        name-col (ui/column "Name" :name {:editable true})
+        age-col (ui/column "Age" :age)
+        rows [{:id 1 :name "Ann" :age 30} {:id 2 :name "Bob" :age 40}]
+        t (ui/table-view {:columns [name-col age-col] :items rows
+                          :on-cell-edited (fn [e] (swap! seen conj e))})]
+    (testing "an edit is reported, and the items stay as they were"
+      (let [e (headless/edit-cell! t 1 0 "Robert")]
+        (is (= [e] @seen))
+        (is (= {:id 2 :name "Bob" :age 40} (:item e)))
+        (is (= 1 (:index e)))
+        (is (identical? name-col (:column e)))
+        (is (= "Robert" (:text e)))
+        (is (= rows (:items t)) "the program saves it")))
+    (testing "leaving the text as it was is no edit"
+      (is (nil? (headless/edit-cell! t 0 0 "Ann")))
+      (is (= 1 (count @seen))))
+    (testing "only editable columns"
+      (is (thrown-with-msg? error "isn't :editable" (headless/edit-cell! t 0 1 "31"))))
+    (testing "a handler that saves the text"
+      (ui/on t :cell-edited
+             (fn [e] (set-slot! t :items (mapv (fn [r] (if (= r (:item e))
+                                                         (assoc r :name (:text e))
+                                                         r))
+                                               (:items t)))))
+      (headless/edit-cell! t 0 0 "Anne")
+      (is (= ["Anne" "Bob"] (mapv :name (:items t))))
+      (is (= "Anne" (ui/table-cell-text t 0 0))))))
+
 (defn- png-size [png]
   (let [u32 (fn [i] (reduce (fn [n k] (+ (* n 256) (aget png (+ i k)))) 0 (range 4)))]
     [(u32 16) (u32 20)]))

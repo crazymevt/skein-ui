@@ -208,6 +208,14 @@ in a tree), :click-count the clicks (0 from the keyboard)."
   (column :init nil)
   (index :init nil))
 
+(defclass cell-edit-event [event]
+  "The user edited a table's cell: :item is the row's item, :index its row, :column the
+column and :text what the user left in the cell."
+  (item :init nil)
+  (index :init nil)
+  (column :init nil)
+  (text :init ""))
+
 (defclass draw-event [event]
   "A canvas needs drawing: draw with :context, a graphics context of :width by :height,
 during the handler."
@@ -2340,19 +2348,20 @@ without regard to case, then anything else by its printed form."
 of the row), :format (a function from that value to its text), :width (pixels, or nil to
 share the width left), :alignment (:left, :center or :right), :sort (a comparator, or
 nil if the column can't sort the table) and :icon-fn (a function from the row to an image
-or nil)."
+or nil). In a table, :editable lets the user edit its cells (:cell-edited)."
   (title :init "")
   (key :init identity)
   (format :init str)
   (width :init nil)
   (alignment :init :left)
   (sort :init compare-values)
-  (icon-fn :init nil))
+  (icon-fn :init nil)
+  (editable :init false))
 
 (defn column
   "A table column titled title whose cells show (key row): key is a function, a keyword
 (read from a map row) or an integer (an index into a vector row). opts are the column's
-:width, :alignment, :format, :sort and :icon-fn."
+:width, :alignment, :format, :sort, :icon-fn and :editable."
   ([title key] (column title key {}))
   ([title key opts]
    (apply make table-column :title title
@@ -2381,7 +2390,10 @@ Backends call it with the item itself, not a row number."
 (defclass table-view-widget [list-box-widget]
   "Rows of items shown in columns: :items are the rows, and each of :columns (made with
 column) says what to show of a row. Clicking a column title emits :column-clicked (a
-column-event) and, when :sortable, sorts the rows by that column."
+column-event) and, when :sortable, sorts the rows by that column. The user edits the cells
+of :editable columns (a double-click, or a click in a selected row): when they finish with
+the text changed, the table emits :cell-edited (a cell-edit-event). It doesn't change its
+items: a handler saves the text and sets :items, or the cell shows the old text again."
   (columns :cell :atom :init [])
   (headers :cell :atom :init true :doc "Whether to show the column titles.")
   (sortable :cell :atom :init true :doc "Whether clicking a column title sorts by it.")
@@ -2392,7 +2404,8 @@ column-event) and, when :sortable, sorts the rows by that column."
 (declare-widget! table-view-widget {:properties [:columns :headers :sort-column
                                                  :sort-descending]
                                     :layout [:columns]
-                                    :signals {:column-clicked column-event}})
+                                    :signals {:column-clicked column-event
+                                              :cell-edited cell-edit-event}})
 
 (defn table-view
   "A table: (table-view {:columns [(column \"Name\" :name)] :items rows})."
@@ -2431,6 +2444,16 @@ selected. Returns the table."
   (let [col (:column e)]
     (when (and (:sortable t) (:sort col))
       (sort-table! t col (and (identical? col (:sort-column t)) (not (:sort-descending t)))))))
+
+(defn cell-edited-by-user!
+  "Backends call this when the user finished editing the table's cell at row and
+column-index, leaving text in it: it emits :cell-edited if the text changed. Backends then
+show the cell's text from :items again. Returns the event, or nil."
+  [t row column-index text]
+  (let [col (get (vec (:columns t)) column-index)]
+    (when (and col (:editable col) (not= text (table-cell-text t row column-index)))
+      (emit! t (event-for t :cell-edited :item (get (vec (:items t)) row) :index row
+                          :column col :text text)))))
 
 (defn column-clicked-by-user!
   "Backends call this when the user clicked the title of the table's column at index.

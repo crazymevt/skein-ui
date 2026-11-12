@@ -91,7 +91,7 @@ with args, a map.")
    :close-request :position :sort :items-changed :pressed :released :motion :enter :leave
    :scroll :key-pressed :key-released :window-key :closed :menu-activate :active
    :page-reordered :tab-close :mark-set :window-state :load-changed :script-message
-   :context-message :web-terminated])
+   :context-message :web-terminated :cell-editing])
 
 (defn- kind-of [data] (nth signal-kinds (ffi/address data)))
 
@@ -1451,13 +1451,22 @@ skein.ui image, or null for nil."
 (defmethod make-native [(l ui/list-box-widget)] (make-list-native l))
 (defmethod make-native [(t ui/tree-view-widget)] (make-list-native t))
 
+(defn- editable-column? [w column]
+  (and (instance? ui/table-view-widget w) (boolean (:editable (get (columns-of w) column)))))
+
 (defmethod setup-cell [w column list-item]
-  ;; A box of the row's icon (hidden without one) and its label.
-  (let [label (lib/label-new "")
+  ;; A box of the row's icon (hidden without one) and its label: an editable label in an
+  ;; :editable column of a table, which reports the end of each edit.
+  (let [editable (editable-column? w column)
+        label (if editable (lib/editable-label-new "") (lib/label-new ""))
         icon (lib/image-new)
         box (lib/box-new 0 4)
         c (get (columns-of w) column)]
-    (lib/label-set-xalign label (f32 (xalign (:alignment c))))
+    (if editable
+      (do (lib/editable-set-alignment label (f32 (xalign (:alignment c))))
+          (lib/register! label w)
+          (connect! label "notify::editing" :cell-editing signal-arg-imp))
+      (lib/label-set-xalign label (f32 (xalign (:alignment c)))))
     (lib/widget-set-hexpand label true)
     (lib/image-set-pixel-size icon 16)
     (lib/widget-set-visible icon false)
@@ -1499,7 +1508,9 @@ skein.ui image, or null for nil."
               child)
         [icon label] (lib/children-of box)
         image (ui/row-icon w (cell-item w list-item) column)]
-    (lib/label-set-text label text)
+    (if (editable-column? w column)
+      (lib/editable-set-text label text)
+      (lib/label-set-text label text))
     (lib/image-set-from-paintable icon (texture image))
     (lib/widget-set-visible icon (some? image))
     (swap! icon-cells (if image conj disj)
@@ -1563,6 +1574,17 @@ skein.ui image, or null for nil."
                                          same))
                                (range (lib/list-model-n-items cols))))]
           (when i (ui/column-clicked-by-user! t i)))))))
+
+(defmethod native-signal [(t ui/table-view-widget) (k (= :cell-editing)) label arg]
+  ;; Editing ended: report it, then show the text from :items, which a handler may have set.
+  (when-not (lib/editable-label-get-editing label)
+    (when-let [[list-item column] (get @cell-widgets (ffi/address (lib/widget-get-parent label)))]
+      (let [row (lib/list-item-get-position list-item)]
+        (when (< row (n-rows t))
+          (ui/cell-edited-by-user! t row column (or (lib/editable-get-text label) ""))
+          (let [row (lib/list-item-get-position list-item)]
+            (when (< row (n-rows t))
+              (lib/editable-set-text label (ui/table-cell-text t row column)))))))))
 
 ;;; Trees
 
@@ -2505,6 +2527,31 @@ view, as its mouse events give points, or nil if none shows there."
                  (when-let [[x y cw ch] (lib/bounds-in n view)]
                    [(+ x (/ cw 2)) (+ y (/ ch 2))]))))
            (widgets view)))))
+
+(defn- cell-label
+  "The label GTK shows at row and column of a list box's, table's or tree's view, or nil."
+  [w row column]
+  (let [widgets (fn walk [n] (cons n (mapcat walk (lib/children-of n))))]
+    (first (keep (fn [n]
+                   (when-let [[list-item c] (get @cell-widgets (ffi/address n))]
+                     (when (and (= c column) (= row (lib/list-item-get-position list-item)))
+                       (let [box (if (and (tree? w) (= column 0)) (first (lib/children-of n)) n)]
+                         (second (lib/children-of box))))))
+                 (widgets (view-of w))))))
+
+(defn cell-editable?
+  "Whether the user can edit the cell GTK shows at row and column."
+  [w row column]
+  (= "GtkEditableLabel" (lib/type-name-of (cell-label w row column))))
+
+(defn edit-cell-natively!
+  "Edit a table's cell at row and column to text, as the user does: start editing it,
+type the text over it and press Return."
+  [t row column text]
+  (let [label (cell-label t row column)]
+    (lib/editable-label-start-editing label)
+    (lib/editable-set-text label text)
+    (lib/editable-label-stop-editing label true)))
 
 (defn select-rows-natively!
   "Select rows in a list box's, table's or tree's view, as the user does."

@@ -214,6 +214,33 @@
       (is (= ["main.skn"] (:selection tree))))
     (ui/close! w)))
 
+(deftest editing-cells
+  ;; Skein's M3.6, D-108.
+  (let [seen (atom [])
+        name-col (ui/column "Name" :name {:editable true})
+        age-col (ui/column "Age" :age)
+        t (ui/table-view {:columns [name-col age-col]
+                          :items [{:name "Ada" :age 36} {:name "Bob" :age 7}]
+                          :on-cell-edited (fn [e] (swap! seen conj [(:index e) (:title (:column e))
+                                                                    (:text e)]))})
+        w (ui/window {:width 300 :height 200} t)]
+    (ui/show! w)
+    (gtk/run-for! 0.3)
+    (is (gtk/cell-editable? t 0 0))
+    (is (not (gtk/cell-editable? t 0 1)))
+    (testing "an edit is reported; the cell shows :items again"
+      (gtk/edit-cell-natively! t 1 0 "Robert")
+      (is (= [[1 "Name" "Robert"]] @seen))
+      (is (= "Bob" (gtk/cell-string t 1 0))))
+    (testing "a handler that saves it"
+      (ui/on t :cell-edited
+             (fn [e] (set-slot! t :items (assoc-in (vec (:items t)) [(:index e) :name] (:text e)))))
+      (gtk/edit-cell-natively! t 0 0 "Augusta")
+      (gtk/run-for! 0.3)
+      (is (= "Augusta" (:name (first (:items t)))))
+      (is (= "Augusta" (gtk/cell-string t 0 0))))
+    (ui/close! w)))
+
 (deftest rows-at-points-and-snapshots
   ;; Skein's M3.6, D-108.
   (let [l (ui/list-box {:items ["a" "b" "c"]})

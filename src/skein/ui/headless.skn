@@ -487,6 +487,14 @@ event."
   [t index]
   (ui/column-clicked-by-user! t index))
 
+(defn edit-cell!
+  "Edit the table's cell at row and column-index to text, as the user would: only an
+:editable column's. Returns the :cell-edited event, or nil if the text didn't change."
+  [t row column-index text]
+  (when-not (:editable (get (vec (:columns t)) column-index))
+    (error "the user can't edit a cell of a column that isn't :editable"))
+  (ui/cell-edited-by-user! t row column-index text))
+
 (defn open-item!
   "Open (expanded true) or close the tree's item, as the user would."
   [tree item expanded]

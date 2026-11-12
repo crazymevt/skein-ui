@@ -178,6 +178,13 @@ hasn't placed it."
 (ffi/defcfun ^:blocking editable-set-editable "gtk_editable_set_editable" void [e ptr, v bool])
 (ffi/defcfun ^:blocking editable-set-alignment "gtk_editable_set_alignment" void
   [e ptr, x f32])
+(ffi/defcfun ^:blocking editable-label-new "gtk_editable_label_new" ptr [text c-string])
+(ffi/defcfun ^:blocking editable-label-get-editing "gtk_editable_label_get_editing" bool
+  [l ptr])
+(ffi/defcfun ^:blocking editable-label-start-editing "gtk_editable_label_start_editing" void
+  [l ptr])
+(ffi/defcfun ^:blocking editable-label-stop-editing "gtk_editable_label_stop_editing" void
+  [l ptr, commit bool])
 (ffi/defcfun ^:blocking editable-set-width-chars "gtk_editable_set_width_chars" void
   [e ptr, n i32])
 
