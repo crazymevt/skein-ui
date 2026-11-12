@@ -1,5 +1,6 @@
 (ns skein.ui.services-test
-  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+  (:require [skein.math :as math]
+            [skein.test :refer [deftest is are testing use-fixtures]]
             [skein.ui :as ui]
             [skein.ui.headless :as headless]
             [skein.system :as system]))
@@ -197,3 +198,60 @@
   (ui/beep!)
   (ui/open-url! "https://example.com")
   (is (= [[:beep] [:open-url "https://example.com"]] (headless/backend-log))))
+
+(deftest path-data
+  (testing "absolute and relative commands, implicit repeats and closing"
+    (is (= [[:move 14.0 2.0] [:line 6.0 2.0] [:line 6.0 10.0] [:line 8.0 12.0] [:line 9.0 13.0]
+            [:close] [:move 1.0 1.0]]
+           (ui/parse-path-data "M14 2H6v8l2 2 1 1zM1 1"))))
+  (testing "numbers run together, as SVG allows"
+    (is (= [[:move 1.65 0.33] [:line -4.03 1.0e2]] (ui/parse-path-data "M1.65.33L-4.03 1e2"))))
+  (testing "a smooth curve reflects the last control point"
+    (is (= [[:move 0.0 0.0] [:curve 0.0 1.0 1.0 1.0 1.0 0.0] [:curve 1.0 -1.0 2.0 -1.0 2.0 0.0]]
+           (ui/parse-path-data "M0 0C0 1 1 1 1 0S2 -1 2 0"))))
+  (testing "a quadratic is a cubic two thirds of the way to its control point"
+    (let [[_ [_ x1 y1 x2 y2 x y]] (ui/parse-path-data "M0 0Q3 3 6 0")]
+      (is (= [2.0 2.0 4.0 2.0 6.0 0.0] (mapv (fn [v] (/ (math/round (* 1000 v)) 1000.0))
+                                              [x1 y1 x2 y2 x y])))))
+  (testing "an arc becomes curves through its points, ending where it says"
+    (let [cmds (ui/parse-path-data "M0 0A1 1 0 0 1 2 0")
+          r (fn [v] (/ (math/round (* 1000 v)) 1000.0))]
+      (is (= 3 (count cmds)) "a half circle: two quarters")
+      (is (= [1.0 -1.0] (mapv r (drop 5 (nth cmds 1)))) "over the top, sweeping clockwise")
+      (is (= [2.0 0.0] (mapv r (drop 5 (nth cmds 2)))))))
+  (is (thrown-with-msg? error "path data" (ui/parse-path-data "2 2")))
+  (testing "drawing it as an icon: round ends, scaled, in a color"
+    (let [c (ui/canvas {:width 24 :height 24
+                        :on-draw (fn [e] (ui/draw-path-data! (:context e) "M5 12h14"
+                                                             {:scale 0.5 :color :red :line-width 2}))})
+          ops (headless/draw! c)]
+      (is (some (fn [op] (= :line-to (first op))) ops))
+      (is (some (fn [op] (= [:scale 0.5 0.5] (vec (take 3 op)))) ops))))
+  (testing "vector images are made once"
+    (let [a (ui/vector-image "M5 12h14" {:size 16})]
+      (is (identical? a (ui/vector-image "M5 12h14" {:size 16})))
+      (is (= 16 (:width a)))
+      (is (:template (:vector a)) "in the text color, it's a template")
+      (is (not (:template (:vector (ui/vector-image "M5 12h14" {:color :red}))))))))
+
+(deftest clickable-containers
+  (let [events (atom [])
+        card (ui/vbox {:clickable true :background "#111111" :hover-background "#222222"
+                       :border-color "#333333" :hover-border-color "#444444"
+                       :on-clicked (fn [_] (swap! events conj :clicked))
+                       :on-mouse-enter (fn [_] (swap! events conj :enter))
+                       :on-mouse-leave (fn [_] (swap! events conj :leave))}
+                      (ui/label {:text "Explain this file"}))
+        plain (ui/vbox {} (ui/label {:text "plain"}))]
+    (ui/show! (ui/window {} (ui/vbox {} card plain)))
+    (headless/click-container! card)
+    (is (nil? (headless/click-container! plain)) "only a clickable one is clicked")
+    (is (= (ui/parse-color "#111111") (ui/ensure-color (ui/container-fill card))))
+    (headless/hover! card true)
+    (is (:hovered card))
+    (is (= "#222222" (ui/container-fill card)) "its hover background")
+    (is (= "#444444" (ui/container-border-color card)))
+    (headless/hover! card false)
+    (is (= "#333333" (ui/container-border-color card)))
+    (is (= [:clicked :enter :leave] @events))))
+

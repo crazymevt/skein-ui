@@ -547,6 +547,8 @@ hasn't placed it."
   [a ptr, f ptr, data ptr, destroy ptr])
 (ffi/defcfun ^:blocking widget-set-focusable "gtk_widget_set_focusable" void [w ptr, v bool])
 (ffi/defcfun ^:blocking gesture-click-new "gtk_gesture_click_new" ptr [])
+(ffi/defcfun ^:blocking widget-set-cursor-from-name "gtk_widget_set_cursor_from_name" void
+  [w ptr, name c-string])
 (ffi/defcfun ^:blocking gesture-single-set-button "gtk_gesture_single_set_button" void
   [g ptr, button u32])
 (ffi/defcfun ^:blocking gesture-single-get-current-button

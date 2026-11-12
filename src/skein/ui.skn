@@ -968,15 +968,46 @@ With homogeneous every item gets the same size. Returns a vector of sizes."
 surface-roles), drawn with the platform's material or theme color; :background, when set,
 fills it with a color instead. With :corner-radius, :border-color and :border-width it is
 a card: its background rounded, and outlined inside its bounds (children aren't clipped to
-the corners, so give it padding)."
+the corners, so give it padding). A :clickable one acts as a button made of what it
+holds: a click on it (but not on a control in it) emits :clicked, the pointer is a
+pointing hand over it, and while the pointer is over it, it emits :mouse-enter and
+:mouse-leave and takes :hover-background and :hover-border-color, if set."
   (surface :cell :atom :init :automatic)
   (background :cell :atom :init nil)
   (corner-radius :cell :atom :init 0 :doc "Pixels of rounding at the background's corners.")
   (border-color :cell :atom :init nil :doc "The color of a line around it, or nil for none.")
-  (border-width :cell :atom :init 1 :doc "The width of that line, in pixels."))
+  (border-width :cell :atom :init 1 :doc "The width of that line, in pixels.")
+  (clickable :cell :atom :init false :doc "Whether it gets clicks and hovering.")
+  (hover-background :cell :atom :init nil :doc "Its background while the pointer is over it.")
+  (hover-border-color :cell :atom :init nil
+                      :doc "Its border's color while the pointer is over it.")
+  (hovered :cell :atom :init false :doc "Whether the pointer is over it (if clickable)."))
 
 (declare-widget! container-widget
-                 {:properties [:surface :background :corner-radius :border-color :border-width]})
+                 {:properties [:surface :background :corner-radius :border-color :border-width
+                               :clickable :hover-background :hover-border-color :hovered]
+                  :signals {:clicked event :mouse-enter event :mouse-leave event}})
+
+(defn clicked-by-user!
+  "Backends call this when the user clicked the clickable container c. Returns the event,
+or nil if c isn't clickable."
+  [c]
+  (when (:clickable c)
+    (emit! c (event-for c :clicked))))
+
+(defn hovered-by-user!
+  "Backends call this when the pointer came over the clickable container c (hovered
+true) or left it: c takes its hover colors, and emits :mouse-enter or :mouse-leave."
+  [c hovered]
+  (when (and (:clickable c) (not= (boolean hovered) (boolean (:hovered c))))
+    (set-slot! c :hovered (boolean hovered))
+    (emit! c (event-for c (if hovered :mouse-enter :mouse-leave)))))
+
+(defn container-border-color
+  "The color of the container's border now: its hover color while hovered, if it has
+one, else :border-color; nil for none."
+  [c]
+  (or (when (:hovered c) (:hover-border-color c)) (:border-color c)))
 
 (defclass box-widget [container-widget]
   "Lays its children out in a column or a row. Children with :vexpand (in a column) or
@@ -1638,13 +1669,16 @@ backend outlines each widget's box."
 (defclass image []
   "A picture that image views, buttons, rows and canvases show: from a file
 (image-from-file), the bytes of one (image-from-bytes), RGBA pixels (image-from-pixels),
-the platform's icons (system-image) or text (glyph-image). Its native image lives until
+the platform's icons (system-image), text (glyph-image) or SVG path data (vector-image). Its native image lives until
 free-image! frees it."
   (path :init nil)
   (pixels :init nil :doc "A byte array of width × height RGBA pixels, row by row.")
   (data :init nil :doc "The bytes of an image file (PNG, JPEG, ...).")
   (system :init nil :doc "The platform's name of a system image.")
   (glyph :init nil :doc "What a glyph image shows: {:text :font :color :size :template}.")
+  (vector :init nil
+          :doc "What a vector image draws: {:path (parse-path-data's) :view-box :size
+:line-width :color :fill :template}.")
   (width :init 0)
   (height :init 0)
   (freed :cell :atom :init false :doc "True once free-image! freed it."))
@@ -1722,6 +1756,53 @@ Glyph images are made once and shared."
                        :width size :height size)]
            (swap! glyph-images assoc key i)
            i)))))
+
+(def ^:private vector-images
+  "[backend key] -> the vector image made for key."
+  (atom {}))
+
+(def parse-path-data
+  "SVG path data's commands (defined with drawing, below).")
+
+(def draw-path-data!
+  "Draw SVG path data on a context (defined with drawing, below).")
+
+(defn vector-image
+  "A square image, :size points on a side (16), of the SVG path data path (a string, as
+an <svg> element's d) drawn as an icon is: stroked :line-width (2) wide, with round ends
+and joins, in :color (a color designator, :text by default), in a :view-box (24) units on
+a side scaled to the size, or filled with :fill instead. A :template image (true for
+:text) takes its color from where it shows, following appearance and selection, as the
+platforms' symbols do. A system color is drawn as it is in the current mode: ask again
+after :appearance-changed. Vector images are made once and shared."
+  ([path] (vector-image path {}))
+  ([path opts]
+   (let [size (get opts :size 16)
+         _ (when-not (and (number? size) (pos? size)) (error "a vector image's size is positive"))
+         color (get opts :color :text)
+         fill (:fill opts)
+         template (boolean (get opts :template (and (nil? fill) (= color :text))))
+         spec {:path (if (string? path) (parse-path-data path) (vec path))
+               :view-box (get opts :view-box 24) :size size
+               :line-width (get opts :line-width 2) :color color :fill fill
+               :template template}
+         key [(current-backend) spec (when-not template (dark-mode?))]]
+     (or (get @vector-images key)
+         (let [i (make image :vector spec :width size :height size)]
+           (swap! vector-images assoc key i)
+           i)))))
+
+(defn draw-vector-image!
+  "Draw a vector image's spec (its :vector) on the context, in a size-by-size square at the
+origin, y down: what backends call to make its native image. A template is drawn in
+template-color."
+  [gc spec template-color]
+  (let [{:keys [path view-box size line-width color fill template]} spec
+        k (/ size view-box)]
+    (draw-path-data! gc path (if fill
+                               {:scale k :fill (if template template-color fill)}
+                               {:scale k :line-width line-width
+                                :color (if template template-color color)}))))
 
 (defgeneric backend-free-image [backend image]
   "Release the image's native image, if the backend made one.")
@@ -3779,6 +3860,7 @@ right, clockwise on the screen), to the path."
 
 (defn close-path! "Close the path's current part." [gc] (gc-close-path gc))
 
+
 (defn fill-path!
   "Fill the path, in :color or the fill color, and start a new one."
   ([gc] (fill-path! gc {}))
@@ -3810,6 +3892,152 @@ right, clockwise on the screen), to the path."
   "Fill the whole canvas with color, or the fill color."
   ([gc] (paint! gc nil))
   ([gc color] (fill-rectangle! gc 0 0 (:width gc) (:height gc) {:color color})))
+
+;;; Path data (Skein's M3.9, D-115): SVG's path syntax, for icons drawn as strokes.
+
+(def ^:private path-tokens
+  #"[MmLlHhVvCcSsQqTtAaZz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+
+(defn- arc-curves
+  "Cubic curves along SVG's elliptical arc from x1, y1 to x2, y2 (SVG 1.1 F.6.5), each
+[:curve x1 y1 x2 y2 x y]."
+  [x1 y1 rx ry degrees large sweep x2 y2]
+  (let [rx (if (neg? rx) (- rx) rx)
+        ry (if (neg? ry) (- ry) ry)]
+    (cond
+      (and (== x1 x2) (== y1 y2)) []
+      (or (zero? rx) (zero? ry)) [[:line x2 y2]]
+      :else
+      (let [phi (* degrees (/ math/pi 180))
+            cs (math/cos phi)
+            sn (math/sin phi)
+            dx (/ (- x1 x2) 2.0)
+            dy (/ (- y1 y2) 2.0)
+            xp (+ (* cs dx) (* sn dy))
+            yp (+ (* (- sn) dx) (* cs dy))
+            lambda (+ (/ (* xp xp) (* rx rx)) (/ (* yp yp) (* ry ry)))
+            [rx ry] (if (> lambda 1) [(* rx (sqrt lambda)) (* ry (sqrt lambda))] [rx ry])
+            num (- (* rx rx ry ry) (* rx rx yp yp) (* ry ry xp xp))
+            den (+ (* rx rx yp yp) (* ry ry xp xp))
+            coef (* (if (= large sweep) -1 1) (sqrt (max 0.0 (/ num den))))
+            cxp (* coef (/ (* rx yp) ry))
+            cyp (* coef (- (/ (* ry xp) rx)))
+            cx (+ (- (* cs cxp) (* sn cyp)) (/ (+ x1 x2) 2.0))
+            cy (+ (* sn cxp) (* cs cyp) (/ (+ y1 y2) 2.0))
+            angle (fn [ux uy vx vy] (math/atan2 (- (* ux vy) (* uy vx)) (+ (* ux vx) (* uy vy))))
+            ux (/ (- xp cxp) rx)
+            uy (/ (- yp cyp) ry)
+            theta (angle 1 0 ux uy)
+            dtheta (angle ux uy (/ (- (- xp) cxp) rx) (/ (- (- yp) cyp) ry))
+            dtheta (cond (and (not sweep) (pos? dtheta)) (- dtheta (* 2 math/pi))
+                         (and sweep (neg? dtheta)) (+ dtheta (* 2 math/pi))
+                         :else dtheta)
+            n (max 1 (int (math/ceil (/ (if (neg? dtheta) (- dtheta) dtheta) (/ math/pi 2)))))
+            delta (/ dtheta n)
+            t (* (/ 4 3.0) (math/tan (/ delta 4)))
+            point (fn [a] [(+ cx (* rx (math/cos a) cs) (- (* ry (math/sin a) sn)))
+                           (+ cy (* rx (math/cos a) sn) (* ry (math/sin a) cs))])
+            slope (fn [a] [(- (- (* rx (math/sin a) cs)) (* ry (math/cos a) sn))
+                           (+ (- (* rx (math/sin a) sn)) (* ry (math/cos a) cs))])]
+        (mapv (fn [i]
+                (let [a1 (+ theta (* i delta))
+                      a2 (+ a1 delta)
+                      [px py] (point a1)
+                      [qx qy] (if (= i (dec n)) [x2 y2] (point a2))
+                      [dx1 dy1] (slope a1)
+                      [dx2 dy2] (slope a2)]
+                  [:curve (+ px (* t dx1)) (+ py (* t dy1)) (- qx (* t dx2)) (- qy (* t dy2))
+                   qx qy]))
+              (range n))))))
+
+(defn parse-path-data
+  "The commands of SVG path data d (\"M14 2H6a2 2 0 0 0-2 2v16...\"), absolute: each
+[:move x y], [:line x y], [:curve x1 y1 x2 y2 x y] or [:close]. Every command of SVG's is
+read (relative ones, H, V, the smooth curves S and T, quadratic Q, arcs A); quadratics
+and arcs become cubic curves."
+  [d]
+  (let [tokens (vec (re-seq path-tokens (str d)))
+        n (count tokens)
+        number? (fn [i] (and (< i n) (not (re-matches #"[A-Za-z]" (nth tokens i)))))
+        num (fn [i] (parse-double (nth tokens i)))]
+    (loop [i 0, cmd nil, x 0.0, y 0.0, sx 0.0, sy 0.0, ctrl nil, out (transient [])]
+      (cond
+        (>= i n) (persistent! out)
+        (not (number? i))
+        (let [c (nth tokens i)]
+          (if (contains? #{"Z" "z"} c)
+            (recur (inc i) c sx sy sx sy nil (conj! out [:close]))
+            (recur (inc i) c x y sx sy ctrl out)))
+        (nil? cmd) (error "path data starts with a number:" (pr-str d))
+        :else
+        (let [upper (string/upper-case cmd)
+              rel (not= cmd upper)
+              ax (fn [v] (if rel (+ x v) v))
+              ay (fn [v] (if rel (+ y v) v))
+              args (fn [k] (when (every? number? (range i (+ i k))) (mapv num (range i (+ i k)))))]
+          (case upper
+            "M" (let [[a b] (or (args 2) (error "bad path data:" (pr-str d)))
+                      px (ax a) py (ay b)]
+                  ;; pairs after the first are lines
+                  (recur (+ i 2) (if rel "l" "L") px py px py nil (conj! out [:move px py])))
+            "L" (let [[a b] (or (args 2) (error "bad path data:" (pr-str d)))]
+                  (recur (+ i 2) cmd (ax a) (ay b) sx sy nil (conj! out [:line (ax a) (ay b)])))
+            "H" (let [px (if rel (+ x (num i)) (num i))]
+                  (recur (inc i) cmd px y sx sy nil (conj! out [:line px y])))
+            "V" (let [py (if rel (+ y (num i)) (num i))]
+                  (recur (inc i) cmd x py sx sy nil (conj! out [:line x py])))
+            "C" (let [[a b c e f g] (or (args 6) (error "bad path data:" (pr-str d)))]
+                  (recur (+ i 6) cmd (ax f) (ay g) sx sy [:c (ax c) (ay e)]
+                         (conj! out [:curve (ax a) (ay b) (ax c) (ay e) (ax f) (ay g)])))
+            "S" (let [[c e f g] (or (args 4) (error "bad path data:" (pr-str d)))
+                      [x1 y1] (if (= :c (first ctrl))
+                                [(- (* 2 x) (second ctrl)) (- (* 2 y) (nth ctrl 2))]
+                                [x y])]
+                  (recur (+ i 4) cmd (ax f) (ay g) sx sy [:c (ax c) (ay e)]
+                         (conj! out [:curve x1 y1 (ax c) (ay e) (ax f) (ay g)])))
+            ("Q" "T")
+            (let [k (if (= upper "Q") 4 2)
+                  vs (or (args k) (error "bad path data:" (pr-str d)))
+                  [qx qy] (if (= upper "Q")
+                            [(ax (nth vs 0)) (ay (nth vs 1))]
+                            (if (= :q (first ctrl))
+                              [(- (* 2 x) (second ctrl)) (- (* 2 y) (nth ctrl 2))]
+                              [x y]))
+                  ex (ax (nth vs (- k 2)))
+                  ey (ay (nth vs (- k 1)))]
+              ;; a quadratic as a cubic: control points two thirds of the way to its own
+              (recur (+ i k) cmd ex ey sx sy [:q qx qy]
+                     (conj! out [:curve (+ x (* (/ 2 3.0) (- qx x))) (+ y (* (/ 2 3.0) (- qy y)))
+                                 (+ ex (* (/ 2 3.0) (- qx ex))) (+ ey (* (/ 2 3.0) (- qy ey)))
+                                 ex ey])))
+            "A" (let [[rx ry rot large sweep ex ey] (or (args 7) (error "bad path data:" (pr-str d)))
+                      ex (ax ex) ey (ay ey)]
+                  (recur (+ i 7) cmd ex ey sx sy nil
+                         (reduce conj! out (arc-curves x y rx ry rot (not (zero? large))
+                                                       (not (zero? sweep)) ex ey))))
+            (error "bad path data:" (pr-str d))))))))
+
+(defn draw-path-data!
+  "Draw the SVG path data path (a string, or parse-path-data's commands) on the context: by
+default stroked as icons are, with round ends and joins, in :color and :line-width, after
+scaling by :scale (1) from the origin [:x :y]; :fill fills it instead, in that color."
+  ([gc path] (draw-path-data! gc path {}))
+  ([gc path opts]
+   (let [commands (if (string? path) (parse-path-data path) path)]
+     (with-saved-state [gc]
+       (translate! gc (get opts :x 0) (get opts :y 0))
+       (scale! gc (get opts :scale 1))
+       (set-line-style! gc {:cap :round :join :round})
+       (begin-path! gc)
+       (doseq [[op & a] commands]
+         (case op
+           :move (apply move-to! gc a)
+           :line (apply line-to! gc a)
+           :curve (apply curve-to! gc a)
+           :close (close-path! gc)))
+       (if-let [fill (:fill opts)]
+         (fill-path! gc {:color fill})
+         (stroke-path! gc (select-keys opts [:color :line-width])))))))
 
 (defn text-size
   "The [width height] of the string s drawn in :font (a font designator) or the context's
@@ -6875,6 +7103,7 @@ when the system's does."
   "The color a container (or window) is filled with: its :background, else its palette's
 color for its surface role, else nil for the native surface."
   [c]
-  (or (:background c)
+  (or (when (and (instance? container-widget c) (:hovered c)) (:hover-background c))
+      (:background c)
       (when-let [role (surface-color-role (:surface c))]
         (when (palette-color c role) (widget-color c role)))))

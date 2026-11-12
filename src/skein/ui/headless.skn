@@ -426,6 +426,18 @@ hasn't been placed."
   [button]
   (ui/emit! button (ui/event-for button :clicked)))
 
+(defn hover!
+  "Move the pointer over the clickable container c (hovered true) or off it, as the user
+would."
+  [c hovered]
+  (ui/hovered-by-user! c hovered))
+
+(defn click-container!
+  "Click the clickable container c, as the user would. Returns the event, or nil if it
+isn't clickable."
+  [c]
+  (ui/clicked-by-user! c))
+
 (defn- user-sets! [object property value]
   (swap! (:native object) assoc-in [:properties property] value)
   (ui/changed-by-user! object property value))

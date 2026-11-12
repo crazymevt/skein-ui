@@ -575,6 +575,9 @@ canvas can draw it), else as the theme's paintable; or null."
           icon
           (do (lib/g-object-unref icon) t))))))
 
+(def ^:private vector-texture
+  "A texture of a vector image (defined with the images, below).")
+
 (def ^:private glyph-texture
   "A texture of a glyph image's text (defined with the drawing, below).")
 
@@ -592,6 +595,7 @@ skein.ui image, or null for nil."
               (:data image) (texture-from-bytes (:data image))
               (:system image) (system-paintable (:system image))
               (:glyph image) (glyph-texture (:glyph image))
+              (:vector image) (vector-texture (:vector image))
               :else
               (let [w (:width image) h (:height image)
                     bytes (ffi/pin [p (:pixels image)] (lib/g-bytes-new p (* 4 w h)))
@@ -2697,7 +2701,7 @@ colors, the palette's text and background colors, a container's surface or backg
          ;; the layout gives the children)
          (if (and (instance? ui/container-widget w) (pos? (or (:corner-radius w) 0)))
            (str "border-radius: " (:corner-radius w) "px; ") "")
-         (if-let [b (and (instance? ui/container-widget w) (:border-color w))]
+         (if-let [b (and (instance? ui/container-widget w) (ui/container-border-color w))]
            (str "box-shadow: inset 0 0 0 " (or (:border-width w) 1) "px "
                 (css-color (ui/widget-color w b)) "; ")
            ""))))
@@ -2728,6 +2732,33 @@ colors, the palette's text and background colors, a container's surface or backg
 (defmethod set-native [(c ui/container-widget) (p (= :corner-radius)) v] (restyle! c))
 (defmethod set-native [(c ui/container-widget) (p (= :border-color)) v] (restyle! c))
 (defmethod set-native [(c ui/container-widget) (p (= :border-width)) v] (restyle! c))
+(defmethod set-native [(c ui/container-widget) (p (= :hover-background)) v] (restyle! c))
+(defmethod set-native [(c ui/container-widget) (p (= :hover-border-color)) v] (restyle! c))
+(defmethod set-native [(c ui/container-widget) (p (= :hovered)) v] (restyle! c))
+
+(def ^:private clickable-containers
+  "A clickable container's GTK widget address -> true once it has its controllers."
+  (atom {}))
+
+(defmethod set-native [(c ui/container-widget) (p (= :clickable)) v]
+  (let [n (native c)]
+    (when (and v (not (get @clickable-containers (ffi/address n))))
+      (swap! clickable-containers assoc (ffi/address n) true)
+      (add-controller! c n (lib/gesture-click-new)
+                       [["pressed" :pressed press-imp] ["released" :released press-imp]])
+      (add-controller! c n (lib/motion-controller-new)
+                       [["enter" :enter motion-imp] ["leave" :leave leave-imp]]))
+    (lib/widget-set-cursor-from-name n (if v "pointer" "default"))))
+
+(defmethod native-input [(c ui/container-widget) kind controller args]
+  (case kind
+    ;; a click: released over it
+    :released (let [[_ _ w h] (:allocation c)]
+                (when (and (<= 0 (:x args) w) (<= 0 (:y args) h))
+                  (ui/clicked-by-user! c)))
+    :enter (ui/hovered-by-user! c true)
+    :leave (ui/hovered-by-user! c false)
+    nil))
 
 (defn css-declarations
   "The CSS declarations of the widget's own look, as its rule has them, or nil."
@@ -3915,6 +3946,38 @@ position."
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Glyph images and row icons
+
+(defn- vector-texture
+  "A texture of a vector image: its path data drawn in a square. GTK doesn't tint images,
+so a template is drawn in the text color of the current mode."
+  [spec]
+  (let [extent (int (math/ceil (:size spec)))
+        surface (lib/cairo-image-surface-create 0 extent extent)   ; CAIRO_FORMAT_ARGB32
+        cr (lib/cairo-create surface)
+        gc (make gtk-context :cr cr :width extent :height extent :widget nil)]
+    (ui/draw-vector-image! gc spec (ui/system-color :text))
+    (lib/cairo-destroy cr)
+    (lib/cairo-surface-flush surface)
+    (let [stride (lib/cairo-image-surface-get-stride surface)
+          bytes (lib/g-bytes-new (lib/cairo-image-surface-get-data surface) (* stride extent))
+          t (lib/memory-texture-new extent extent 0 bytes stride)]
+      (lib/g-bytes-unref bytes)
+      (lib/cairo-surface-destroy surface)
+      t)))
+
+(defn texture-pixel
+  "The color of the image's texture at the pixel x, y (from the top left): for tests."
+  [image x y]
+  (let [t (texture image)
+        w (lib/texture-get-width t)
+        h (lib/texture-get-height t)
+        bytes (make-array u8 (* 4 w h))]
+    ;; Cairo's ARGB32 on a little-endian machine: B, G, R, A, premultiplied
+    (ffi/pin [p bytes] (lib/texture-download t p (* 4 w)))
+    (let [i (* 4 (+ x (* y w)))
+          a (/ (aget bytes (+ i 3)) 255.0)
+          un (fn [v] (if (pos? a) (/ (/ v 255.0) a) 0.0))]
+      (ui/rgb (un (aget bytes (+ i 2))) (un (aget bytes (+ i 1))) (un (aget bytes i)) a))))
 
 (defn- glyph-texture
   "A texture of the glyph image's text drawn in the middle of a square."

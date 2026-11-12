@@ -553,6 +553,54 @@
         "the wheel goes on to the column")
     (ui/close! w)))
 
+(deftest icons-and-clickable-containers
+  (let [red (ui/vector-image "M4 4h16v16H4z" {:size 24 :fill "#ff0000"})
+        arrow (ui/vector-image "M5 12h14 M12 5l7 7l-7 7" {:size 16})
+        iv (ui/image-view {:image red})
+        b (ui/button {:label "Send" :image arrow})
+        events (atom [])
+        card (ui/vbox {:clickable true :padding 8 :background "#202020"
+                       :hover-background "#404040" :corner-radius 8
+                       :on-clicked (fn [_] (swap! events conj :clicked))
+                       :on-mouse-enter (fn [_] (swap! events conj :enter))
+                       :on-mouse-leave (fn [_] (swap! events conj :leave))}
+                      (ui/label {:text "Explain this file"}))
+        plain (ui/vbox {:padding 8} (ui/label {:text "plain"}))
+        w (ui/window {:title "Icons"} (ui/vbox {:padding 10 :spacing 8} iv b card plain))]
+    (ui/show! w)
+    (cocoa/run-for! 0.1)
+    (testing "a vector image draws its path"
+      ;; in the middle of the view, which centers the image (drawn in the device's color
+      ;; space, so red isn't sRGB's exactly)
+      (let [[_ _ vw vh] (:allocation iv)
+            c (cocoa/draw-into-image! iv (quot vw 2) (quot vh 2))]
+        (is (and (< 0.8 (ui/color-red c)) (< (ui/color-green c) 0.4) (< (ui/color-blue c) 0.4))
+            "filled red")))
+    (is (objc/send-bool (cocoa/ns-image arrow) (objc/sel "isTemplate"))
+        "in the text color, a template, which the button tints")
+    (testing "a click on the card, released over it"
+      (cocoa/send-mouse! card 1 5 5)
+      (cocoa/send-mouse! card 2 5 5)
+      (is (= [:clicked] @events))
+      (cocoa/send-mouse! card 1 5 5)
+      (cocoa/send-mouse! card 2 -20 5)
+      (is (= [:clicked] @events) "released off it, no click"))
+    (testing "hovering"
+      (objc/send-p-void (cocoa/container-view card) (objc/sel "mouseEntered:") (ffi/null))
+      (is (:hovered card))
+      (is (= "#404040" (ui/color-hex (:fill (cocoa/native-card card)))))
+      (objc/send-p-void (cocoa/container-view card) (objc/sel "mouseExited:") (ffi/null))
+      (is (= "#202020" (ui/color-hex (:fill (cocoa/native-card card)))))
+      (is (= [:clicked :enter :leave] @events)))
+    (is (pos? (objc/send-long (objc/send (cocoa/container-view card) (objc/sel "trackingAreas"))
+                              (objc/sel "count")))
+        "it tracks the pointer")
+    (testing "a container that isn't clickable passes the mouse on"
+      (cocoa/send-mouse! plain 1 5 5)
+      (cocoa/send-mouse! plain 2 5 5)
+      (is (= [:clicked :enter :leave] @events)))
+    (ui/close! w)))
+
 (deftest stacks-and-tabbed-panes
   (let [a (ui/label {:text "one"})
         b (ui/label {:text "two"})

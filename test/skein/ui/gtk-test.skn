@@ -497,6 +497,30 @@
         (is (< (* 1.6 h2) h4 (* 2.4 h2)) "four lines are about twice as tall as two")))
     (ui/close! w)))
 
+(deftest icons-and-clickable-containers
+  (let [red (ui/vector-image "M4 4h16v16H4z" {:size 24 :fill "#ff0000"})
+        events (atom [])
+        card (ui/vbox {:clickable true :padding 8 :background "#202020"
+                       :hover-background "#404040"
+                       :on-clicked (fn [_] (swap! events conj :clicked))
+                       :on-mouse-enter (fn [_] (swap! events conj :enter))
+                       :on-mouse-leave (fn [_] (swap! events conj :leave))}
+                      (ui/label {:text "Explain this file"}))
+        w (ui/window {:title "Icons"} (ui/vbox {:padding 10} (ui/image-view {:image red}) card))]
+    (ui/show! w)
+    (gtk/settle!)
+    (is (= "#ff0000" (ui/color-hex (gtk/texture-pixel red 12 12))) "a vector image's path")
+    (is (zero? (ui/color-alpha (gtk/texture-pixel red 1 1))) "clear around it")
+    (gtk/native-input card :released nil {:n 1 :x 5.0 :y 5.0})
+    (gtk/native-input card :released nil {:n 1 :x -20.0 :y 5.0})
+    (is (= [:clicked] @events) "released over it, a click; off it, none")
+    (gtk/native-input card :enter nil {:x 5.0 :y 5.0})
+    (is (string/includes? (gtk/css-declarations card) "rgba(64,64,64,1.000)") "hovered")
+    (gtk/native-input card :leave nil {})
+    (is (string/includes? (gtk/css-declarations card) "rgba(32,32,32,1.000)"))
+    (is (= [:clicked :enter :leave] @events))
+    (ui/close! w)))
+
 (deftest stacks-and-tabbed-panes
   (let [a (ui/label {:text "one"})
         b (ui/label {:text "two"})

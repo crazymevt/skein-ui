@@ -372,6 +372,37 @@ consumed it (defined below).")
   (data-source :init nil :doc "The data source and delegate of tables and outline views.")
   (modes :init nil :doc "An NSArray of the run loop modes AppKit runs in."))
 
+(defn- clickable-at [view]
+  (when-let [w (objc/object-for view)]
+    (when (and (instance? ui/container-widget w) (:clickable w)) w)))
+
+(ffi/defcallback container-mouse-imp void [self ptr, cmd ptr, event ptr]
+  (let [selector (objc/sel-name cmd)
+        c (clickable-at self)]
+    (cond
+      (nil? c) (when (contains? #{"mouseDown:" "mouseUp:"} selector)
+                 (objc/send-p-void (objc/send self (objc/sel "nextResponder")) cmd event))
+      (= selector "mouseEntered:") (ui/hovered-by-user! c true)
+      (= selector "mouseExited:") (ui/hovered-by-user! c false)
+      (= selector "mouseUp:")
+      ;; a click: released over it (AppKit gives mouseUp: to the view the press was in)
+      (let [l (objc/send-point event (objc/sel "locationInWindow"))
+            p (objc/send-point-p self (objc/sel "convertPoint:fromView:")
+                                 {:x (ffi/field l objc/ns-point :x) :y (ffi/field l objc/ns-point :y)}
+                                 (ffi/null))
+            x (ffi/field p objc/ns-point :x)
+            y (ffi/field p objc/ns-point :y)
+            [_ _ w h] (objc/rect-vec (objc/send-rect self (objc/sel "bounds")))]
+        (when (and (<= 0 x w) (<= 0 y h))
+          (ui/clicked-by-user! c)))
+      :else nil)))
+
+(ffi/defcallback container-cursor-imp void [self ptr, cmd ptr]
+  (when (clickable-at self)
+    (objc/send-rp-void self (objc/sel "addCursorRect:cursor:")
+                       (objc/send-rect self (objc/sel "bounds"))
+                       (objc/send (objc/cls "NSCursor") (objc/sel "pointingHandCursor")))))
+
 (ffi/defcallback pass-scroll-imp void [self ptr, cmd ptr, event ptr]
   (objc/send-p-void (objc/send self (objc/sel "nextResponder")) (objc/sel "scrollWheel:") event))
 
@@ -443,7 +474,13 @@ consumed it (defined below).")
                       [["hitTest:" no-hit-imp "@@:{CGPoint=dd}"]])
   (objc/define-class! "SkeinFlippedView" "NSView"
                       [["isFlipped" yes-imp "B@:"]
-                       ["viewDidChangeEffectiveAppearance" appearance-imp "v@:"]])
+                       ["viewDidChangeEffectiveAppearance" appearance-imp "v@:"]
+                       ;; a clickable container's (others pass the mouse on, as NSView does)
+                       ["mouseDown:" container-mouse-imp "v@:@"]
+                       ["mouseUp:" container-mouse-imp "v@:@"]
+                       ["mouseEntered:" container-mouse-imp "v@:@"]
+                       ["mouseExited:" container-mouse-imp "v@:@"]
+                       ["resetCursorRects" container-cursor-imp "v@:"]])
   ;; A tab: an NSButton that selects on mouse down and drags, rather than tracking.
   (objc/define-class! "SkeinTabButton" "NSButton"
                       (mapv (fn [name] [name tab-mouse-imp "v@:@"])
@@ -870,6 +907,28 @@ keyword gives the platform's own, which follows dark mode."
     ;; A system color is drawn as it is in the application's appearance.
     (if (and (keyword? color) (not template)) (with-app-appearance render) (render))))
 
+(def ^:private cocoa-context-at
+  "A drawing context on the current graphics context, flipped to y down, size square
+(defined with canvases, below).")
+
+(defn- vector-ns-image
+  "A new NSImage of a vector image: its path data drawn on it."
+  [spec]
+  (let [size (:size spec)
+        render (fn []
+                 (let [img (objc/send-z (objc/alloc "NSImage") (objc/sel "initWithSize:")
+                                        {:width (f64 size) :height (f64 size)})]
+                   (objc/send-void img (objc/sel "lockFocus"))
+                   (try (ui/draw-vector-image! (cocoa-context-at size) spec (ui/rgb 0 0 0))
+                        (finally (objc/send-void img (objc/sel "unlockFocus"))))
+                   (objc/send-b-void img (objc/sel "setTemplate:") (boolean (:template spec)))
+                   img))
+        color (or (:fill spec) (:color spec))]
+    ;; A system color is drawn as it is in the application's appearance.
+    (if (and (or (keyword? color) (vector? color)) (not (:template spec)))
+      (with-app-appearance render)
+      (render))))
+
 (defn ns-image
   "The NSImage of a skein.ui image, or null for nil."
   [image]
@@ -884,6 +943,7 @@ keyword gives the platform's own, which follows dark mode."
               (:data image) (image-from-data (:data image))
               (:system image) (system-ns-image (:system image))
               (:glyph image) (glyph-ns-image (:glyph image))
+              (:vector image) (vector-ns-image (:vector image))
               :else
               (let [w (:width image) h (:height image)
                     rep (objc/send-bitmap
@@ -1976,6 +2036,13 @@ down through the open ones."
   (objc/send (objc/send (objc/cls "NSGraphicsContext") (objc/sel "currentContext"))
              (objc/sel "CGContext")))
 
+(defn- cocoa-context-at [size]
+  (let [cg (current-cg)]
+    ;; an image's focus is y up: flip it, as a canvas's view is
+    (objc/cg-translate cg 0.0 (f64 size))
+    (objc/cg-scale cg 1.0 -1.0)
+    (make cocoa-context :cg cg :width size :height size :widget nil)))
+
 (defmethod native-draw [(c ui/canvas-widget)]
   (let [[_ _ w h] (objc/rect-vec (objc/send-rect (view c) (objc/sel "bounds")))
         gc (make cocoa-context :cg (current-cg) :width w :height h :widget c)]
@@ -3029,6 +3096,10 @@ consumed it."
   "A surface role -> the NSVisualEffectMaterial that draws it."
   {:window 12 :sidebar 7 :content 18 :status 12 :toolbar 3 :activity 7 :popover 6})
 
+(def ^:private hover-areas
+  "A clickable container's view address -> true once it has its tracking area."
+  (atom {}))
+
 (def ^:private backdrops
   "A host view's address -> {:color an NSBox, :material an NSVisualEffectView}, behind a
 container's children."
@@ -3069,7 +3140,7 @@ platform's dynamic one."
     (if (and (keyword? k) (ui/palette-color w k)) (ns-color (ui/widget-color w d)) (ns-color d))))
 
 (defn- card? [c]
-  (or (pos? (or (:corner-radius c) 0)) (some? (:border-color c))))
+  (or (pos? (or (:corner-radius c) 0)) (some? (:border-color c)) (some? (:hover-border-color c))))
 
 (defn- refresh-surface! [c]
   (let [role (:surface c)
@@ -3093,8 +3164,8 @@ platform's dynamic one."
                               (palette-ns-color c (or color :transparent)))
             (objc/send-d-void box (objc/sel "setCornerRadius:") (f64 (or (:corner-radius c) 0)))
             (objc/send-d-void box (objc/sel "setBorderWidth:")
-                              (f64 (if (:border-color c) (or (:border-width c) 1) 0)))
-            (when-let [b (:border-color c)]
+                              (f64 (if (ui/container-border-color c) (or (:border-width c) 1) 0)))
+            (when-let [b (ui/container-border-color c)]
               (objc/send-p-void box (objc/sel "setBorderColor:") (palette-ns-color c b))))
           (objc/send-b-void box (objc/sel "setHidden:") (not boxed)))
         (when-let [m (:material data)]
@@ -3117,6 +3188,25 @@ platform's dynamic one."
 (defmethod set-native [(c ui/container-widget) (p (= :corner-radius)) v] (refresh-surface! c))
 (defmethod set-native [(c ui/container-widget) (p (= :border-color)) v] (refresh-surface! c))
 (defmethod set-native [(c ui/container-widget) (p (= :border-width)) v] (refresh-surface! c))
+(defmethod set-native [(c ui/container-widget) (p (= :hover-background)) v] (refresh-surface! c))
+(defmethod set-native [(c ui/container-widget) (p (= :hover-border-color)) v] (refresh-surface! c))
+(defmethod set-native [(c ui/container-widget) (p (= :hovered)) v] (refresh-surface! c))
+
+(defmethod set-native [(c ui/container-widget) (p (= :clickable)) v]
+  ;; The pointer over it: an area that follows its visible rectangle, for entering and
+  ;; leaving, and a pointing hand (resetCursorRects, below).
+  (let [n (container-view c)]
+    (when (and v (not (get @hover-areas (ffi/address n))))
+      ;; NSTrackingMouseEnteredAndExited 1 | ActiveAlways 0x80 | InVisibleRect 0x200
+      (let [area (objc/send-rlpp (objc/alloc "NSTrackingArea")
+                                 (objc/sel "initWithRect:options:owner:userInfo:")
+                                 (objc/rect 0 0 0 0) (+ 1 0x80 0x200) n (ffi/null))]
+        (objc/send-p-void n (objc/sel "addTrackingArea:") area)
+        (objc/release area)
+        (swap! hover-areas assoc (ffi/address n) true)))
+    (when-let [win (objc/send n (objc/sel "window"))]
+      (when-not (ffi/null? win)
+        (objc/send-p-void win (objc/sel "invalidateCursorRectsForView:") n)))))
 
 (defn native-card
   "A container's card as AppKit draws it: {:corner-radius :border-width :border-color
