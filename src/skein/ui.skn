@@ -851,8 +851,9 @@ start."
 (defn distribute
   "Split total pixels among items of the natural sizes given: when there is more, the
 items that expanding (booleans, one per item) marks share the extra equally; when less,
-all shrink in proportion. With homogeneous every item gets the same size. Returns a
-vector of sizes."
+the expanding items give it up first, in proportion, down to half their natural size
+(an entry before the check boxes beside it), and past that all shrink in proportion.
+With homogeneous every item gets the same size. Returns a vector of sizes."
   ([total sizes expanding] (distribute total sizes expanding false))
   ([total sizes expanding homogeneous]
    (let [n (count sizes)
@@ -869,8 +870,23 @@ vector of sizes."
              ranks (reductions + 0 (map (fn [e] (if e 1 0)) expanding))]
          (mapv (fn [s e r] (if e (+ s each (if (< r more) 1 0)) s)) sizes expanding ranks))
        (pos? natural)
-       (let [out (mapv (fn [s] (quot (* s total) natural)) sizes)]
-         (update out (dec n) + (- total (reduce + 0 out))))
+       (let [floors (mapv (fn [s e] (if e (quot (inc s) 2) s)) sizes
+                          (or expanding (repeat false)))
+             give (- natural (reduce + 0 floors))
+             deficit (- natural total)]
+         (if (<= deficit give)
+           ;; The expanding items give it up, each in proportion to what it can give; the
+           ;; pixels rounding leaves come one each from the first that can still give.
+           (loop [out (mapv (fn [s f] (- s (quot (* (- s f) deficit) give))) sizes floors)
+                  i 0]
+             (let [over (- (reduce + 0 out) total)]
+               (if (and (pos? over) (< i n))
+                 (recur (if (> (nth out i) (nth floors i)) (update out i dec) out) (inc i))
+                 out)))
+           ;; Past that, all shrink in proportion from there.
+           (let [low (- natural give)
+                 out (mapv (fn [f] (quot (* f total) low)) floors)]
+             (update out (dec n) + (- total (reduce + 0 out))))))
        :else (vec sizes)))))
 
 ;;; ------------------------------------------------------------------------------------
