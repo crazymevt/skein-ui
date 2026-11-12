@@ -4762,8 +4762,13 @@ those from :start to :new-end. :removed-text and :inserted-text are the old and 
   "Text to edit, shared by any number of code views: its lines, an index of where each
 starts, a revision that grows with every change, an undo history, and :changed (a
 buffer-change-event) for each change. Make one with make-text-buffer."
-  (lines :cell :atom :init [""] :doc "The text's lines, without their newlines.")
-  (starts :cell :atom :init [0] :doc "Where each line starts.")
+  (chunks :cell :atom :init [[[""] [0] 1]]
+          :doc "The text's lines (without their newlines) in chunks, so an edit costs what
+it changes: each [lines starts chars], with where each line starts in the chunk and the
+characters the chunk spans, a newline after each line.")
+  (chunk-lines :cell :atom :init [0] :doc "The line each chunk starts with.")
+  (chunk-starts :cell :atom :init [0] :doc "Where each chunk starts.")
+  (line-count :cell :atom :init 1 :doc "The number of lines.")
   (length :cell :atom :init 0 :doc "The number of characters.")
   (astral :cell :atom :init 0
           :doc "How many characters are outside the Basic Multilingual Plane (two UTF-16
@@ -4814,68 +4819,124 @@ that keep their own."
 (defn buffer-line-count
   "The number of lines in the buffer: one more than its number of newlines."
   [b]
-  (count (:lines b)))
+  (:line-count b))
 
 (defn- check-range [b start end]
   (when-not (and (integer? start) (integer? end) (<= 0 start end (:length b)))
     (error (str "the range " start " to " end " is outside the buffer, which has "
                 (:length b) " characters"))))
 
+;; The lines are kept in chunks of at most line-chunk-size (D-108's runs are kept so too):
+;; an edit rebuilds the chunks it touches and the index of where each chunk starts, rather
+;; than copying every line after it and moving every start.
+
+(def ^:private line-chunk-size 256)
+
+(defn- make-line-chunk
+  "A chunk of lines (at least one): [lines starts chars]."
+  [lines]
+  (let [lines (vec lines)
+        ends (reduce (fn [acc l] (conj acc (+ (peek acc) (count l) 1))) [0] lines)]
+    [lines (pop ends) (peek ends)]))
+
+(defn- chunk-lines
+  "lines in chunks of about the same size, at most line-chunk-size each."
+  [lines]
+  (let [n (count lines)
+        k (max 1 (quot (+ n line-chunk-size -1) line-chunk-size))
+        size (quot (+ n k -1) k)]
+    (mapv make-line-chunk (partition-all (max 1 size) lines))))
+
+(defn- index-chunks!
+  "Make chunks the buffer's lines, with the index of where each starts."
+  [b chunks]
+  (loop [i 0 line 0 pos 0 ls (transient []) ps (transient [])]
+    (if (< i (count chunks))
+      (let [[lines _ chars] (nth chunks i)]
+        (recur (inc i) (+ line (count lines)) (+ pos chars) (conj! ls line) (conj! ps pos)))
+      (do (set-slot! b :chunks chunks)
+          (set-slot! b :chunk-lines (persistent! ls))
+          (set-slot! b :chunk-starts (persistent! ps))
+          (set-slot! b :line-count line)))))
+
+(defn- last-at-most
+  "The index of the last of the ascending numbers v that is at most x (v's first is)."
+  [v x]
+  (loop [lo 0 hi (dec (count v))]
+    (if (< lo hi)
+      (let [mid (quot (+ lo hi 1) 2)]
+        (if (<= (nth v mid) x) (recur mid hi) (recur lo (dec mid))))
+      lo)))
+
+(defn- check-line [b line]
+  (when-not (and (integer? line) (< -1 line (:line-count b)))
+    (error (str "line " line " is not in the buffer, which has " (:line-count b) " lines"))))
+
 (defn line-start
   "Where line (counting from 0) of the buffer starts."
   [b line]
-  (when-not (and (integer? line) (< -1 line (count (:lines b))))
-    (error (str "line " line " is not in the buffer, which has " (count (:lines b)) " lines")))
-  (nth (:starts b) line))
-
-(defn line-end
-  "Where line of the buffer ends, before its newline."
-  [b line]
-  (+ (line-start b line) (count (nth (:lines b) line))))
+  (check-line b line)
+  (let [i (last-at-most (:chunk-lines b) line)
+        [_ starts] (nth (:chunks b) i)]
+    (+ (nth (:chunk-starts b) i) (nth starts (- line (nth (:chunk-lines b) i))))))
 
 (defn line-text
   "The text of line of the buffer, without its newline."
   [b line]
-  (line-start b line)
-  (nth (:lines b) line))
+  (check-line b line)
+  (let [i (last-at-most (:chunk-lines b) line)]
+    (nth (first (nth (:chunks b) i)) (- line (nth (:chunk-lines b) i)))))
+
+(defn line-end
+  "Where line of the buffer ends, before its newline."
+  [b line]
+  (+ (line-start b line) (count (line-text b line))))
 
 (defn position-line
   "The line position is on in the buffer, counting from 0."
   [b position]
-  (let [starts (:starts b)]
-    (loop [lo 0 hi (dec (count starts))]
-      (if (< lo hi)
-        (let [mid (quot (+ lo hi 1) 2)]
-          (if (<= (nth starts mid) position) (recur mid hi) (recur lo (dec mid))))
-        lo))))
+  (let [i (last-at-most (:chunk-starts b) position)
+        [_ starts] (nth (:chunks b) i)]
+    (+ (nth (:chunk-lines b) i) (last-at-most starts (- position (nth (:chunk-starts b) i))))))
 
 (defn position-column
   "How many characters position is from the start of its line."
   [b position]
   (- position (line-start b (position-line b position))))
 
+(defn- buffer-lines
+  "The buffer's lines from first up to (not including) end."
+  [b first end]
+  (loop [line first out (transient [])]
+    (if (< line end)
+      (let [i (last-at-most (:chunk-lines b) line)
+            [lines] (nth (:chunks b) i)
+            from (- line (nth (:chunk-lines b) i))
+            upto (min (count lines) (- end (nth (:chunk-lines b) i)))]
+        (recur (+ line (- upto from)) (reduce conj! out (subvec lines from upto))))
+      (persistent! out))))
+
 (defn buffer-text
   "The buffer's text, all of it or from start to end."
-  ([b] (string/join "\n" (:lines b)))
+  ([b] (string/join "\n" (into [] (mapcat first) (:chunks b))))
   ([b start end]
    (check-range b start end)
    (let [ls (position-line b start)
          le (position-line b end)
-         lines (:lines b)
-         starts (:starts b)]
+         ss (line-start b ls)]
      (if (= ls le)
-       (subs (nth lines ls) (- start (nth starts ls)) (- end (nth starts ls)))
-       (string/join "\n" (concat [(subs (nth lines ls) (- start (nth starts ls)))]
-                                 (subvec lines (inc ls) le)
-                                 [(subs (nth lines le) 0 (- end (nth starts le)))]))))))
+       (subs (line-text b ls) (- start ss) (- end ss))
+       (string/join "\n" (concat [(subs (line-text b ls) (- start ss))]
+                                 (buffer-lines b (inc ls) le)
+                                 [(subs (line-text b le) 0 (- end (line-start b le)))]))))))
 
 (defn buffer-char
   "The character at position in the buffer (\newline at a line's end)."
   [b position]
   (check-range b position (inc position))
   (let [line (position-line b position)
-        column (- position (nth (:starts b) line))
-        text (nth (:lines b) line)]
+        column (- position (line-start b line))
+        text (line-text b line)]
     (if (< column (count text)) (nth text column) \newline)))
 
 (defn- split-at-newlines
@@ -4940,19 +5001,31 @@ Backspace does, so undo! takes them back together. Returns the end of the new te
      (if (and (= start end) (= "" text))
        end
        (let [removed (buffer-text b start end)
-             lines (:lines b)
-             starts (:starts b)
              ls (position-line b start)
              le (position-line b end)
-             prefix (subs (nth lines ls) 0 (- start (nth starts ls)))
-             suffix (subs (nth lines le) (- end (nth starts le)))
+             prefix (subs (line-text b ls) 0 (- start (line-start b ls)))
+             suffix (subs (line-text b le) (- end (line-start b le)))
              new-lines (split-at-newlines (str prefix text suffix))
              delta (- (count text) (- end start))
-             new-starts (reduce (fn [acc line] (conj acc (+ (peek acc) (count line) 1)))
-                                [(nth starts ls)] (butlast new-lines))]
-         (set-slot! b :lines (into (into (subvec lines 0 ls) new-lines) (subvec lines (inc le))))
-         (set-slot! b :starts (into (into (subvec starts 0 ls) new-starts)
-                                    (map (fn [x] (+ x delta)) (subvec starts (inc le)))))
+             chunks (:chunks b)
+             ;; The chunks the edit touches, and the next if they'd end up small.
+             ci (last-at-most (:chunk-lines b) ls)
+             cj (last-at-most (:chunk-lines b) le)
+             ;; how many lines those chunks will have
+             after (+ (- (+ (nth (:chunk-lines b) cj) (count (first (nth chunks cj))))
+                         (nth (:chunk-lines b) ci))
+                      (- (count new-lines) (inc (- le ls))))
+             cj (if (and (< after (quot line-chunk-size 4)) (< (inc cj) (count chunks)))
+                  (inc cj)
+                  cj)
+             old-lines (into [] (mapcat first) (subvec chunks ci (inc cj)))
+             first-line (nth (:chunk-lines b) ci)
+             lines (-> (subvec old-lines 0 (- ls first-line))
+                       (into new-lines)
+                       (into (subvec old-lines (inc (- le first-line)))))]
+         (index-chunks! b (-> (subvec chunks 0 ci)
+                              (into (chunk-lines lines))
+                              (into (subvec chunks (inc cj)))))
          (update-slot! b :length + delta)
          (let [old (:astral-positions b)
                added (astral-offsets text start)]

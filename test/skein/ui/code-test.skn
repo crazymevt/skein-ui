@@ -1,5 +1,6 @@
 (ns skein.ui.code-test
-  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+  (:require [skein.string :as string]
+            [skein.test :refer [deftest is are testing use-fixtures]]
             [skein.ui :as ui]
             [skein.ui.headless :as headless]))
 
@@ -72,10 +73,15 @@
     (is (= 4 (ui/utf16-length "a😀b")))))
 
 (deftest buffers-against-a-model
-  ;; Random edits to a buffer and to a plain string agree, and undo takes them all back.
+  ;; Random edits to a buffer and to a plain string agree, and undo takes them all back;
+  ;; some start with enough lines for several chunks of them, and add or take many.
   (dotimes [seed 20]
-    (let [alphabet ["a" "b" "\n" "é" "😀" "xy" "\n\n" ""]
-          start-text "hello\nworld"
+    (let [long? (odd? seed)
+          alphabet (cond-> ["a" "b" "\n" "é" "😀" "xy" "\n\n" ""]
+                     long? (conj (apply str (repeat 300 "ab\n"))))
+          start-text (if long?
+                       (string/join "\n" (map (fn [i] (str "line " i)) (range 900)))
+                       "hello\nworld")
           b (ui/make-text-buffer {:text start-text})
           model (atom start-text)]
       (dotimes [_ 60]
@@ -91,6 +97,12 @@
                 before (subs @model 0 p)
                 line (count (filter (fn [c] (= c \newline)) before))]
             (is (= line (ui/position-line b p)))
+            (let [ls (ui/line-start b line)
+                  le (ui/line-end b line)]
+              (is (and (<= ls p le) (or (zero? ls) (= \newline (nth @model (dec ls))))
+                       (or (= le (count @model)) (= \newline (nth @model le))))
+                  "the line's start and end")
+              (is (= (subs @model ls le) (ui/line-text b line))))
             (is (= (ui/utf16-length before) (ui/buffer-utf16-position b p)) "UTF-16 units")
             (is (= p (ui/buffer-position-from-utf16 b (ui/utf16-length before))))
             (is (= (inc (count (filter (fn [c] (= c \newline)) @model)))
