@@ -4295,11 +4295,19 @@ units."
 ;;; Runs
 
 (def ^:private run-dictionaries
-  "[color background underline] -> a retained NSDictionary of temporary attributes."
+  "[color background underline strikethrough] -> a retained NSDictionary of temporary
+attributes."
   (atom {}))
 
+(def ^:private temporary-attributes
+  ["NSColor" "NSBackgroundColor" "NSUnderline" "NSStrikethrough"])
+
+(defn- temporary-run? [a]
+  (or (:color a) (:background a) (:underline a) (:strikethrough a)))
+
 (defn- run-dictionary [attrs]
-  (let [k [(:color attrs) (:background attrs) (boolean (:underline attrs))]]
+  (let [k [(:color attrs) (:background attrs) (boolean (:underline attrs))
+           (boolean (:strikethrough attrs))]]
     (or (get @run-dictionaries k)
         (let [d (objc/retain (objc/send (objc/cls "NSMutableDictionary") (objc/sel "dictionary")))]
           (when-let [c (first k)]
@@ -4311,14 +4319,26 @@ units."
             (objc/send-pp-void d (objc/sel "setObject:forKey:")
                                (objc/send-l (objc/cls "NSNumber") (objc/sel "numberWithInteger:") 1)
                                (objc/ns-string "NSUnderline")))
+          (when (nth k 3)
+            (objc/send-pp-void d (objc/sel "setObject:forKey:")
+                               (objc/send-l (objc/cls "NSNumber") (objc/sel "numberWithInteger:") 1)
+                               (objc/ns-string "NSStrikethrough")))
           (swap! run-dictionaries assoc k d)
           d))))
 
 (defn- storage-run?
   "Whether a run's attributes need the text storage: a font of its own, or a paragraph's."
   [a]
-  (or (:bold a) (:italic a) (:size a) (:family a)
+  (or (:bold a) (:italic a) (:size a) (:family a) (:image a)
       (some (fn [k] (contains? a k)) ui/run-paragraph-attributes)))
+
+(defn- text-attachment
+  "An NSTextAttachment showing a run's :image at its :image-width by :image-height."
+  [a]
+  (let [t (objc/autorelease (objc/new-object "NSTextAttachment"))]
+    (objc/send-p-void t (objc/sel "setImage:") (ns-image (:image a)))
+    (objc/send-r-void t (objc/sel "setBounds:") (objc/rect 0 0 (:image-width a) (:image-height a)))
+    t))
 
 (defn- run-font
   "The code view's font changed as a run's attributes say."
@@ -4372,11 +4392,11 @@ block (NSTextBlock) the text view's whole width for a background."
              s16 (u16 w start)
              whole {:location s16 :length (- (u16 w end) s16)}
              storage? (or (:storage-runs (parts w)) (some (fn [[_ _ a]] (storage-run? a)) runs))]
-         (doseq [name ["NSColor" "NSBackgroundColor" "NSUnderline"]]
+         (doseq [name temporary-attributes]
            (objc/send-prange-void layout (objc/sel "removeTemporaryAttribute:forCharacterRange:")
                                   (objc/ns-string name) whole))
          (doseq [[rs re a] runs]
-           (when (or (:color a) (:background a) (:underline a))
+           (when (temporary-run? a)
              (let [x (u16 w (min rs n))]
                (objc/send-prange-void layout (objc/sel "addTemporaryAttributes:forCharacterRange:")
                                       (run-dictionary a)
@@ -4394,6 +4414,8 @@ block (NSTextBlock) the text view's whole width for a background."
                                         (objc/ns-string "NSFont") (ns-font (:font w)) whole)
                 ;; The core restyles whole lines, so their paragraphs' runs are all here.
                 (objc/send-prange-void storage (objc/sel "removeAttribute:range:")
+                                       (objc/ns-string "NSAttachment") whole)
+                (objc/send-prange-void storage (objc/sel "removeAttribute:range:")
                                        (objc/ns-string "NSParagraphStyle")
                                        (objc/send-range-range
                                         text (objc/sel "paragraphRangeForRange:") whole))
@@ -4403,6 +4425,10 @@ block (NSTextBlock) the text view's whole width for a background."
                     (when (some (fn [k] (contains? a k)) [:bold :italic :size :family])
                       (objc/send-pprange-void storage (objc/sel "addAttribute:value:range:")
                                               (objc/ns-string "NSFont") (ns-font (run-font w a)) r))
+                    (when (:image a)
+                      (objc/send-pprange-void storage (objc/sel "addAttribute:value:range:")
+                                              (objc/ns-string "NSAttachment") (text-attachment a)
+                                              r))
                     (when (some (fn [k] (contains? a k)) ui/run-paragraph-attributes)
                       (objc/send-pprange-void
                        storage (objc/sel "addAttribute:value:range:")
@@ -4508,7 +4534,9 @@ nil."
 (defn code-text-attributes
   "What the code view's text storage has at position: its font's :size, :monospace and
 :bold, and its paragraph style's :indent, :first-indent (from :indent), :space-above,
-:space-below, :tabs and :block-background (whether it has a block with a background)."
+:space-below, :tabs and :block-background (whether it has a block with a background); an
+attachment's [width height] as :attachment; and from the layout's temporary attributes,
+:strikethrough."
   [w position]
   (objc/call-with-pool
    (fn []
@@ -4518,12 +4546,21 @@ nil."
                                         (objc/ns-string name) i (ffi/null)))
            font (at "NSFont")
            p (at "NSParagraphStyle")
+           attachment (at "NSAttachment")
+           struck (objc/send-plp (:layout (parts w))
+                                 (objc/sel "temporaryAttribute:atCharacterIndex:effectiveRange:")
+                                 (objc/ns-string "NSStrikethrough") i (ffi/null))
            traits (objc/send-long (objc/send font (objc/sel "fontDescriptor"))
                                   (objc/sel "symbolicTraits"))
            nth-of (fn [array k] (objc/send-l array (objc/sel "objectAtIndex:") k))]
        (merge {:size (objc/send-double font (objc/sel "pointSize"))
                :monospace (objc/send-bool font (objc/sel "isFixedPitch"))
-               :bold (pos? (bit-and traits 2))}
+               :bold (pos? (bit-and traits 2))
+               :strikethrough (not (ffi/null? struck))}
+              (when-not (ffi/null? attachment)
+                (let [r (objc/send-rect attachment (objc/sel "bounds"))]
+                  {:attachment [(ffi/field r objc/ns-rect :width)
+                                (ffi/field r objc/ns-rect :height)]}))
               (when-not (ffi/null? p)
                 (let [tabs (objc/send p (objc/sel "tabStops"))
                       blocks (objc/send p (objc/sel "textBlocks"))

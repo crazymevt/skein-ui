@@ -26,7 +26,8 @@ controls.
 The backend protocol is a set of generic functions on a backend object (backend-realize,
 backend-set-property, ...), which skein.ui.headless, skein.ui.cocoa, skein.ui.win32 and
 skein.ui.gtk implement. The core calls them through backend-in-ui-thread."
-  (:require [skein.io :as io]
+  (:require [skein.bytes :as bytes]
+            [skein.io :as io]
             [skein.math :as math]
             [skein.string :as string]
             [skein.system :as system]
@@ -5560,6 +5561,10 @@ left, scrolled part included, gutter excluded), where a click there puts the car
       (:bold all) (assoc :bold true)
       (:italic all) (assoc :italic true)
       (:underline all) (assoc :underline true)
+      (:strikethrough all) (assoc :strikethrough true)
+      (:image all) (assoc :image (:image all)
+                          :image-width (or (number :image-width) (:width (:image all)))
+                          :image-height (or (number :image-height) (:height (:image all))))
       (number :size) (assoc :size (number :size))
       (:family all) (assoc :family (let [f (:family all)]
                                      (if (or (keyword? f) (string? f))
@@ -5613,8 +5618,10 @@ attributes, which cover whole lines, need."
 (defn set-text-runs!
   "Make runs all of the code view's styled runs: each [start end attributes], attributes a
 map of :style (a name in :text-styles giving defaults for the rest), :color and
-:background (color designators), :bold, :italic and :underline, :size (points) and :family
-(:monospace, :system or a family name). These apply to every line a run touches, whole:
+:background (color designators), :bold, :italic, :underline and :strikethrough, :size
+(points) and :family (:monospace, :system or a family name), and :image (a skein.ui image
+shown in place of the run's one character, an object replacement character, at
+:image-width by :image-height pixels). These apply to every line a run touches, whole:
 :indent and :first-indent (pixels from the left, the first line's from :indent, negative
 to hang it, as a list's bullet does), :space-above and :space-below (pixels),
 :block-background (a color across the lines' whole width) and :tabs (tab stops, pixels
@@ -5796,8 +5803,9 @@ the view, or nil. Platforms whose native view does the editing keys don't call i
 ;;; ------------------------------------------------------------------------------------
 ;;; Rich text (Skein's M3.6, D-108): formatted text to read, as chat and Markdown show,
 ;;; from Hiccup data, rendered into the text and styled runs of a code view the user can't
-;;; edit: blocks :h1 to :h6, :p, :ul and :ol of :li, :pre and :table of :tr, :th and :td;
-;;; inline :b, :i, :code and :a.
+;;; edit: blocks :h1 to :h6, :p, :ul and :ol of :li, :pre and :table of :tr, :th and :td,
+;;; :blockquote, :hr and :html; inline :b, :i, :del, :code, :a, :img, :br and :html. These
+;;; are what skein-markdown parses Markdown into (M3.8, D-110).
 
 (defclass link-event [event]
   "A link in rich text was clicked: :href is where it goes, :text its text."
@@ -5806,7 +5814,40 @@ the view, or nil. Platforms whose native view does the editing keys don't call i
 
 (def ^:private heading-scales {:h1 1.8 :h2 1.5 :h3 1.25 :h4 1.1 :h5 1.0 :h6 0.9})
 
-(def ^:private block-tags #{:h1 :h2 :h3 :h4 :h5 :h6 :p :ul :ol :pre :table})
+(def ^:private block-tags
+  #{:h1 :h2 :h3 :h4 :h5 :h6 :p :ul :ol :pre :table :blockquote :hr :html})
+
+(defn- percent-decode
+  "s with its %XX escapes decoded, as UTF-8."
+  [s]
+  (if-not (string/includes? s "%")
+    s
+    (let [cs (vec s)
+          n (count cs)
+          digit (fn [c] (when c (string/index-of "0123456789abcdef" (string/lower-case (str c)))))
+          text (fn [octets]
+                 (let [a (make-array u8 (count octets))]
+                   (doseq [[i o] (map-indexed vector octets)] (aset! a i o))
+                   (bytes/utf8-string a)))]
+      (loop [i 0 octets [] out []]
+        (let [flush (fn [out] (if (seq octets) (conj out (text octets)) out))]
+          (cond
+            (>= i n) (apply str (flush out))
+            (and (= \% (nth cs i)) (digit (get cs (inc i))) (digit (get cs (+ i 2))))
+            (recur (+ i 3)
+                   (conj octets (+ (* 16 (digit (nth cs (inc i)))) (digit (nth cs (+ i 2)))))
+                   out)
+            :else (recur (inc i) [] (conj (flush out) (nth cs i)))))))))
+
+(defn load-local-image
+  "The image at src if it is a local file, a path or a file: URL, else nil: what rich text
+shows for [:img {:src src}] unless its :load-image says otherwise."
+  [src]
+  (let [path (cond (string/starts-with? src "file://") (percent-decode (subs src 7))
+                   (re-find #"^[A-Za-z][A-Za-z0-9+.-]+:" src) nil   ; another scheme
+                   :else (percent-decode src))]
+    (when (and path (io/file? path))
+      (try (image-from-file path) (catch error e nil)))))
 
 (defn- element-parts
   "[tag attrs children] of a Hiccup element: children without nils, seqs spliced."
@@ -5849,8 +5890,29 @@ the view, or nil. Platforms whose native view does the editing keys don't call i
 (defn- emit-run! [bld s e attrs]
   (when (< s e) (vswap! (:runs bld) conj! [s e attrs])))
 
+(def ^:private emit-inlines!)
+
+(defn- emit-link! [bld kids attrs opts href]
+  (let [s @(:pos bld)]
+    (emit-inlines! bld kids (merge attrs (:link-style opts)) opts)
+    (vswap! (:links bld) conj! [s @(:pos bld) href])))
+
+(defn- emit-image!
+  "An image, as an object replacement character whose run shows it (no wider than
+:max-image-width); one it can't load, as its alt text linking to it."
+  [bld a attrs opts]
+  (let [src (str (:src a))
+        image (when-let [load (:load-image opts)] (load src))]
+    (if image
+      (let [scale (min 1.0 (/ (:max-image-width opts) (max 1 (:width image))))
+            scaled (fn [n] (int (math/round (* scale n))))]
+        (emit-text! bld "\uFFFC" (assoc attrs :image image :image-width (scaled (:width image))
+                                        :image-height (scaled (:height image)))))
+      (emit-link! bld [(if (seq (:alt a)) (:alt a) src)] attrs opts src))))
+
 (defn- emit-inlines!
-  "Add inline content (strings and :b, :i, :code and :a elements) with attrs."
+  "Add inline content (strings and :b, :i, :del, :code, :a, :img, :br and :html elements)
+with attrs."
   [bld kids attrs opts]
   (doseq [k kids]
     (if-not (vector? k)
@@ -5859,11 +5921,15 @@ the view, or nil. Platforms whose native view does the editing keys don't call i
         (case tag
           :b (emit-inlines! bld kids (assoc attrs :bold true) opts)
           :i (emit-inlines! bld kids (assoc attrs :italic true) opts)
+          :del (emit-inlines! bld kids (assoc attrs :strikethrough true) opts)
           :code (emit-inlines! bld kids (merge attrs (:code-style opts)) opts)
-          :a (let [s @(:pos bld)]
-               (emit-inlines! bld kids (merge attrs (:link-style opts)) opts)
-               (vswap! (:links bld) conj! [s @(:pos bld) (:href a)]))
-          (error "rich text's inline elements are :b, :i, :code and :a, not" (pr-str tag)))))))
+          :a (emit-link! bld kids attrs opts (:href a))
+          :img (emit-image! bld a attrs opts)
+          ;; a line separator: a new line in the same paragraph
+          :br (emit-text! bld "\u2028" attrs)
+          :html (emit-inlines! bld kids attrs opts)
+          (error "rich text's inline elements are :b, :i, :del, :code, :a, :img, :br and"
+                 ":html, not" (pr-str tag)))))))
 
 (defn- emit-blocks!
   "Add blocks to the builder, each after a newline unless it is the first of all. indent
@@ -5871,20 +5937,28 @@ is the left margin of the blocks, inside lists."
   [bld blocks opts indent]
   (doseq [block blocks]
     (let [[tag a kids] (element-parts block)
-          base (:size opts)]
+          base (:size opts)
+          ;; what a block quote's text has
+          inline-attrs (or (:inline-attrs opts) {})]
       (when (> @(:pos bld) (:start opts)) (emit-text! bld "\n" nil))
       (let [s @(:pos bld)
             margin (if (pos? indent) {:indent indent} {})]
         (case tag
           (:h1 :h2 :h3 :h4 :h5 :h6)
-          (do (emit-inlines! bld kids {:bold true :size (* base (get heading-scales tag))} opts)
+          (do (emit-inlines! bld kids (merge inline-attrs
+                                             {:bold true :size (* base (get heading-scales tag))})
+                             opts)
               (emit-run! bld s @(:pos bld)
                          (merge margin {:space-above (if (> s (:start opts)) 8 0) :space-below 4})))
           :p
-          (do (emit-inlines! bld kids {} opts)
+          (do (emit-inlines! bld kids inline-attrs opts)
               (emit-run! bld s @(:pos bld) (merge margin {:space-below 6})))
           (:ul :ol)
-          (let [level-indent (+ indent 24)]
+          (let [level-indent (+ indent 24)
+                p? (fn [k] (and (vector? k) (= :p (first k))))
+                ;; Markdown's loose lists, of paragraphs not marked :tight, are spaced apart
+                loose (and (not (:tight a))
+                           (some (fn [item] (some p? (nth (element-parts item) 2))) kids))]
             (doseq [[i item] (map-indexed vector kids)]
               (let [[itag _ ikids] (element-parts item)]
                 (when-not (= itag :li)
@@ -5892,16 +5966,30 @@ is the left margin of the blocks, inside lists."
                 (when (pos? i) (emit-text! bld "\n" nil))
                 (let [ls @(:pos bld)
                       block? (fn [k] (and (vector? k) (contains? block-tags (first k))))
-                      inline (vec (take-while (complement block?) ikids))
-                      nested (drop (count inline) ikids)]
-                  (emit-text! bld (if (= tag :ul) "•\t" (str (inc i) ".\t")) nil)
-                  (emit-inlines! bld inline {} opts)
+                      ;; an item's text, or its first paragraph's, then its blocks
+                      [inline nested] (if (p? (first ikids))
+                                        [(nth (element-parts (first ikids)) 2) (rest ikids)]
+                                        (split-with (complement block?) ikids))]
+                  (emit-text! bld (if (= tag :ul) "•\t" (str (+ i (or (:start a) 1)) ".\t"))
+                              inline-attrs)
+                  (emit-inlines! bld inline inline-attrs opts)
                   (emit-run! bld ls @(:pos bld) {:indent level-indent :first-indent -18
-                                                 :tabs [level-indent] :space-below 2})
+                                                 :tabs [level-indent]
+                                                 :space-below (if loose 6 2)})
                   (when (seq nested)
                     (emit-blocks! bld nested (assoc opts :start (dec @(:pos bld)))
                                   level-indent))))))
-          :pre
+          :blockquote
+          (emit-blocks! bld kids (assoc opts :start s
+                                        :inline-attrs (assoc inline-attrs :color :secondary-text))
+                        (+ indent 16))
+          :hr
+          ;; a thin paragraph whose background is the rule, then a small one for space below
+          ;; it (a paragraph's own space would take the background too)
+          (do (emit-text! bld " " {:size 2})
+              (emit-run! bld s (inc s) (merge margin {:block-background (:rule-color opts)}))
+              (emit-text! bld "\n " {:size 4}))
+          (:pre :html)
           (let [code (string/replace (plain-text kids) #"\n+$" "")
                 lines (string/split code #"\n" -1)]
             (emit-text! bld code {:family :monospace})
@@ -5938,15 +6026,17 @@ is the left margin of the blocks, inside lists."
                 (emit-run! bld rs (max (inc rs) @(:pos bld))
                            (merge {:tabs stops}
                                   (when (= i (dec (count rows))) {:space-below 6}))))))
-          (error "rich text's blocks are :h1 to :h6, :p, :ul, :ol, :pre and :table, not"
-                 (pr-str tag)))))))
+          (error "rich text's blocks are :h1 to :h6, :p, :ul, :ol, :pre, :table, :blockquote,"
+                 ":hr and :html, not" (pr-str tag)))))))
 
 (defn render-rich-text
   "Hiccup blocks as rich text from position start (a newline first unless it is 0):
 {:text :runs :links}, runs [start end attributes] and links [start end href]. opts are
 :size (the base font's, points), :measure (a function of a string and attributes giving
 its width, for tables' columns), :code-style and :link-style (attributes of inline code
-and links) and :block-background (a code block's)."
+and links), :block-background (a code block's), :rule-color (a thematic break's),
+:load-image (a function of an image's :src giving a skein.ui image, or nil to show its alt
+text as a link; load-local-image by default) and :max-image-width (pixels)."
   ([blocks opts] (render-rich-text blocks opts 0))
   ([blocks opts start]
    (let [bld (rich-builder start)
@@ -5954,7 +6044,10 @@ and links) and :block-background (a code block's)."
          opts (merge {:size 13 :measure (fn [s a] (* 7 (count s)))
                       :code-style {:family :monospace :background "#8080802e"}
                       :link-style {:color :link :underline true}
-                      :block-background "#80808024"}
+                      :block-background "#80808024"
+                      :rule-color "#80808066"
+                      :load-image load-local-image
+                      :max-image-width 480}
                      opts
                      {:start 0})]
      (when (pos? start) (emit-text! bld "\n" nil))
@@ -5970,6 +6063,8 @@ Clicking a link emits :link-activated (a link-event with its :href)."
   (content :cell :atom :init [] :doc "The Hiccup blocks shown.")
   (rendered :cell :atom :init nil :doc "The content the text was last made from.")
   (links :cell :atom :init [] :doc "[start end href] of each link in the text.")
+  (load-image :init load-local-image
+              :doc "A function of an image's :src giving a skein.ui image to show, or nil.")
   (editable :cell :atom :init false)
   (line-numbers :cell :atom :init false)
   (wrap :cell :atom :init true)
@@ -5983,6 +6078,7 @@ Clicking a link emits :link-activated (a link-event with its :href)."
         font (:font r)
         size (or (:size font) 13)]
     {:size size
+     :load-image (:load-image r)
      :measure (fn [s a]
                 (let [f (merge font (when (:bold a) {:weight :bold}))]
                   (first (in-ui (fn [] (backend-text-size b s f))))))}))
@@ -6015,8 +6111,12 @@ Clicking a link emits :link-activated (a link-event with its :href)."
 (defn rich-text
   "Rich text: (rich-text {:content [[:h2 \"Result\"] [:p \"Call \" [:code \"(f 1)\"]]]
 :on-link-activated f}). Blocks are :h1 to :h6, :p, :ul and :ol (of :li, which may hold
-blocks after their text), :pre (code) and :table (of :tr, of :th and :td); inline, :b, :i,
-:code and [:a {:href url} ...]. An element's second item may be a map of attributes."
+blocks after their text or first :p; {:start n} numbers an :ol from n, and items of
+paragraphs are spaced apart unless the list is {:tight true}), :pre (code), :table (of :tr,
+of :th and :td), :blockquote (of blocks), :hr and :html (raw HTML, shown as code); inline,
+:b, :i, :del (struck through), :code, [:a {:href url} ...], [:img {:src s :alt a}] (the
+image :load-image gives, else its alt text linking to it), :br and :html. An element's
+second item may be a map of attributes. skein-markdown parses Markdown into these."
   ([] (rich-text {}))
   ([opts] (build rich-text-widget opts nil)))
 

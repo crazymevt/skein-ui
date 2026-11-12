@@ -3730,6 +3730,7 @@ which has it already."
         (when (:bold attrs) (lib/g-object-set-int tag "weight" 700 (ffi/null)))
         (when (:italic attrs) (lib/g-object-set-int tag "style" 2 (ffi/null)))       ; PANGO_STYLE_ITALIC
         (when (:underline attrs) (lib/g-object-set-int tag "underline" 1 (ffi/null))) ; SINGLE
+        (when (:strikethrough attrs) (lib/g-object-set-int tag "strikethrough" 1 (ffi/null)))
         (when-let [size (:size attrs)]
           (lib/g-object-set-double tag "size-points" (f64 size) (ffi/null)))
         (when-let [f (:family attrs)]
@@ -3758,6 +3759,25 @@ which has it already."
         (swap! code-parts assoc-in [(ffi/address (native w)) :tags attrs] tag)
         tag)))
 
+(def ^:private image-attributes [:image :image-width :image-height])
+
+(defn- show-image!
+  "Show a run's image at position, where the text has an object replacement character: a
+picture at a child anchor in its place (a paintable alone can't be scaled), unless one is
+there already. The buffer's text is the same, the anchor standing for the character."
+  [w a z position attrs]
+  (iter-at w a position)
+  (when (ffi/null? (lib/text-iter-get-child-anchor a))
+    (iter-at w z (inc position))
+    (lib/text-buffer-delete (code-buffer w) a z)
+    (iter-at w a position)
+    (let [anchor (lib/text-buffer-create-child-anchor (code-buffer w) a)
+          p (lib/picture-new)]
+      (lib/picture-set-paintable p (texture (:image attrs)))
+      (lib/picture-set-can-shrink p true)
+      (lib/widget-set-size-request p (int (:image-width attrs)) (int (:image-height attrs)))
+      (lib/text-view-add-child-at-anchor (text-view-of w) p anchor))))
+
 (defmethod ui/backend-code-apply-runs [(b gtk-backend) w start end runs]
   (let [n (ui/text-length w)]
     (quietly
@@ -3766,11 +3786,16 @@ which has it already."
                      (iter-at w a (min start n))
                      (iter-at w z (min end n))
                      (lib/text-buffer-remove-all-tags (code-buffer w) a z)
+                     ;; images first: they change the buffer, which tags are applied to after
+                     (doseq [[rs re attrs] runs]
+                       (when (and (:image attrs) (< rs n))
+                         (show-image! w a z rs attrs)))
                      (doseq [[rs re attrs] runs]
                        ;; A paragraph's attributes cover the run's whole lines, newlines and all
                        ;; (the core restyles whole lines, so this stays within start to end).
                        (let [paragraph (select-keys attrs ui/run-paragraph-attributes)
-                             own (apply dissoc attrs ui/run-paragraph-attributes)
+                             own (apply dissoc attrs (concat ui/run-paragraph-attributes
+                                                             image-attributes))
                              buf (:buffer w)]
                          (when (seq own)
                            (iter-at w a (min rs n))
@@ -3838,6 +3863,14 @@ gesture reports a click: pressed, then released."
                 (iter-at w a position)
                 (reduce (fn [m [attrs tag]] (if (lib/text-iter-has-tag a tag) (merge m attrs) m))
                         {} (:tags (code-parts-of w))))))
+
+(defn code-child-at?
+  "True if the code view's GtkTextBuffer has a child anchor (as an image shows at) at
+position."
+  [w position]
+  (with-iters (fn [a z]
+                (iter-at w a position)
+                (not (ffi/null? (lib/text-iter-get-child-anchor a))))))
 
 (defn code-placeholder-shown?
   "True if the code view shows its placeholder."

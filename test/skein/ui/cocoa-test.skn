@@ -305,6 +305,13 @@
       (is (= "1" (cocoa/link-at-native r (+ 1 (at "there")))))
       (cocoa/click-link! r (+ 1 (at "there")))
       (is (= ["https://x.test" "u2"] @seen)))
+    (testing "strikethrough, and an image as a text attachment (Skein's M3.8, D-110)"
+      (ui/append-content! r [[:p "was " [:del "old"] " "
+                              [:img {:src (io/absolute-path "test/skein/ui/red-3x2.png")}]]])
+      (cocoa/run-for! 0.05)
+      (is (:strikethrough (cocoa/code-text-attributes r (at "old"))))
+      (is (not (:strikethrough (cocoa/code-text-attributes r (at "was")))))
+      (is (= [3.0 2.0] (:attachment (cocoa/code-text-attributes r (at "\uFFFC"))))))
     (ui/close! w)))
 
 (deftest rows-at-points-and-snapshots

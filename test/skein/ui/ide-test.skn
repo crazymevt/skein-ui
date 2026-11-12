@@ -206,6 +206,58 @@ stored blocks."
       (is (thrown-with-msg? error "blocks are" (ui/rich-text {:content [[:div "x"]]})))
       (is (thrown-with-msg? error "Hiccup" (ui/rich-text {:content ["just text"]}))))))
 
+;; What Markdown has (Skein's M3.8, D-110): what skein-markdown parses it into.
+(deftest rich-text-shows-markdown
+  (let [png (io/absolute-path "test/skein/ui/red-3x2.png")
+        r (ui/rich-text {:content [[:blockquote [:p "Quoted " [:a {:href "u"} "link"]]
+                                    [:p "again"]]
+                                   [:hr]
+                                   [:p "gone " [:del "old"] " and" [:br] "next"]
+                                   [:ol {:start 3 :tight true} [:li [:p "three"]]
+                                    [:li [:p "four"] [:ul {:tight true} [:li [:p "sub"]]]]]
+                                   [:ul [:li [:p "loose"]] [:li [:p "items"] [:p "more"]]]
+                                   [:p "img " [:img {:src png :alt "red"}] " end"]
+                                   [:p [:img {:src "https://x.test/a.png" :alt "remote"}]]
+                                   [:p [:img {:src "nowhere.png"}]]
+                                   [:html "<div>\n raw\n</div>"]
+                                   [:p "inline " [:html "<kbd>"] "k"]]})
+        text (ui/code-text r)
+        at (fn [s] (string/index-of text s))]
+    (is (= (str "Quoted link\nagain\n \n \ngone old and\u2028next\n3.\tthree\n4.\tfour\n•\tsub\n"
+                "•\tloose\n•\titems\nmore\nimg \uFFFC end\nremote\nnowhere.png\n"
+                "<div>\n raw\n</div>\ninline <kbd>k")
+           text))
+    (testing "a block quote: further in, its text dimmed, its links still links"
+      (is (= [16 :secondary-text] ((juxt :indent :color) (runs-at r (at "Quoted")))))
+      (is (= 16 (:indent (runs-at r (at "again")))))
+      (is (= :link (:color (runs-at r (at "link"))))))
+    (testing "a rule: a thin paragraph with a background"
+      (is (= [2 "#80808066"] ((juxt :size :block-background) (runs-at r (at " \n"))))))
+    (testing "strikethrough, and a line break within the paragraph"
+      (is (:strikethrough (runs-at r (at "old"))))
+      (is (not (:strikethrough (runs-at r (at " and"))))))
+    (testing "lists: numbered from :start, an item's first paragraph its text"
+      (is (= [24 2] ((juxt :indent :space-below) (runs-at r (at "three")))))
+      (is (= 48 (:indent (runs-at r (at "sub")))))
+      (is (= 6 (:space-below (runs-at r (at "loose")))) "paragraphs not :tight are apart")
+      (is (= 24 (:indent (runs-at r (at "more")))) "an item's next paragraph"))
+    (testing "images: a local file shown, no wider than its natural size; others as links"
+      (let [a (runs-at r (at "\uFFFC"))]
+        (is (= [3 2] ((juxt :image-width :image-height) a)))
+        (is (= [3 2] ((juxt :width :height) (:image a)))))
+      (is (= ["u" "https://x.test/a.png" "nowhere.png"] (mapv (fn [[_ _ h]] h) (:links r))))
+      (is (= :link (:color (runs-at r (at "remote"))))))
+    (testing "raw HTML: a block as code, inline as text"
+      (is (= :monospace (:family (runs-at r (at "<div>")))))
+      (is (nil? (:family (runs-at r (at "<kbd>"))))))
+    (testing "a big image is scaled to :max-image-width"
+      (let [wide (ui/image-from-pixels 960 20 (make-array u8 76800))
+            big (ui/rich-text {:content [[:p [:img {:src png}]]] :load-image (fn [src] wide)})]
+        (is (= [480 10] ((juxt :image-width :image-height) (runs-at big 0))))))
+    (testing "no loader: images as links"
+      (let [plain (ui/rich-text {:content [[:p [:img {:src png :alt "red"}]]] :load-image nil})]
+        (is (= "red" (ui/code-text plain)))))))
+
 (deftest rich-text-links-and-appending
   (let [seen (atom [])
         r (ui/rich-text {:content [[:p "See " [:a {:href "u1"} "here"] " now"]]

@@ -291,6 +291,14 @@
       (placed "there")
       (gtk/click-code-position! r (+ 1 (at "there")))
       (is (= ["https://x.test" "u2"] @seen)))
+    (testing "strikethrough, and an image as a picture at a child anchor (Skein's M3.8, D-110)"
+      (ui/append-content! r [[:p "was " [:del "old"] " "
+                              [:img {:src (io/absolute-path "test/skein/ui/red-3x2.png")}]]])
+      (gtk/run-for! 0.3)
+      (is (:strikethrough (tags (at "old"))))
+      (is (not (:strikethrough (tags (at "was")))))
+      (is (gtk/code-child-at? r (at "\uFFFC")))
+      (is (not (gtk/code-child-at? r (at "was")))))
     (ui/close! w)))
 
 (deftest rows-at-points-and-snapshots

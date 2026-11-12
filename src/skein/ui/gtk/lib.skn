@@ -364,6 +364,12 @@ hasn't placed it."
 (ffi/defcfun ^:blocking text-buffer-select-range "gtk_text_buffer_select_range" void
   [b ptr, ins ptr, bound ptr])
 (ffi/defcfun ^:blocking text-iter-get-offset "gtk_text_iter_get_offset" i32 [iter ptr])
+(ffi/defcfun ^:blocking text-iter-get-child-anchor "gtk_text_iter_get_child_anchor" ptr
+  [iter ptr])
+(ffi/defcfun ^:blocking text-buffer-create-child-anchor "gtk_text_buffer_create_child_anchor"
+  ptr [b ptr, iter ptr])
+(ffi/defcfun ^:blocking text-view-add-child-at-anchor "gtk_text_view_add_child_at_anchor"
+  void [v ptr, child ptr, anchor ptr])
 
 (ffi/defcfun ^:blocking notebook-new "gtk_notebook_new" ptr [])
 (ffi/defcfun ^:blocking notebook-append-page "gtk_notebook_append_page" i32
