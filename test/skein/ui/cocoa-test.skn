@@ -527,6 +527,32 @@
     (is (= 0.0 (:border-width (cocoa/native-card card))) "no border once it has no color")
     (ui/close! w)))
 
+(deftest height-for-width
+  (let [long-text (apply str (interpose " " (repeat 40 "word")))
+        l (ui/label {:text long-text :wrap true})
+        one (ui/label {:text "word"})
+        v (ui/code-view {:fit-height true :wrap true :line-numbers false
+                         :buffer (ui/make-text-buffer {:text "one\ntwo"})})
+        col (ui/vbox {:spacing 0} l one v)
+        w (ui/window {:title "Heights" :width 300 :height 400} col)]
+    (ui/show! w)
+    (ui/allocate col 0 0 200 400)
+    (cocoa/run-for! 0.1)
+    (let [line (second (ui/preferred-size one))
+          h (ui/preferred-height l 200)]
+      (is (> h (* 3 line)) "40 words wrap to several lines at 200 pixels")
+      (is (< (ui/preferred-height l 400) h) "fewer at 400"))
+    (let [h2 (ui/preferred-height v 200)]
+      (ui/insert-into-buffer! (:buffer v) 7 "\nthree\nfour")
+      (cocoa/run-for! 0.1)
+      (let [h4 (ui/preferred-height v 200)]
+        (is (< (* 1.6 h2) h4 (* 2.4 h2)) "four lines are about twice as tall as two")))
+    (is (= "SkeinPassScrollView"
+           (objc/string-of (objc/send (objc/send (cocoa/native-scroll v) (objc/sel "class"))
+                                      (objc/sel "description"))))
+        "the wheel goes on to the column")
+    (ui/close! w)))
+
 (deftest stacks-and-tabbed-panes
   (let [a (ui/label {:text "one"})
         b (ui/label {:text "two"})

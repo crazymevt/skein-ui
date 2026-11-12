@@ -372,6 +372,9 @@ consumed it (defined below).")
   (data-source :init nil :doc "The data source and delegate of tables and outline views.")
   (modes :init nil :doc "An NSArray of the run loop modes AppKit runs in."))
 
+(ffi/defcallback pass-scroll-imp void [self ptr, cmd ptr, event ptr]
+  (objc/send-p-void (objc/send self (objc/sel "nextResponder")) (objc/sel "scrollWheel:") event))
+
 (defn- define-classes! []
   (objc/define-class! "SkeinWaker" "NSObject" [["drain:" drain-imp "v@:@"]])
   (objc/define-class! "SkeinTarget" "NSObject" [["action:" action-imp "v@:@"]
@@ -424,6 +427,10 @@ consumed it (defined below).")
                         "B@:@{_NSRange=QQ}@"]
                        ["textStorage:didProcessEditing:range:changeInLength:" storage-edited-imp
                         "v@:@Q{_NSRange=QQ}q"]])
+  ;; A fit-height code view's scroll view: it has nothing to scroll, so the wheel goes on
+  ;; to the view it's in (a column of messages in a scrolled window).
+  (objc/define-class! "SkeinPassScrollView" "NSScrollView"
+                      [["scrollWheel:" pass-scroll-imp "v@:@"]])
   (objc/define-class! "SkeinCodeTextView" "NSTextView"
                       [["undo:" code-undo-imp "v@:@"] ["redo:" code-undo-imp "v@:@"]])
   (objc/define-class! "SkeinTracker" "NSObject"
@@ -675,6 +682,10 @@ as iOS does; Intel Macs put right before center."
   ;; NSLineBreakByWordWrapping is 0, NSLineBreakByTruncatingTail 4.
   (set-long! l "setLineBreakMode:" (if v 0 4))
   (set-long! l "setMaximumNumberOfLines:" (if v 0 1)))
+
+(defmethod ui/backend-height-for-width [(b cocoa-backend) (l ui/label-widget) width]
+  (objc/send-d-void (view l) (objc/sel "setPreferredMaxLayoutWidth:") (f64 width))
+  (second (objc/size-vec (objc/send-size (view l) (objc/sel "fittingSize")))))
 
 (defmethod native-natural-size [(l ui/label-widget)]
   (if (and (:wrap l) (:width l))
@@ -4113,6 +4124,38 @@ typing."
   (update-placeholder! w))
 
 (defmethod native-natural-size [(w ui/code-view-widget)] [300 200])
+
+(defmethod ui/backend-height-for-width [(b cocoa-backend) (w ui/code-view-widget) width]
+  ;; Its text laid out at that width by a layout manager of its own, added to the text's
+  ;; storage for the measurement, so the view's own layout isn't disturbed.
+  (let [{:keys [inner]} (parts w)
+        big 1.0e7
+        g (if (:line-numbers w) (gutter-thickness w) 0.0)
+        [ix iy] (objc/size-vec (objc/send-size inner (objc/sel "textContainerInset")))
+        tw (max 1.0 (- width g (* 2 ix)))
+        storage (objc/send inner (objc/sel "textStorage"))
+        layout (objc/new-object "NSLayoutManager")
+        container (objc/send-z (objc/alloc "NSTextContainer") (objc/sel "initWithSize:")
+                               {:width (if (:wrap w) tw big) :height big})]
+    (objc/send-p-void layout (objc/sel "addTextContainer:") container)
+    (objc/release container)
+    (objc/send-p-void storage (objc/sel "addLayoutManager:") layout)
+    (objc/send-p-void layout (objc/sel "ensureLayoutForTextContainer:") container)
+    (let [[_ _ _ h] (objc/rect-vec (objc/send-p-rect layout (objc/sel "usedRectForTextContainer:")
+                                                     container))]
+      (objc/send-p-void storage (objc/sel "removeLayoutManager:") layout)
+      (objc/release layout)
+      (+ (math/ceil h) (* 2 iy)))))
+
+(defn native-scroll
+  "A code view's NSScrollView."
+  [w]
+  (:scroll (parts w)))
+
+(defmethod set-native [(w ui/code-view-widget) (p (= :fit-height)) v]
+  (let [{:keys [scroll]} (parts w)]
+    (objc/send-b-void scroll (objc/sel "setHasVerticalScroller:") (not v))
+    (objc/set-class! scroll (objc/cls (if v "SkeinPassScrollView" "NSScrollView")))))
 
 (defmethod set-native [(w ui/code-view-widget) (p (= :buffer)) buffer]
   (detach-storage! w)

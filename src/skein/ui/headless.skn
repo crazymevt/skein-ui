@@ -171,6 +171,26 @@ pixels a character, 16 a line of text, 24 for a field. Calls the core asks to ma
 
 (def ^:private size-factors {:regular 1 :small 0.85 :mini 0.72 :large 1.15})
 
+(defn- wrapped-height
+  "The height of lines wrapped at width pixels: each takes as many as its characters fill,
+at least one."
+  [lines width]
+  (let [per-line (max 1 (quot (max 0 width) char-width))]
+    (* line-height
+       (reduce + 0 (map (fn [line] (max 1 (quot (+ (count line) per-line -1) per-line)))
+                        lines)))))
+
+(defmethod ui/backend-height-for-width [(b headless-backend) (l ui/label-widget) width]
+  (wrapped-height (let [ls (string/split-lines (str (:text l)))] (if (seq ls) ls [""])) width))
+
+(defmethod ui/backend-height-for-width [(b headless-backend) (v ui/code-view-widget) width]
+  ;; lines wrapped only if the view wraps
+  (let [buf (:buffer v)
+        lines (map (fn [i] (ui/line-text buf i)) (range (ui/buffer-line-count buf)))]
+    (if (:wrap v)
+      (wrapped-height lines width)
+      (* line-height (ui/buffer-line-count buf)))))
+
 (defmethod ui/backend-natural-size [(b headless-backend) widget]
   ;; A control's size scales with its :control-size.
   (let [[w h] (natural-size widget)

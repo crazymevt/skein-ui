@@ -88,6 +88,8 @@ user acts."
 
 (ffi/defcfun ^:blocking widget-set-size-request "gtk_widget_set_size_request" void
   [w ptr, width i32, height i32])
+(ffi/defcfun ^:blocking widget-get-size-request "gtk_widget_get_size_request" void
+  [w ptr, width ptr, height ptr])
 (ffi/defcfun ^:blocking widget-measure "gtk_widget_measure" void
   [w ptr, orientation i32, for-size i32, min ptr, nat ptr, min-base ptr, nat-base ptr])
 (ffi/defcfun ^:blocking widget-set-visible "gtk_widget_set_visible" void [w ptr, v bool])
@@ -144,6 +146,22 @@ hasn't placed it."
       (let [width (ffi/get nt i32)]
         (widget-measure w 1 width mn nt (ffi/null) (ffi/null))
         [width (ffi/get nt i32)]))))
+
+(defn height-for-width
+  "The natural height of the GTK widget w when it is width wide, measured without its size
+request (as natural-size is), which it keeps."
+  [w width]
+  (ffi/with-foreign [mn (ffi/alloc i32 1)]
+    (ffi/with-foreign [nt (ffi/alloc i32 1)]
+      ;; without the request layout gave it, which it gets back
+      (widget-get-size-request w mn nt)
+      (let [rw (ffi/get mn i32)
+            rh (ffi/get nt i32)]
+        (widget-set-size-request w -1 -1)
+        (widget-measure w 1 (int width) mn nt (ffi/null) (ffi/null))
+        (let [h (ffi/get nt i32)]
+          (widget-set-size-request w rw rh)
+          h)))))
 
 (defn position-in
   "Where the GTK widget w's top left is in target's coordinates, [x y], or nil if GTK

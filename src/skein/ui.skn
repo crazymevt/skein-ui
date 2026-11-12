@@ -89,6 +89,13 @@ reads back.")
 (defgeneric backend-close [backend window]
   "Close the window: take it off the screen.")
 
+(defgeneric backend-height-for-width [backend widget width]
+  "The natural height of a widget whose height depends on its width (width-dependent?)
+when it is width wide, or nil to use its natural size's.")
+
+(defmethod backend-height-for-width [(b backend) widget width]
+  nil)
+
 (defgeneric backend-natural-size [backend widget]
   "The natural [width height] of widget's native control, in pixels, for its contents.")
 
@@ -324,6 +331,8 @@ application."
   (destroyed :cell :atom :init false)
   (user-data :cell :atom :init nil :doc "Anything a program wants to keep with the object.")
   (size-cache :cell :atom :init nil :doc "The preferred size, until invalidate-size!.")
+  (height-cache :cell :atom :init nil
+                :doc "[width height]: the natural height at a width, until invalidate-size!.")
   (allocation :cell :atom :init nil
               :doc "[x y width height], where layout put it in its container."))
 
@@ -419,6 +428,7 @@ Custom widgets call this when something changes their natural size."
   (loop [o object]
     (when o
       (set-slot! o :size-cache nil)
+      (set-slot! o :height-cache nil)
       (recur (:parent o))))
   (when-let [root (layout-root object)]
     (schedule-layout! root))
@@ -773,6 +783,45 @@ margin. A hidden widget's is [0 0]."
                 (set-slot! w :size-cache size)
                 size)))
 
+(defgeneric width-dependent? [widget]
+  "True if widget's natural height depends on the width it is given: a wrapping label, a
+code view with :fit-height, a box or bin holding one. Layout then asks height-for-width
+at the width it gives.")
+
+(defmethod width-dependent? [(w widget)]
+  false)
+
+(defgeneric height-for-width [widget width]
+  "widget's natural height, without its margin, when it is width wide: the backend's for a
+leaf, its children's for a container. Only asked of width-dependent? widgets.")
+
+(defmethod height-for-width [(w widget) width]
+  (let [b (current-backend)]
+    (or (in-ui (fn [] (backend-height-for-width b w width)))
+        (second (measure w)))))
+
+(defn preferred-height
+  "widget's natural height, at least its :height, when it is width wide (without its
+margin): its preferred size's unless it is width-dependent?."
+  [w width]
+  (cond (not (:visible w)) 0
+        (not (width-dependent? w)) (second (preferred-size w))
+        :else (let [width (max 0 (int width))
+                    [cw ch] (:height-cache w)]
+                (if (= cw width)
+                  ch
+                  (let [h (max (int (math/ceil (height-for-width w width))) (or (:height w) 0))]
+                    (set-slot! w :height-cache [width h])
+                    h)))))
+
+(defn outer-height
+  "widget's preferred-height with its margin, in a cell width wide."
+  [w width]
+  (if (:visible w)
+    (let [[top right bottom left] (sides (:margin w))]
+      (+ top bottom (preferred-height w (- width left right))))
+    0))
+
 (defn outer-size
   "widget's preferred size with its margin, as [width height]."
   [w]
@@ -796,6 +845,8 @@ of that orientation, or a child of it expands."
   [w orientation]
   (let [flag (if (= orientation :horizontal) (:hexpand w) (:vexpand w))]
     (cond (not (:visible w)) false
+          ;; a code view as tall as its text
+          (and (= orientation :vertical) (:fit-height w)) false
           (= flag :auto) (boolean (or (and (:expand w)
                                            (= orientation (main-axis (:parent w))))
                                       (some (fn [c] (expands? c orientation)) (:children w))))
@@ -845,8 +896,15 @@ start."
     (let [[top right bottom left] (sides (:margin w))
           [pw ph] (preferred-size w)
           [ax aw] (align-in (:halign w) (+ x left) (max 0 (- width left right)) pw)
+          ph (if (width-dependent? w) (preferred-height w aw) ph)
           [ay ah] (align-in (:valign w) (+ y top) (max 0 (- height top bottom)) ph)]
       (allocate w ax ay aw ah))))
+
+(defn- cell-width
+  "How wide widget is in a cell width wide, margin included: all of it if it fills,
+else at most its own width."
+  [w width]
+  (if (= :fill (:halign w)) width (min width (first (outer-size w)))))
 
 (defn distribute
   "Split total pixels among items of the natural sizes given: when there is more, the
@@ -963,6 +1021,30 @@ the corners, so give it padding)."
       [(+ main left right) (+ cross top bottom)]
       [(+ cross left right) (+ main top bottom)])))
 
+(defmethod width-dependent? [(b box-widget)]
+  (boolean (some width-dependent? (visible-children b))))
+
+(defn- row-widths
+  "The widths a horizontal box width wide gives its visible children (margins included)."
+  [b width]
+  (let [[_ right _ left] (sides (:padding b))
+        kids (visible-children b)
+        inner (- width left right (* (:spacing b) (max 0 (dec (count kids)))))]
+    (distribute (max 0 inner) (mapv (fn [c] (first (outer-size c))) kids)
+                (mapv (fn [c] (expands? c :horizontal)) kids) (:homogeneous b))))
+
+(defmethod height-for-width [(b box-widget) width]
+  (let [[top right bottom left] (sides (:padding b))
+        kids (visible-children b)]
+    (+ top bottom
+       (if (= :horizontal (:orientation b))
+         (reduce max 0 (map outer-height kids (row-widths b width)))
+         (let [inner (max 0 (- width left right))
+               heights (map (fn [c] (outer-height c (cell-width c inner))) kids)]
+           (if (:homogeneous b)
+             (* (count kids) (reduce max 0 heights))
+             (+ (reduce + 0 heights) (* (:spacing b) (max 0 (dec (count kids)))))))))))
+
 (defmethod arrange [(b box-widget) width height]
   (let [[top right bottom left] (sides (:padding b))
         kids (visible-children b)
@@ -971,7 +1053,11 @@ the corners, so give it padding)."
         inner-main (- (if horizontal (- width left right) (- height top bottom))
                       (* gap (max 0 (dec (count kids)))))
         inner-cross (if horizontal (- height top bottom) (- width left right))
-        sizes (mapv (fn [c] (let [[w h] (outer-size c)] (if horizontal w h))) kids)
+        ;; in a column, each child's height at the width it gets
+        sizes (mapv (fn [c] (if horizontal
+                              (first (outer-size c))
+                              (outer-height c (cell-width c inner-cross))))
+                    kids)
         expanding (mapv (fn [c] (expands? c (:orientation b))) kids)
         alloc (distribute (max 0 inner-main) sizes expanding (:homogeneous b))]
     (reduce (fn [pos [c size]]
@@ -1108,6 +1194,13 @@ and whether it expands."
   (let [[dw dh] (backend-decoration-size (current-backend) b)
         [cw ch] (if-let [c (content b)] (outer-size c) [0 0])]
     [(+ cw dw) (+ ch dh)]))
+
+(defmethod width-dependent? [(b bin-widget)]
+  (boolean (when-let [c (content b)] (width-dependent? c))))
+
+(defmethod height-for-width [(b bin-widget) width]
+  (let [[dw dh] (backend-decoration-size (current-backend) b)]
+    (+ dh (if-let [c (content b)] (outer-height c (max 0 (- width dw))) 0))))
 
 (defmethod arrange [(b bin-widget) width height]
   (when-let [c (content b)]
@@ -1697,7 +1790,9 @@ path."
   "Text that the user can't edit."
   (text :cell :atom :init "")
   (alignment :cell :atom :init :left :doc "How lines line up: :left, :center or :right.")
-  (wrap :cell :atom :init false :doc "Whether long text wraps (set :width to say where).")
+  (wrap :cell :atom :init false
+        :doc "Whether long text wraps: at the width layout gives it (its natural width is
+its :width, if set, else its text's on one line).")
   (selectable :cell :atom :init false :doc "Whether the user can select and copy the text.")
   (text-color :cell :atom :init nil :doc "The text's color (a color designator), or nil.")
   (background :cell :atom :init nil :doc "A background color, or nil for none."))
@@ -1705,6 +1800,9 @@ path."
 (declare-widget! label-widget {:properties [:text :alignment :wrap :selectable :text-color
                                             :background]
                                :layout [:text :wrap]})
+
+(defmethod width-dependent? [(l label-widget)]
+  (boolean (:wrap l)))
 
 (defn label
   "A label: (label {:text \"Name\"})."
@@ -2870,13 +2968,18 @@ view, :always always, and :never makes the content as wide as the view.")
     [(+ dw (if (= :never (:horizontal-policy s)) cw (min cw (:min-content-width s))))
      (+ dh (if (= :never (:vertical-policy s)) ch (min ch (:min-content-height s))))]))
 
+(defmethod width-dependent? [(s scrolled-window-widget)]
+  false)
+
 (defmethod arrange [(s scrolled-window-widget) width height]
   (when-let [c (content s)]
     (let [b (current-backend)
           [_ _ vw vh] (backend-content-area b s width height)
-          [cw ch] (outer-size c)
-          extent (fn [vw vh] [(if (= :never (:horizontal-policy s)) vw (max vw cw))
-                              (if (= :never (:vertical-policy s)) vh (max vh ch))])
+          [cw _] (outer-size c)
+          ;; content as wide as the view is as tall as it is at that width
+          height-at (fn [w] (outer-height c w))
+          extent (fn [vw vh] (let [w (if (= :never (:horizontal-policy s)) vw (max vw cw))]
+                               [w (if (= :never (:vertical-policy s)) vh (max vh (height-at w)))]))
           [w h] (extent vw vh)
           ;; Showing a scroll bar can shrink the view; if it did, size the content again.
           changed (in-ui (fn [] (backend-set-scroll-extent b s w h)))
@@ -5220,6 +5323,9 @@ what it does. It emits :changed (a buffer-change-event) for any change to its bu
   (tab-width :cell :atom :init 4 :doc "How many spaces wide a tab is.")
   (wrap :cell :atom :init false
         :doc "Whether long lines wrap at its width, instead of scrolling sideways.")
+  (fit-height :cell :atom :init false
+              :doc "Whether it is as tall as its text at its width, with no vertical scroll
+bar of its own: a message in a column of them, say. It doesn't expand vertically then.")
   (placeholder :cell :atom :init nil :doc "Dimmed text shown while it is empty, or nil.")
   (text-styles :cell :atom :init {}
                :doc "A map from style names to attribute maps, which runs with :style use.
@@ -5236,7 +5342,8 @@ Changing it restyles the view, as a theme change needs.")
 
 (declare-widget! code-view-widget
                  {:properties [:buffer :editable :line-numbers :tab-width :wrap :placeholder
-                               :text-styles]
+                               :text-styles :fit-height]
+                  :layout [:fit-height]
                   :signals (merge input-signals
                                   {:changed buffer-change-event :selection-changed event
                                    :scrolled event :mouse-move mouse-event
@@ -5248,7 +5355,16 @@ Changing it restyles the view, as a theme change needs.")
   ([opts] (build code-view-widget opts nil)))
 
 (defmethod measure [(v code-view-widget)]
-  [300 200])
+  (if (:fit-height v) [300 (preferred-height v 300)] [300 200]))
+
+(defmethod width-dependent? [(v code-view-widget)]
+  (boolean (:fit-height v)))
+
+(defmethod height-for-width [(v code-view-widget) width]
+  ;; a backend that can't measure text: a line's height a line
+  (let [b (current-backend)]
+    (or (in-ui (fn [] (backend-height-for-width b v width)))
+        (* 16 (buffer-line-count (:buffer v))))))
 
 (defmethod has-caret? [(v code-view-widget)] true)
 
@@ -5416,6 +5532,7 @@ that overlaps it, or that it falls in, to the last are made again."
                                                (:removed-text e))))))
     (doseq [v (:views b)]
       (when-not (:destroyed v)
+        (when (:fit-height v) (invalidate-size! v))
         (set-slot! v :cursor (shift-position (:cursor v) start old-end new-end))
         (set-slot! v :anchor (shift-position (:anchor v) start old-end new-end))
         (set-slot! v :run-chunks (shift-chunks (:run-chunks v) start old-end new-end))
@@ -5612,9 +5729,11 @@ left, scrolled part included, gutter excluded), where a click there puts the car
     (in-ui (fn [] (backend-code-scroll-to-position b v p)))))
 
 (defn visible-lines
-  "[first last], the lines the code view shows."
+  "[first last], the lines the code view shows: all of them with :fit-height."
   [v]
-  (let [b (current-backend)] (in-ui (fn [] (backend-code-visible-lines b v)))))
+  (if (:fit-height v)
+    [0 (dec (buffer-line-count (:buffer v)))]
+    (let [b (current-backend)] (in-ui (fn [] (backend-code-visible-lines b v))))))
 
 (defn gutter-width
   "The width of the code view's line-number gutter, or 0 when it has none."
@@ -5754,6 +5873,7 @@ once; the rest as it scrolls into view."
             z (min (second old) (text-length v))]
         (in-ui (fn [] (backend-code-apply-runs b v (first old) z []))))))
   (ensure-styled! v)
+  (when (:fit-height v) (invalidate-size! v))
   runs)
 
 (defn replace-text-runs!
@@ -5762,6 +5882,8 @@ range, and show the change where it shows: how to restyle part of a large text."
   [v start end runs]
   (set-slot! v :run-chunks (replace-chunk-runs (:run-chunks v) start end (map normalize-run runs)))
   (restyle! v start end)
+  ;; a run's size or spacing changes the height of a view as tall as its text
+  (when (:fit-height v) (invalidate-size! v))
   runs)
 
 (defn text-style-at

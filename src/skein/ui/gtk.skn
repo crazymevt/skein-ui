@@ -3587,6 +3587,17 @@ which has it already."
 (defmethod set-native [(w ui/code-view-widget) (p (= :wrap)) v]
   (lib/text-view-set-wrap-mode (text-view-of w) (if v 3 0)))
 
+(defmethod set-native [(w ui/code-view-widget) (p (= :fit-height)) v]
+  ;; As tall as its text: it doesn't scroll vertically (GTK_POLICY_NEVER is 2), so the
+  ;; wheel goes on to the view it's in.
+  (lib/scrolled-set-policy (native w) 1 (if v 2 1)))
+
+(defmethod ui/backend-height-for-width [(b gtk-backend) (w ui/code-view-widget) width]
+  (lib/height-for-width (native w) width))
+
+(defmethod ui/backend-height-for-width [(b gtk-backend) (l ui/label-widget) width]
+  (lib/height-for-width (native l) width))
+
 (defmethod set-native [(w ui/code-view-widget) (p (= :line-numbers)) v]
   (update-code-gutter! w))
 
