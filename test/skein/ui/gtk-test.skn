@@ -255,7 +255,13 @@
                          :on-link-activated (fn [e] (swap! seen conj (:href e)))})
         w (ui/window {:width 400 :height 300} r)
         at (fn [s] (string/index-of (ui/code-text r) s))
-        tags (fn [p] (gtk/code-tag-attributes r p))]
+        tags (fn [p] (gtk/code-tag-attributes r p))
+        ;; GTK lays text out on its frame clock, later under Xvfb: wait until the line of
+        ;; the text s has its place, below the first.
+        placed (fn [s] (loop [n 0]
+                         (when (and (< n 30) (zero? (second (ui/point-at-position r (at s)))))
+                           (gtk/run-for! 0.1)
+                           (recur (inc n)))))]
     (ui/show! w)
     (gtk/run-for! 0.3)
     (is (= (ui/code-text r) (gtk/code-native-text r)))
@@ -265,6 +271,7 @@
       (is (= [24 -18] ((juxt :indent :first-indent) (tags (at "one")))))
       (is (some? (:block-background (tags (at "(defn"))))))
     (testing "a click on a link, through the view's click gesture"
+      (placed "the docs")
       (gtk/click-code-position! r (+ 2 (at "the docs")))
       (is (= ["https://x.test"] @seen))
       (gtk/click-code-position! r (at "Call"))
@@ -273,6 +280,7 @@
       (ui/append-content! r [[:p "More, " [:a {:href "u2"} "there"]]])
       (gtk/run-for! 0.3)
       (is (= (ui/code-text r) (gtk/code-native-text r)))
+      (placed "there")
       (gtk/click-code-position! r (+ 1 (at "there")))
       (is (= ["https://x.test" "u2"] @seen)))
     (ui/close! w)))
