@@ -3095,6 +3095,9 @@ platform's dynamic one."
   [w d]
   (if (and (keyword? d) (ui/palette-color w d)) (ns-color (ui/widget-color w d)) (ns-color d)))
 
+(def ^:private recolor-code-view!
+  "Give a code view its palette's colors again (defined with code views).")
+
 (defmethod ui/backend-apply-palette [(b cocoa-backend) w]
   (cond
     (instance? ui/label-widget w)
@@ -3111,6 +3114,7 @@ platform's dynamic one."
       (objc/send-p-void tv (objc/sel "setTextColor:") (palette-ns-color w :text))
       (objc/send-p-void tv (objc/sel "setBackgroundColor:") (palette-ns-color w :background))
       (objc/send-p-void tv (objc/sel "setInsertionPointColor:") (palette-ns-color w :caret)))
+    (instance? ui/code-view-widget w) (recolor-code-view! w)
     (or (instance? ui/list-box-widget w) (instance? ui/tree-view-widget w))
     (objc/send-p-void (table-of w) (objc/sel "setBackgroundColor:")
                       (palette-ns-color w :control-background))
@@ -3946,6 +3950,16 @@ typing."
     (objc/send-p-void (code-text-view w) (objc/sel "setTypingAttributes:") attributes)
     (update-gutter! w)))
 
+(defn- recolor-code-view!
+  ;; Plain text's color is in its attributes, made from the palette: made again, and the
+  ;; runs given back their fonts and paragraph styles, which that overwrites.
+  [w]
+  (apply-base-attributes! w)
+  (when (ui/palette-color w :caret)
+    (objc/send-p-void (code-text-view w) (objc/sel "setInsertionPointColor:")
+                      (palette-ns-color w :caret)))
+  (ui/set-text-runs! w (ui/text-runs w)))
+
 (defn- attach-storage!
   "Put the code view's layout manager on its buffer's storage, making the storage first."
   [w]
@@ -4535,8 +4549,8 @@ nil."
   "What the code view's text storage has at position: its font's :size, :monospace and
 :bold, and its paragraph style's :indent, :first-indent (from :indent), :space-above,
 :space-below, :tabs and :block-background (whether it has a block with a background); an
-attachment's [width height] as :attachment; and from the layout's temporary attributes,
-:strikethrough."
+attachment's [width height] as :attachment; its text's :color, as hex; and from the
+layout's temporary attributes, :strikethrough."
   [w position]
   (objc/call-with-pool
    (fn []
@@ -4547,6 +4561,7 @@ attachment's [width height] as :attachment; and from the layout's temporary attr
            font (at "NSFont")
            p (at "NSParagraphStyle")
            attachment (at "NSAttachment")
+           text-color (at "NSColor")
            struck (objc/send-plp (:layout (parts w))
                                  (objc/sel "temporaryAttribute:atCharacterIndex:effectiveRange:")
                                  (objc/ns-string "NSStrikethrough") i (ffi/null))
@@ -4556,7 +4571,8 @@ attachment's [width height] as :attachment; and from the layout's temporary attr
        (merge {:size (objc/send-double font (objc/sel "pointSize"))
                :monospace (objc/send-bool font (objc/sel "isFixedPitch"))
                :bold (pos? (bit-and traits 2))
-               :strikethrough (not (ffi/null? struck))}
+               :strikethrough (not (ffi/null? struck))
+               :color (when-not (ffi/null? text-color) (ui/color-hex (color-of text-color)))}
               (when-not (ffi/null? attachment)
                 (let [r (objc/send-rect attachment (objc/sel "bounds"))]
                   {:attachment [(ffi/field r objc/ns-rect :width)

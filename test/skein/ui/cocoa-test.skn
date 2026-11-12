@@ -314,6 +314,27 @@
       (is (= [3.0 2.0] (:attachment (cocoa/code-text-attributes r (at "\uFFFC"))))))
     (ui/close! w)))
 
+(deftest code-views-take-a-new-palette
+  ;; A palette changed while the view shows recolors its plain text (Skein Studio's themes
+  ;; left it the old theme's color, M3.8): its own palette, and its window's.
+  (let [v (ui/code-view {:buffer (ui/make-text-buffer {:text "plain (bold)"})
+                         :palette {:text "#ececE8"}})
+        w (ui/window {:width 300 :height 200} v)]
+    (ui/set-text-runs! v [[7 11 {:bold true}]])
+    (ui/show! w)
+    (cocoa/run-for! 0.05)
+    (is (= "#ECECE8" (string/upper-case (:color (cocoa/code-text-attributes v 0)))))
+    (set-slot! v :palette {:text "#1C1C1A"})
+    (cocoa/run-for! 0.05)
+    (is (= "#1C1C1A" (string/upper-case (:color (cocoa/code-text-attributes v 0)))))
+    (is (:bold (cocoa/code-text-attributes v 8)) "the runs keep their fonts")
+    (set-slot! v :palette nil)
+    (set-slot! w :palette {:text "#336699"})
+    (cocoa/run-for! 0.05)
+    (is (= "#336699" (string/upper-case (:color (cocoa/code-text-attributes v 0))))
+        "from the window's")
+    (ui/close! w)))
+
 (deftest rows-at-points-and-snapshots
   ;; Skein's M3.6, D-108.
   (let [l (ui/list-box {:items ["a" "b" "c"]})
