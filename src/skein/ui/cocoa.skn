@@ -147,8 +147,11 @@ button the mouse button, event the NSEvent.")
 (ffi/defcallback row-count-imp i64 [self ptr, cmd ptr, tv ptr]
   (if-let [w (objc/object-for tv)] (native-row-count w) 0))
 
-(defn- column-index [tv col]
-  (objc/send-p-long (objc/send tv (objc/sel "tableColumns")) (objc/sel "indexOfObject:") col))
+(defn- column-index
+  "The index in :columns of the table view's column col: its identifier, which stays when
+the user drags it to another place."
+  [tv col]
+  (parse-long (objc/string-of (objc/send col (objc/sel "identifier")))))
 
 (ffi/defcallback cell-value-imp ptr [self ptr, cmd ptr, tv ptr, col ptr, row i64]
   (if-let [w (objc/object-for tv)]
@@ -1606,7 +1609,8 @@ NSTableColumn."
         i (when-let [c (:sort-column t)] (index-of (:columns t) c))]
     (doseq [k (range (objc/send-long cols (objc/sel "count")))]
       (objc/send-pp-void tv (objc/sel "setIndicatorImage:inTableColumn:")
-                         (if (= k i)
+                         (if (= i (column-index tv (objc/send-l cols (objc/sel "objectAtIndex:")
+                                                                k)))
                            (objc/send-p (objc/cls "NSImage") (objc/sel "imageNamed:")
                                         (objc/ns-string (if (:sort-descending t)
                                                           "NSDescendingSortIndicator"
@@ -2512,6 +2516,19 @@ string value."
                        (objc/send tv (objc/sel "doubleAction"))
                        (objc/send tv (objc/sel "target")))))
 
+(defn cell-point
+  "The middle of the cell at row and column (a position in the view) of a list box's,
+table's or tree's view, as its mouse events give points."
+  [w row column]
+  (let [r (objc/send-ll-rect (table-of w) (objc/sel "frameOfCellAtColumn:row:") column row)]
+    [(+ (ffi/field r objc/ns-rect :x) (/ (ffi/field r objc/ns-rect :width) 2))
+     (+ (ffi/field r objc/ns-rect :y) (/ (ffi/field r objc/ns-rect :height) 2))]))
+
+(defn move-column-natively!
+  "Drag a table's column from one place to another, as the user would."
+  [t from to]
+  (objc/send-ll-void (table-of t) (objc/sel "moveColumn:toColumn:") from to))
+
 (defn click-column-title!
   "Tell a table's delegate its column at index was clicked, as AppKit does."
   [t index]
@@ -2735,6 +2752,43 @@ a widget with input signals other than a canvas, which handles its own."
                        (emit-input! w :context-request :x x :y y :button button
                                     :click-count clicks :modifiers mods))))))
         false))))
+
+;;; The row and cell at a point (Skein's M3.6, D-108). A list's mouse events give points
+;;; in its table view, which rowAtPoint: and columnAtPoint: take.
+
+(defmethod ui/backend-cell-at-point [(b cocoa-backend) w x y]
+  (let [tv (table-of w)
+        p {:x (f64 x) :y (f64 y)}
+        row (objc/send-point-long tv (objc/sel "rowAtPoint:") p)
+        col (objc/send-point-long tv (objc/sel "columnAtPoint:") p)]
+    (when (>= row 0)
+      [(if (instance? ui/tree-view-widget w)
+         (item-of (objc/send-l tv (objc/sel "itemAtRow:") row))
+         (get (vec (:items w)) row))
+       (when (>= col 0)
+         (column-index tv (objc/send-l (objc/send tv (objc/sel "tableColumns"))
+                                       (objc/sel "objectAtIndex:") col)))])))
+
+;;; Snapshots (Skein's M3.6, D-108): the content view drawn into a bitmap, as PNG.
+
+(defmethod ui/backend-snapshot [(b cocoa-backend) w]
+  ;; The window's frame view draws its background and every control; the content view
+  ;; alone leaves some out. Its content area is the content view's frame in it.
+  (let [cv (objc/send (view w) (objc/sel "contentView"))
+        fv (objc/send cv (objc/sel "superview"))
+        r (objc/send-rect cv (objc/sel "frame"))
+        bounds (objc/rect (ffi/field r objc/ns-rect :x) (ffi/field r objc/ns-rect :y)
+                          (ffi/field r objc/ns-rect :width) (ffi/field r objc/ns-rect :height))
+        _ (objc/send-void fv (objc/sel "displayIfNeeded"))
+        rep (objc/send-r fv (objc/sel "bitmapImageRepForCachingDisplayInRect:") bounds)
+        _ (objc/send-rp-void fv (objc/sel "cacheDisplayInRect:toBitmapImageRep:") bounds rep)
+        data (objc/send-lp rep (objc/sel "representationUsingType:properties:") 4   ; PNG
+                           (objc/send (objc/cls "NSDictionary") (objc/sel "dictionary")))
+        n (objc/send-long data (objc/sel "length"))
+        bytes (make-array u8 n)]
+    (ffi/pin [p bytes]
+      (objc/memcpy p (objc/send data (objc/sel "bytes")) n))
+    bytes))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Windows' options, modal runs and the application

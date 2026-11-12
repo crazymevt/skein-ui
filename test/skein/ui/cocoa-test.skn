@@ -238,6 +238,43 @@
       (is (= ["main.skn"] (:selection tree))))
     (ui/close! w)))
 
+(deftest rows-at-points-and-snapshots
+  ;; Skein's M3.6, D-108.
+  (let [l (ui/list-box {:items ["a" "b" "c"]})
+        name-col (ui/column "Name" :name {:width 100})
+        age-col (ui/column "Age" :age)
+        t (ui/table-view {:columns [name-col age-col]
+                          :items [{:name "Ada" :age 36} {:name "Bob" :age 7}]})
+        files {"/" ["docs" "src"] "src" ["main.skn"]}
+        tree (ui/tree-view {:roots ["/"] :children-fn (fn [f] (get files f []))})
+        w (ui/window {:width 400 :height 500} (ui/vbox {} l t tree))
+        at (fn [f widget row column] (let [[x y] (cocoa/cell-point widget row column)]
+                                       (f widget x y)))]
+    (ui/show! w)
+    (testing "list boxes"
+      (is (= ["a" "b" "c"] (mapv (fn [r] (at ui/item-at-point l r 0)) [0 1 2])))
+      (is (nil? (ui/item-at-point l 5 2000)) "below the rows"))
+    (testing "tables, by column, also once the user moved one"
+      (is (= [{:name "Bob" :age 7} age-col] (at ui/cell-at-point t 1 1)))
+      (is (= [{:name "Ada" :age 36} name-col] (at ui/cell-at-point t 0 0)))
+      (cocoa/move-column-natively! t 1 0)
+      (is (= [{:name "Ada" :age 36} age-col] (at ui/cell-at-point t 0 0)))
+      (is (= "36" (cocoa/cell-string t 0 0)) "the moved column shows its own cells"))
+    (testing "trees"
+      (ui/expand! tree "/")
+      (is (= ["/" "docs" "src"] (mapv (fn [r] (at ui/item-at-point tree r 0)) [0 1 2]))))
+    (testing "snapshots"
+      (let [png (ui/snapshot w)
+            u32 (fn [i] (reduce (fn [n k] (+ (* n 256) (aget png (+ i k)))) 0 (range 4)))
+            scale (quot (u32 16) 400)]
+        (is (= [137 80 78 71] (mapv (fn [i] (aget png i)) (range 4))))
+        (is (contains? #{1 2 3} scale) "the screen's scale")
+        (is (= [(* scale 400) (* scale 500)] [(u32 16) (u32 20)]) "the content area")
+        (let [path (str (io/temp-dir "snapshot") "/w.png")]
+          (ui/snapshot w path)
+          (is (< 1000 (io/file-size path))))))
+    (ui/close! w)))
+
 (deftest canvases-draw-and-get-the-mouse
   (let [clicks (atom [])
         c (ui/canvas {:width 200 :height 100 :background :white

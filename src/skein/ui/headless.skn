@@ -1008,3 +1008,129 @@ platform tells the core, which emits :closed with :dismissed). True if it closed
   "The scripts the web view was asked to run, oldest first: [id script]."
   [v]
   (:web-scripts @(:native v)))
+
+;;; ------------------------------------------------------------------------------------
+;;; The row at a point, and snapshots (Skein's M3.6, D-108)
+
+(def row-height
+  "The height of a list's, table's or tree's rows, and of a table's titles, in pixels."
+  24)
+
+(defn- column-lefts
+  "Where each of the widget's columns starts, and where the last ends: fixed widths as
+given, the width left shared by the others."
+  [w width]
+  (let [cols (vec (:columns w))
+        fixed (reduce + 0 (keep :width cols))
+        shared (count (remove :width cols))
+        each (if (pos? shared) (quot (max 0 (- width fixed)) shared) 0)]
+    (vec (reductions + 0 (map (fn [c] (or (:width c) each)) cols)))))
+
+(defmethod ui/backend-cell-at-point [(b headless-backend) w x y]
+  ;; Rows row-height pixels high from the top, under the titles if they show; no scrolling.
+  (let [[_ _ width height] (or (:allocation w) (into [0 0] (natural-size w)))
+        tree (instance? ui/tree-view-widget w)
+        columns (seq (:columns w))
+        header (if (and columns (:headers w)) row-height 0)
+        rows (if tree (ui/visible-tree-items w) (vec (:items w)))
+        row (quot (- y header) row-height)
+        lefts (column-lefts w width)
+        column (if columns
+                 (first (keep-indexed (fn [i left] (when (and (<= left x) (< x (get lefts (inc i))))
+                                                     i))
+                                      (butlast lefts)))
+                 0)]
+    (when (and (<= 0 x) (< x width) (<= header y) (< y height) (< -1 row (count rows)) column)
+      [(nth rows row) column])))
+
+(def ^:private crc-table
+  (mapv (fn [n] (loop [c n k 0]
+                  (if (= k 8)
+                    c
+                    (recur (if (odd? c)
+                             (bit-xor 0xEDB88320 (bit-shift-right c 1))
+                             (bit-shift-right c 1))
+                           (inc k)))))
+        (range 256)))
+
+(defn- crc32
+  "The CRC-32 of the bytes of a from start to end, as PNG's chunks have."
+  [a start end]
+  (loop [i start c 0xFFFFFFFF]
+    (if (< i end)
+      (recur (inc i) (bit-xor (get crc-table (bit-and (bit-xor c (aget a i)) 0xFF))
+                              (bit-shift-right c 8)))
+      (bit-xor c 0xFFFFFFFF))))
+
+(defn- adler32 [a]
+  (loop [i 0 s1 1 s2 0]
+    (if (< i (count a))
+      (let [s1 (mod (+ s1 (aget a i)) 65521)]
+        (recur (inc i) s1 (mod (+ s2 s1) 65521)))
+      (+ (* s2 65536) s1))))
+
+(defn png-gray
+  "A PNG of 8-bit gray pixels: pixels is a u8 array of width times height, row by row.
+The image data is deflate's stored blocks, uncompressed."
+  [width height pixels]
+  (let [raw (make-array u8 (* height (inc width)))
+        _ (dotimes [y height]
+            (dotimes [x width]
+              (aset! raw (+ (* y (inc width)) 1 x) (aget pixels (+ (* y width) x)))))
+        n (count raw)
+        blocks (max 1 (quot (+ n 65534) 65535))
+        zsize (+ 2 n (* 5 blocks) 4)
+        out (make-array u8 (+ 8 25 (+ 12 zsize) 12))
+        pos (volatile! 0)
+        byte! (fn [v] (aset! out @pos (bit-and v 0xFF)) (vswap! pos inc))
+        u32! (fn [v] (doseq [s [24 16 8 0]] (byte! (bit-shift-right v s))))
+        chunk! (fn [type size write]
+                 (u32! size)
+                 (let [start @pos]
+                   (doseq [c type] (byte! (int c)))
+                   (write)
+                   (u32! (crc32 out start @pos))))]
+    (doseq [v [137 80 78 71 13 10 26 10]] (byte! v))
+    (chunk! "IHDR" 13 (fn [] (u32! width) (u32! height)
+                        (doseq [v [8 0 0 0 0]] (byte! v))))   ; 8 bits, gray
+    (chunk! "IDAT" zsize
+            (fn []
+              (byte! 0x78) (byte! 0x01)
+              (loop [i 0 k 0]
+                (when (< k blocks)
+                  (let [len (min 65535 (- n i))]
+                    (byte! (if (= k (dec blocks)) 1 0))
+                    (byte! len) (byte! (bit-shift-right len 8))
+                    (byte! (bit-xor len 0xFFFF)) (byte! (bit-shift-right (bit-xor len 0xFFFF) 8))
+                    (dotimes [j len] (byte! (aget raw (+ i j))))
+                    (recur (+ i len) (inc k)))))
+              (u32! (adler32 raw))))
+    (chunk! "IEND" 0 (fn [] nil))
+    out))
+
+(defn- outline!
+  "Draw the outline of the box x, y, w, h in black on the pixels, inside clip [x0 y0 x1 y1]."
+  [pixels width [x0 y0 x1 y1] x y w h]
+  (let [plot (fn [px py] (when (and (<= x0 px) (< px x1) (<= y0 py) (< py y1))
+                           (aset! pixels (+ (* py width) px) 0)))]
+    (when (and (pos? w) (pos? h))
+      (dotimes [i w] (plot (+ x i) y) (plot (+ x i) (+ y h -1)))
+      (dotimes [j h] (plot x (+ y j)) (plot (+ x w -1) (+ y j))))))
+
+(defmethod ui/backend-snapshot [(b headless-backend) window]
+  ;; White, with each visible widget's box outlined in black, clipped to its container's.
+  (let [content (first (:children window))
+        [_ _ cw ch] (or (when content (:allocation content)) [0 0 0 0])
+        width (max 1 (or (:width window) cw))
+        height (max 1 (or (:height window) ch))
+        pixels (make-array u8 (* width height))]
+    (dotimes [i (* width height)] (aset! pixels i 255))
+    (letfn [(draw [w ox oy clip]
+              (when-let [[ax ay aw ah] (when (:visible w) (:allocation w))]
+                (let [x (+ ox ax) y (+ oy ay)
+                      [x0 y0 x1 y1] clip
+                      inner [(max x0 x) (max y0 y) (min x1 (+ x aw)) (min y1 (+ y ah))]]
+                  (outline! pixels width clip x y aw ah)
+                  (doseq [c (:children w)] (draw c x y inner)))))]
+      (when content (draw content 0 0 [0 0 width height])))
+    (png-gray width height pixels)))

@@ -147,9 +147,19 @@ this namespace's), reporting it as kind. Returns o."
   (when-let [[w column] (get @factory-owners (ffi/address factory))]
     (setup-cell w column item)))
 
+(def ^:private cell-widgets
+  "The GTK widget of each cell set up -> [its list item, its column's index in :columns],
+to find the cell at a point. A list item is set up once and bound to row after row; teardown
+forgets it."
+  (atom {}))
+
 (ffi/defcallback bind-imp void [factory ptr, item ptr, data ptr]
   (when-let [[w column] (get @factory-owners (ffi/address factory))]
     (bind-cell w column item)))
+
+(ffi/defcallback teardown-imp void [factory ptr, item ptr, data ptr]
+  (let [gone (ffi/address item)]
+    (swap! cell-widgets (fn [m] (into {} (remove (fn [[_ [li _]]] (= (ffi/address li) gone))) m)))))
 
 (ffi/defcallback selection-changed-imp void [model ptr, position u32, n u32, data ptr]
   (when-let [w (lib/object-for model)]
@@ -1270,7 +1280,16 @@ skein.ui image, or null for nil."
     (swap! factory-owners assoc (ffi/address f) [w column])
     (lib/g-signal-connect-data f "setup" setup-imp (ffi/null) (ffi/null) 0)
     (lib/g-signal-connect-data f "bind" bind-imp (ffi/null) (ffi/null) 0)
+    (lib/g-signal-connect-data f "teardown" teardown-imp (ffi/null) (ffi/null) 0)
     f))
+
+(defn- gtk-ancestors
+  "The GTK widget n and the widgets it is in, up to (not including) stop, or to the top."
+  [n stop]
+  (loop [n n out []]
+    (if (or (ffi/null? n) (and stop (= (ffi/address n) (ffi/address stop))))
+      out
+      (recur (lib/widget-get-parent n) (conj out n)))))
 
 (defn- tree? [w] (instance? ui/tree-view-widget w))
 (defn- columns-of [w] (vec (:columns w)))
@@ -1447,8 +1466,10 @@ skein.ui image, or null for nil."
     (if (and (tree? w) (= column 0))
       (let [expander (lib/tree-expander-new)]
         (lib/tree-expander-set-child expander box)
-        (lib/list-item-set-child list-item expander))
-      (lib/list-item-set-child list-item box))))
+        (lib/list-item-set-child list-item expander)
+        (swap! cell-widgets assoc (ffi/address expander) [list-item column]))
+      (do (lib/list-item-set-child list-item box)
+          (swap! cell-widgets assoc (ffi/address box) [list-item column])))))
 
 (defn- cell-item
   "The item of the list item's row."
@@ -2471,6 +2492,20 @@ given ({:text s} or {:text nil})."
   [w row column]
   (get @bound-cells [(ffi/address (native w)) row column]))
 
+(defn cell-point
+  "The middle of the cell GTK shows at row and column of a list box's, table's or tree's
+view, as its mouse events give points, or nil if none shows there."
+  [w row column]
+  (let [view (view-of w)
+        widgets (fn walk [n] (cons n (mapcat walk (lib/children-of n))))]
+    (first
+     (keep (fn [n]
+             (when-let [[list-item c] (get @cell-widgets (ffi/address n))]
+               (when (and (= c column) (= row (lib/list-item-get-position list-item)))
+                 (when-let [[x y cw ch] (lib/bounds-in n view)]
+                   [(+ x (/ cw 2)) (+ y (/ ch 2))]))))
+           (widgets view)))))
+
 (defn select-rows-natively!
   "Select rows in a list box's, table's or tree's view, as the user does."
   [w rows]
@@ -3003,13 +3038,75 @@ header."
             (detach! n)
             (lib/notebook-set-action-widget nb n pack)))))))
 
-(defn- gtk-ancestors
-  "The GTK widget n and the widgets it is in, up to (not including) stop, or to the top."
-  [n stop]
-  (loop [n n out []]
-    (if (or (ffi/null? n) (and stop (= (ffi/address n) (ffi/address stop))))
-      out
-      (recur (lib/widget-get-parent n) (conj out n)))))
+;;; The row and cell at a point (Skein's M3.6, D-108): the widget there and those it is
+;;; in, up to a cell's. A list's mouse events give points in its list or column view.
+
+(defn- cells-in
+  "The cells set up in the GTK widget n and the widgets in it: [widget list-item column]."
+  [n]
+  (let [here (when-let [[li c] (get @cell-widgets (ffi/address n))] [[n li c]])]
+    (into (vec here) (mapcat cells-in (lib/children-of n)))))
+
+(defmethod ui/backend-cell-at-point [(b gtk-backend) w x y]
+  ;; The first widget up from the one at x, y that holds cells, if they are one row's: a
+  ;; row's padding is its widget's, around its cells. The column is the cell's under x.
+  (let [view (view-of w)
+        picked (lib/widget-pick view (f64 x) (f64 y) 0)
+        cells (when-not (ffi/null? picked)
+                (first (keep (fn [n] (not-empty (cells-in n))) (gtk-ancestors picked view))))
+        rows (set (map (fn [[_ li _]] (ffi/address li)) cells))]
+    (when (= 1 (count rows))
+      (let [[_ li _] (first cells)
+            row (lib/list-item-get-position li)
+            column (some (fn [[n _ c]]
+                           (when-let [[cx _ cw _] (lib/bounds-in n view)]
+                             (when (and (<= cx x) (< x (+ cx cw))) c)))
+                         cells)]
+        (when (< row (n-rows w))
+          [(if (tree? w) (first (row-items w [row])) (get (vec (:items w)) row))
+           (if (= 1 (count cells)) (nth (first cells) 2) column)])))))
+
+;;; Snapshots (Skein's M3.6, D-108): the window drawn as a render node, the content area's
+;;; part of it rendered with Cairo and saved as PNG.
+
+(defmethod ui/backend-snapshot [(b gtk-backend) w]
+  (let [win (native w)
+        content (get @inner-fixed (ffi/address win))
+        [x y cw ch] (or (lib/bounds-in content win)
+                        (error "GTK hasn't placed the window's content yet"))
+        paintable (lib/widget-paintable-new win)
+        snap (lib/snapshot-new)]
+    (lib/paintable-snapshot paintable snap (f64 (lib/widget-get-width win))
+                            (f64 (lib/widget-get-height win)))
+    (lib/g-object-unref paintable)
+    (let [node (lib/snapshot-free-to-node snap)]
+      (when (ffi/null? node) (error "GTK hasn't drawn the window yet"))
+      (let [texture (ffi/with-foreign [r (ffi/alloc lib/graphene-rect)]
+                      (ffi/put-field! r lib/graphene-rect :x (f32 x))
+                      (ffi/put-field! r lib/graphene-rect :y (f32 y))
+                      (ffi/put-field! r lib/graphene-rect :width (f32 cw))
+                      (ffi/put-field! r lib/graphene-rect :height (f32 ch))
+                      ;; A renderer of its own: the window's draws with its GL context.
+                      (let [renderer (lib/cairo-renderer-new)]
+                        (when-not (lib/renderer-realize renderer (ffi/null) (ffi/null))
+                          (lib/g-object-unref renderer)
+                          (lib/render-node-unref node)
+                          (error "GTK can't make a renderer for a snapshot"))
+                        (try (lib/renderer-render-texture renderer node r)
+                             (finally (lib/renderer-unrealize renderer)
+                                      (lib/g-object-unref renderer)))))
+            png (lib/texture-save-to-png-bytes texture)]
+        (lib/render-node-unref node)
+        (lib/g-object-unref texture)
+        (let [bytes (ffi/with-foreign [size (ffi/alloc u64)]
+                      (let [data (lib/g-bytes-get-data png size)
+                            n (ffi/get size u64)
+                            out (make-array u8 n)]
+                        (ffi/pin [p out] (lib/memcpy p data n))
+                        out))]
+          (lib/g-bytes-unref png)
+          bytes)))))
+
 
 (defmethod ui/backend-tab-at-point [(b gtk-backend) pane x y]
   (let [nb (native pane)

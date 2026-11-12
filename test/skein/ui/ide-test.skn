@@ -1,0 +1,125 @@
+(ns skein.ui.ide-test
+  (:require [skein.test :refer [deftest is are testing use-fixtures]]
+            [skein.ui :as ui]
+            [skein.ui.headless :as headless]
+            [skein.io :as io]))
+
+;; What Skein Studio needs of skein-ui (Skein's M3.6, D-108), on the headless backend: the
+;; row and cell at a point, snapshots, and a buffer's revision for unsaved changes.
+
+(use-fixtures :each (fn [t] (ui/use-backend! (headless/backend)) (t)))
+
+(defn- shown
+  "w in a shown window of width by height, laid out."
+  [w width height]
+  (let [win (ui/window {:width width :height height} w)]
+    (ui/show! win)
+    (ui/flush-layouts!)
+    win))
+
+(deftest items-at-points
+  (testing "a list box: rows 24 pixels high"
+    (let [l (ui/list-box {:items ["a" "b" "c"]})]
+      (shown l 200 200)
+      (is (= "a" (ui/item-at-point l 10 0)))
+      (is (= "a" (ui/item-at-point l 10 23)))
+      (is (= "b" (ui/item-at-point l 10 24)))
+      (is (= "c" (ui/item-at-point l 199 71)))
+      (is (nil? (ui/item-at-point l 10 72)) "below the last row")
+      (is (nil? (ui/item-at-point l 200 10)) "beside the list")
+      (is (nil? (ui/item-at-point l -1 10)))
+      (is (nil? (ui/cell-at-point l 10 10)) "a list box has no columns")))
+  (testing "a table: under its titles, by column"
+    (let [name-col (ui/column "Name" :name {:width 50})
+          age-col (ui/column "Age" :age)
+          rows [{:name "Ann" :age 30} {:name "Bob" :age 40}]
+          t (ui/table-view {:columns [name-col age-col] :items rows})]
+      (shown t 150 200)
+      (is (nil? (ui/item-at-point t 10 10)) "the titles aren't a row")
+      (is (= (first rows) (ui/item-at-point t 10 24)))
+      (is (= [(first rows) name-col] (ui/cell-at-point t 49 30)))
+      (is (= [(first rows) age-col] (ui/cell-at-point t 50 30)))
+      (is (= [(second rows) age-col] (ui/cell-at-point t 149 50)))
+      (is (nil? (ui/cell-at-point t 150 50)))
+      (set-slot! t :headers false)
+      (is (= (first rows) (ui/item-at-point t 10 10)) "without titles the rows start at the top")
+      (ui/sort-table! t age-col true)
+      (is (= (second rows) (ui/item-at-point t 10 10)) "rows in the order they show")))
+  (testing "a tree: the rows that show"
+    (let [kids {:root [:x :y] :x [:x1] :y []}
+          t (ui/tree-view {:roots [:root] :children-fn (fn [i] (get kids i []))})]
+      (shown t 200 200)
+      (is (= :root (ui/item-at-point t 5 5)))
+      (is (nil? (ui/item-at-point t 5 30)) "closed")
+      (ui/expand! t :root)
+      (is (= [:root :x :y] (mapv (fn [y] (ui/item-at-point t 5 y)) [5 30 60])))
+      (ui/expand! t :x)
+      (is (= :x1 (ui/item-at-point t 5 60)))
+      (is (= :y (ui/item-at-point t 5 80)))))
+  (testing "other widgets have no rows"
+    (is (thrown-with-msg? error "has rows at points"
+                          (ui/item-at-point (ui/button {:label "B"}) 0 0)))))
+
+(defn- png-size [png]
+  (let [u32 (fn [i] (reduce (fn [n k] (+ (* n 256) (aget png (+ i k)))) 0 (range 4)))]
+    [(u32 16) (u32 20)]))
+
+(defn- png-pixels
+  "The gray pixels of a headless snapshot, rows of numbers: its image data is deflate's
+stored blocks."
+  [png]
+  (let [[w h] (png-size png)
+        start (+ 8 25 8 2)   ; signature, IHDR, IDAT's length and type, zlib's header
+        raw (loop [i start out []]
+              (let [final (odd? (aget png i))
+                    len (+ (aget png (+ i 1)) (* 256 (aget png (+ i 2))))
+                    out (into out (map (fn [k] (aget png (+ i 5 k))) (range len)))]
+                (if final out (recur (+ i 5 len) out))))]
+    (mapv (fn [y] (subvec raw (+ (* y (inc w)) 1) (* (inc y) (inc w)))) (range h))))
+
+(deftest snapshots
+  (let [b1 (ui/button {:label "One"})
+        b2 (ui/button {:label "Two"})
+        box (ui/vbox {:spacing 0} b1 b2)
+        win (ui/window {:width 120 :height 80} box)]
+    (is (thrown-with-msg? error "window that is shown" (ui/snapshot win)))
+    (ui/show! win)
+    (let [png (ui/snapshot win)
+          rows (png-pixels png)
+          [_ y2 _ _] (:allocation b2)]
+      (is (= [137 80 78 71 13 10 26 10] (mapv (fn [i] (aget png i)) (range 8))))
+      (is (= [120 80] (png-size png)))
+      (is (= 80 (count rows)))
+      (is (= 0 (get-in rows [0 0])) "the content's box")
+      (is (= 0 (get-in rows [y2 60])) "the second button's top")
+      (is (= 255 (get-in rows [(quot y2 2) 60])) "inside the first button"))
+    (let [path (str (io/temp-dir "snapshot") "/win.png")]
+      (is (= path (ui/snapshot win path)))
+      (is (= (vec (ui/snapshot win)) (vec (io/read-bytes path)))))))
+
+(deftest revisions-for-unsaved-changes
+  ;; As Lisp Studio does: remember the revision saved, and compare.
+  (let [b (ui/make-text-buffer {:text "(defn f [x] x)"})
+        saved (atom (:revision b))
+        modified? (fn [] (not= @saved (:revision b)))]
+    (is (not (modified?)) "a new buffer is as saved")
+    (ui/insert-into-buffer! b 0 ";; f\n")
+    (is (modified?))
+    (reset! saved (:revision b))
+    (is (not (modified?)) "saving")
+    (ui/undo! b)
+    (is (modified?) "undoing a saved change is a change")
+    (ui/redo! b)
+    (is (modified?) "so is redoing it: revisions only grow")
+    (let [r (:revision b)]
+      (ui/set-buffer-text! b "x")
+      (is (> (:revision b) r) "replacing the text")
+      (ui/with-undo-group [b]
+        (ui/insert-into-buffer! b 1 "y")
+        (ui/insert-into-buffer! b 2 "z"))
+      (is (= "xyz" (ui/buffer-text b))))
+    (let [v (ui/code-view {:buffer b})
+          r (:revision b)]
+      (shown v 200 100)
+      (ui/replace-selection! v "typed")
+      (is (> (:revision b) r) "a view's edits change its buffer's revision"))))

@@ -386,6 +386,23 @@ hasn't placed it."
 (ffi/defcfun ^:blocking button-new-from-icon-name "gtk_button_new_from_icon_name" ptr
   [name c-string])
 (ffi/defcfun ^:blocking widget-pick "gtk_widget_pick" ptr [w ptr, x f64, y f64, flags i32])
+
+;; Snapshots (Skein's M3.6, D-108)
+(ffi/defcfun ^:blocking widget-paintable-new "gtk_widget_paintable_new" ptr [w ptr])
+(ffi/defcfun ^:blocking snapshot-new "gtk_snapshot_new" ptr [])
+(ffi/defcfun ^:blocking paintable-snapshot "gdk_paintable_snapshot" void
+  [p ptr, s ptr, width f64, height f64])
+(ffi/defcfun ^:blocking snapshot-free-to-node "gtk_snapshot_free_to_node" ptr [s ptr])
+(ffi/defcfun ^:blocking cairo-renderer-new "gsk_cairo_renderer_new" ptr [])
+(ffi/defcfun ^:blocking renderer-realize "gsk_renderer_realize" bool
+  [r ptr, surface ptr, error ptr])
+(ffi/defcfun ^:blocking renderer-unrealize "gsk_renderer_unrealize" void [r ptr])
+(ffi/defcfun ^:blocking renderer-render-texture "gsk_renderer_render_texture" ptr
+  [r ptr, node ptr, viewport ptr])
+(ffi/defcfun ^:blocking render-node-unref "gsk_render_node_unref" void [n ptr])
+(ffi/defcfun ^:blocking texture-save-to-png-bytes "gdk_texture_save_to_png_bytes" ptr [t ptr])
+(ffi/defcfun ^:blocking g-bytes-get-data "g_bytes_get_data" ptr [b ptr, size ptr])
+(ffi/defcfun ^:blocking memcpy "memcpy" ptr [to ptr, from ptr, n u64])
 (ffi/defcfun ^:blocking widget-get-native "gtk_widget_get_native" ptr [w ptr])
 (ffi/defcfun ^:blocking native-get-surface-transform "gtk_native_get_surface_transform" void
   [n ptr, x ptr, y ptr])

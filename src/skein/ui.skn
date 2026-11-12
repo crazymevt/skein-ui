@@ -1489,6 +1489,25 @@ window."
   (note-normal-frame! w)
   (emit! w (event-for w :moved :value [x y])))
 
+;;; Snapshots (Skein's M3.6, D-108)
+
+(defgeneric backend-snapshot [backend window]
+  "A picture of the shown window's content area as PNG bytes, a u8 array.")
+
+(defn snapshot
+  "A picture of the window's content area as laid out now, as a PNG: its bytes, a u8
+array, or with path, written to that file (returning path). The window must be shown. The
+platform draws it offscreen, so a few native parts may be missing from it; the headless
+backend outlines each widget's box."
+  ([w]
+   (when-not (:shown w)
+     (error "a snapshot is of a window that is shown"))
+   (let [b (current-backend)]
+     (in-ui (fn [] (flush-layouts!) (backend-snapshot b w)))))
+  ([w path]
+   (io/write-bytes path (snapshot w))
+   path))
+
 ;;; ------------------------------------------------------------------------------------
 ;;; Images
 
@@ -2554,6 +2573,36 @@ on it. Returns the event."
   ([t item] (tree-item-activated-by-user! t item 2))
   ([t item click-count]
    (emit! t (event-for t :row-activated :item item :click-count click-count))))
+
+;;; The row and cell at a point (Skein's M3.6, D-108)
+
+(defgeneric backend-cell-at-point [backend w x y]
+  "[item column-index] of the list box's, table's or tree's row at x, y (a point as the
+widget's mouse events give it), or nil outside its rows. column-index is the column's
+index in :columns, 0 without columns.")
+
+(defmethod backend-cell-at-point [(b backend) w x y]
+  nil)
+
+(defn- cell-at [w x y]
+  (when-not (or (instance? list-box-widget w) (instance? tree-view-widget w))
+    (error "a list box, table or tree has rows at points, not" (pr-str w)))
+  (let [b (current-backend)]
+    (in-ui (fn [] (backend-cell-at-point b w x y)))))
+
+(defn item-at-point
+  "The item of the list box's, table's or tree's row at x, y, or nil: x and y as the
+widget's mouse events give them, so a :context-request handler finds the row clicked."
+  [w x y]
+  (first (cell-at w x y)))
+
+(defn cell-at-point
+  "[item column] of the table's cell at x, y, or nil: column is one of its :columns. A tree
+with :columns has cells too."
+  [t x y]
+  (when-let [[item i] (cell-at t x y)]
+    (when-let [c (get (vec (:columns t)) i)]
+      [item c])))
 
 ;;; ------------------------------------------------------------------------------------
 ;;; Color and date pickers
