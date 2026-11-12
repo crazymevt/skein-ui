@@ -3624,7 +3624,10 @@ which has it already."
   (lib/scrolled-set-policy (native w) 1 (if v 2 1)))
 
 (defmethod ui/backend-height-for-width [(b gtk-backend) (w ui/code-view-widget) width]
-  (lib/height-for-width (native w) width))
+  ;; its text view's, at the width the scrolled window gives it (less a gutter's)
+  (let [tv (text-view-of w)
+        g (if (:line-numbers w) (lib/widget-get-width (:gutter (code-parts-of w))) 0)]
+    (lib/height-for-width tv (max 1 (- width g)))))
 
 (defmethod ui/backend-height-for-width [(b gtk-backend) (l ui/label-widget) width]
   (lib/height-for-width (native l) width))

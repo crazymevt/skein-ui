@@ -721,8 +721,11 @@ as iOS does; Intel Macs put right before center."
   (set-long! l "setMaximumNumberOfLines:" (if v 0 1)))
 
 (defmethod ui/backend-height-for-width [(b cocoa-backend) (l ui/label-widget) width]
+  ;; its cell's height in a frame that wide: where the text wraps when it's shown so
   (objc/send-d-void (view l) (objc/sel "setPreferredMaxLayoutWidth:") (f64 width))
-  (second (objc/size-vec (objc/send-size (view l) (objc/sel "fittingSize")))))
+  (second (objc/size-vec (objc/send-r-size (objc/send (view l) (objc/sel "cell"))
+                                           (objc/sel "cellSizeForBounds:")
+                                           (objc/rect 0 0 width 1.0e7)))))
 
 (defmethod native-natural-size [(l ui/label-widget)]
   (if (and (:wrap l) (:width l))
@@ -1552,10 +1555,17 @@ keyword gives the platform's own, which follows dark mode."
         (mapv (fn [x] (int (math/floor x))) after)))))
 
 (defmethod ui/backend-scroll-to [(b cocoa-backend) s x y]
-  (quietly
-   (fn []
-     (objc/send-point-void (clip-view s) (objc/sel "scrollToPoint:") {:x (f64 x) :y (f64 y)})
-     (objc/send-p-void (view s) (objc/sel "reflectScrolledClipView:") (clip-view s)))))
+  ;; no further than the content goes, as GTK's adjustments keep it
+  (let [clip (clip-view s)
+        [_ _ dw dh] (objc/rect-vec (objc/send-rect (objc/send clip (objc/sel "documentView"))
+                                                   (objc/sel "frame")))
+        [_ _ cw ch] (objc/rect-vec (objc/send-rect clip (objc/sel "bounds")))
+        x (max 0 (min x (- dw cw)))
+        y (max 0 (min y (- dh ch)))]
+    (quietly
+     (fn []
+       (objc/send-point-void clip (objc/sel "scrollToPoint:") {:x (f64 x) :y (f64 y)})
+       (objc/send-p-void (view s) (objc/sel "reflectScrolledClipView:") clip)))))
 
 (defmethod native-selection-changed [(s ui/scrolled-window-widget) clip]
   (when-not (quiet?)

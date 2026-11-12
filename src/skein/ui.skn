@@ -3591,7 +3591,8 @@ methods on handle-event, to make a custom widget. Coordinates start at its top l
   ([opts] (build canvas-widget opts nil)))
 
 (defmethod measure [(c canvas-widget)]
-  [100 100])
+  ;; its :width and :height when given (an avatar of 20), else 100 by 100
+  [(or (:width c) 100) (or (:height c) 100)])
 
 (defn redraw!
   "Draw the canvas again soon, all of it or the rectangle given. Returns the canvas."

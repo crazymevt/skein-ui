@@ -159,6 +159,7 @@ and all of them run on the main thread, which no fiber waits to share."
   [self ptr, sel ptr, p ns-point, a ptr])
 (ffi/defcfun ^:blocking send-p-size "objc_msgSend" ns-size [self ptr, sel ptr, a ptr])
 (ffi/defcfun ^:blocking send-p-rect "objc_msgSend" ns-rect [self ptr, sel ptr, a ptr])
+(ffi/defcfun ^:blocking send-r-size "objc_msgSend" ns-size [self ptr, sel ptr, r ns-rect])
 (ffi/defcfun set-class! "object_setClass" ptr [object ptr, cls ptr])
 (ffi/defcfun ^:blocking send-rlpp "objc_msgSend" ptr
   [self ptr, sel ptr, r ns-rect, options u64, owner ptr, info ptr])
