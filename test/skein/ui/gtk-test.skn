@@ -519,6 +519,31 @@
       (is (gtk/code-placeholder-shown? empty))
       (ui/set-code-text! empty "x")
       (is (not (gtk/code-placeholder-shown? empty))))
+    (testing "fonts and paragraphs in runs (Skein's M3.6, D-108)"
+      (let [b (ui/make-text-buffer {:text "Title\nsome code here\n- item one\na\tb\tc"})
+            r (ui/code-view {:buffer b :line-numbers false :wrap true})
+            w2 (ui/window {:width 400 :height 300} r)
+            at (fn [p] (gtk/code-tag-attributes r p))]
+        (ui/show! w2)
+        (gtk/settle!)
+        (ui/set-text-runs! r [[0 5 {:size 20 :bold true :space-below 6}]
+                              [11 15 {:family :monospace}]
+                              [6 21 {:block-background "#eeeeee" :indent 8 :space-above 4}]
+                              [22 32 {:indent 24 :first-indent -12}]
+                              [33 38 {:tabs [100 200]}]])
+        (gtk/settle!)
+        (is (= {:size 20 :bold true :space-below 6} (at 2)))
+        (is (= [8 4] [(:indent (at 6)) (:space-above (at 6))])
+            "the whole line, from its start, though the run starts after it")
+        (is (some? (:block-background (at 20))))
+        (is (= :monospace (:family (at 12))))
+        (is (= [24 -12] [(:indent (at 22)) (:first-indent (at 22))]) "a hanging indent")
+        (is (= [100 200] (:tabs (at 33))))
+        (testing "restyling a line takes its paragraph's attributes away"
+          (ui/replace-text-runs! r 22 32 [])
+          (gtk/settle!)
+          (is (nil? (:indent (at 22)))))
+        (ui/close! w2)))
     (ui/close! w)))
 
 (deftest images-fonts-and-row-icons

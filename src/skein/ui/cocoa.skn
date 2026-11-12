@@ -4298,6 +4298,53 @@ units."
           (swap! run-dictionaries assoc k d)
           d))))
 
+(defn- storage-run?
+  "Whether a run's attributes need the text storage: a font of its own, or a paragraph's."
+  [a]
+  (or (:bold a) (:italic a) (:size a) (:family a)
+      (some (fn [k] (contains? a k)) ui/run-paragraph-attributes)))
+
+(defn- run-font
+  "The code view's font changed as a run's attributes say."
+  [w a]
+  (cond-> (:font w)
+    (:size a) (assoc :size (:size a))
+    (:family a) (assoc :family (:family a))
+    (contains? a :bold) (assoc :weight (if (:bold a) :bold :regular))
+    (contains? a :italic) (assoc :italic (boolean (:italic a)))))
+
+(defn- paragraph-style
+  "An NSParagraphStyle of a run's paragraph attributes: indents, spacing, tab stops, and a
+block (NSTextBlock) the text view's whole width for a background."
+  [a]
+  (let [p (objc/autorelease (objc/new-object "NSMutableParagraphStyle"))
+        indent (f64 (or (:indent a) 0))]
+    (objc/send-d-void p (objc/sel "setHeadIndent:") indent)
+    (objc/send-d-void p (objc/sel "setFirstLineHeadIndent:")
+                      (max 0.0 (+ indent (f64 (or (:first-indent a) 0)))))
+    (when-let [x (:space-above a)]
+      (objc/send-d-void p (objc/sel "setParagraphSpacingBefore:") (f64 x)))
+    (when-let [x (:space-below a)]
+      (objc/send-d-void p (objc/sel "setParagraphSpacing:") (f64 x)))
+    (when-let [tabs (:tabs a)]
+      (let [array (objc/send (objc/cls "NSMutableArray") (objc/sel "array"))
+            none (objc/send (objc/cls "NSDictionary") (objc/sel "dictionary"))]
+        (doseq [t tabs]
+          (objc/send-p-void array (objc/sel "addObject:")
+                            (objc/autorelease
+                             (objc/send-ldp (objc/alloc "NSTextTab")
+                                            (objc/sel "initWithTextAlignment:location:options:")
+                                            0 (f64 t) none))))     ; left
+        (objc/send-p-void p (objc/sel "setTabStops:") array)))
+    (when-let [c (:block-background a)]
+      (let [block (objc/autorelease (objc/new-object "NSTextBlock"))]
+        (objc/send-p-void block (objc/sel "setBackgroundColor:") (ns-color c))
+        ;; 100 percent (NSTextBlockPercentageValueType) of the width (NSTextBlockWidth).
+        (objc/send-dll-void block (objc/sel "setValue:type:forDimension:") 100.0 1 0)
+        (objc/send-p-void p (objc/sel "setTextBlocks:")
+                          (objc/send-p (objc/cls "NSArray") (objc/sel "arrayWithObject:") block))))
+    p))
+
 (defmethod ui/backend-code-apply-runs [(b cocoa-backend) w start end runs]
   (defer-native!
    (fn []
@@ -4308,8 +4355,7 @@ units."
              end (min end n)
              s16 (u16 w start)
              whole {:location s16 :length (- (u16 w end) s16)}
-             fonts (or (:font-runs (parts w))
-                       (some (fn [[_ _ a]] (or (:bold a) (:italic a))) runs))]
+             storage? (or (:storage-runs (parts w)) (some (fn [[_ _ a]] (storage-run? a)) runs))]
          (doseq [name ["NSColor" "NSBackgroundColor" "NSUnderline"]]
            (objc/send-prange-void layout (objc/sel "removeTemporaryAttribute:forCharacterRange:")
                                   (objc/ns-string name) whole))
@@ -4319,24 +4365,33 @@ units."
                (objc/send-prange-void layout (objc/sel "addTemporaryAttributes:forCharacterRange:")
                                       (run-dictionary a)
                                       {:location x :length (- (u16 w (min re n)) x)}))))
-         ;; Bold and italic: fonts in the shared storage.
-         (when fonts
-           (swap! code-parts assoc-in [(ffi/address (view w)) :font-runs] true)
-           (let [storage (objc/send (code-text-view w) (objc/sel "textStorage"))]
+         ;; Fonts and paragraph styles: attributes of the shared storage. A paragraph style
+         ;; covers the whole lines its run touches.
+         (when storage?
+           (swap! code-parts assoc-in [(ffi/address (view w)) :storage-runs] true)
+           (let [storage (objc/send (code-text-view w) (objc/sel "textStorage"))
+                 text (objc/send storage (objc/sel "string"))]
              (pushing!
               (fn []
                 (objc/send-void storage (objc/sel "beginEditing"))
                 (objc/send-pprange-void storage (objc/sel "addAttribute:value:range:")
                                         (objc/ns-string "NSFont") (ns-font (:font w)) whole)
+                ;; The core restyles whole lines, so their paragraphs' runs are all here.
+                (objc/send-prange-void storage (objc/sel "removeAttribute:range:")
+                                       (objc/ns-string "NSParagraphStyle")
+                                       (objc/send-range-range
+                                        text (objc/sel "paragraphRangeForRange:") whole))
                 (doseq [[rs re a] runs]
-                  (when (or (:bold a) (:italic a))
-                    (let [x (u16 w (min rs n))]
+                  (let [x (u16 w (min rs n))
+                        r {:location x :length (- (u16 w (min re n)) x)}]
+                    (when (some (fn [k] (contains? a k)) [:bold :italic :size :family])
                       (objc/send-pprange-void storage (objc/sel "addAttribute:value:range:")
-                                              (objc/ns-string "NSFont")
-                                              (ns-font (merge (:font w)
-                                                              {:weight (if (:bold a) :bold :regular)
-                                                               :italic (boolean (:italic a))}))
-                                              {:location x :length (- (u16 w (min re n)) x)}))))
+                                              (objc/ns-string "NSFont") (ns-font (run-font w a)) r))
+                    (when (some (fn [k] (contains? a k)) ui/run-paragraph-attributes)
+                      (objc/send-pprange-void
+                       storage (objc/sel "addAttribute:value:range:")
+                       (objc/ns-string "NSParagraphStyle") (paragraph-style a)
+                       (objc/send-range-range text (objc/sel "paragraphRangeForRange:") r)))))
                 (objc/send-void storage (objc/sel "endEditing")))))))))))
 
 ;;; The pointer over the text, and the placeholder
@@ -4387,6 +4442,40 @@ units."
   "The text of the code view's NSTextView."
   [w]
   (objc/string-of (objc/send (code-text-view w) (objc/sel "string"))))
+
+(defn code-text-attributes
+  "What the code view's text storage has at position: its font's :size, :monospace and
+:bold, and its paragraph style's :indent, :first-indent (from :indent), :space-above,
+:space-below, :tabs and :block-background (whether it has a block with a background)."
+  [w position]
+  (objc/call-with-pool
+   (fn []
+     (let [storage (objc/send (code-text-view w) (objc/sel "textStorage"))
+           i (u16 w position)
+           at (fn [name] (objc/send-plp storage (objc/sel "attribute:atIndex:effectiveRange:")
+                                        (objc/ns-string name) i (ffi/null)))
+           font (at "NSFont")
+           p (at "NSParagraphStyle")
+           traits (objc/send-long (objc/send font (objc/sel "fontDescriptor"))
+                                  (objc/sel "symbolicTraits"))
+           nth-of (fn [array k] (objc/send-l array (objc/sel "objectAtIndex:") k))]
+       (merge {:size (objc/send-double font (objc/sel "pointSize"))
+               :monospace (objc/send-bool font (objc/sel "isFixedPitch"))
+               :bold (pos? (bit-and traits 2))}
+              (when-not (ffi/null? p)
+                (let [tabs (objc/send p (objc/sel "tabStops"))
+                      blocks (objc/send p (objc/sel "textBlocks"))
+                      head (objc/send-double p (objc/sel "headIndent"))]
+                  {:indent head
+                   :first-indent (- (objc/send-double p (objc/sel "firstLineHeadIndent")) head)
+                   :space-above (objc/send-double p (objc/sel "paragraphSpacingBefore"))
+                   :space-below (objc/send-double p (objc/sel "paragraphSpacing"))
+                   :tabs (mapv (fn [k] (objc/send-double (nth-of tabs k) (objc/sel "location")))
+                               (range (objc/send-long tabs (objc/sel "count"))))
+                   :block-background
+                   (and (pos? (objc/send-long blocks (objc/sel "count")))
+                        (not (ffi/null? (objc/send (nth-of blocks 0)
+                                                   (objc/sel "backgroundColor")))))})))))))
 
 (defn type-into-code-view!
   "Type s into the code view's NSTextView as the keyboard does (insertText:), at its

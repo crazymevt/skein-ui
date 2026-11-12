@@ -3497,7 +3497,8 @@ which has it already."
         gutter (lib/drawing-area-new)
         adj (lib/scrolled-get-vadjustment scroll)]
     (lib/scrolled-set-child scroll tv)
-    (lib/text-view-set-monospace tv true)
+    ;; GTK's monospace class would override the font the view's CSS gives it.
+    (lib/text-view-set-monospace tv (= :monospace (:family (:font w))))
     (swap! text-views assoc (ffi/address scroll) tv)
     (let [buffer (lib/text-view-get-buffer tv)]
       (also-register! buffer w)
@@ -3559,6 +3560,7 @@ which has it already."
   (show-tab-width! w))
 
 (defmethod set-native :after [(w ui/code-view-widget) (p (= :font)) f]
+  (lib/text-view-set-monospace (text-view-of w) (= :monospace (:family f)))
   (show-tab-width! w)
   (update-code-gutter! w))
 
@@ -3697,12 +3699,31 @@ which has it already."
 
 (defn- tag-for [w attrs]
   (or (get-in (code-parts-of w) [:tags attrs])
-      (let [tag (lib/text-tag-new (ffi/null))]
+      (let [tag (lib/text-tag-new (ffi/null))
+            set-int (fn [name v] (lib/g-object-set-int tag name (int (math/round v)) (ffi/null)))]
         (when-let [c (:color attrs)] (lib/g-object-set-string tag "foreground" (css-color c) (ffi/null)))
         (when-let [c (:background attrs)] (lib/g-object-set-string tag "background" (css-color c) (ffi/null)))
         (when (:bold attrs) (lib/g-object-set-int tag "weight" 700 (ffi/null)))
         (when (:italic attrs) (lib/g-object-set-int tag "style" 2 (ffi/null)))       ; PANGO_STYLE_ITALIC
         (when (:underline attrs) (lib/g-object-set-int tag "underline" 1 (ffi/null))) ; SINGLE
+        (when-let [size (:size attrs)]
+          (lib/g-object-set-double tag "size-points" (f64 size) (ffi/null)))
+        (when-let [f (:family attrs)]
+          (lib/g-object-set-string tag "family" (case f :system "Sans" :monospace "Monospace" f)
+                                   (ffi/null)))
+        ;; A paragraph's: GTK takes them from the tags at each line's start.
+        (when-let [x (:indent attrs)] (set-int "left-margin" x))
+        (when-let [x (:first-indent attrs)] (set-int "indent" x))
+        (when-let [x (:space-above attrs)] (set-int "pixels-above-lines" x))
+        (when-let [x (:space-below attrs)] (set-int "pixels-below-lines" x))
+        (when-let [c (:block-background attrs)]
+          (lib/g-object-set-string tag "paragraph-background" (css-color c) (ffi/null)))
+        (when-let [tabs (:tabs attrs)]
+          (let [array (lib/pango-tab-array-new (count tabs) true)]
+            (doseq [[i t] (map-indexed vector tabs)]
+              (lib/pango-tab-array-set-tab array i 0 (int (math/round t))))   ; PANGO_TAB_LEFT
+            (lib/g-object-set-pointer tag "tabs" array (ffi/null))
+            (lib/pango-tab-array-free array)))
         (lib/text-tag-table-add (lib/text-buffer-get-tag-table (code-buffer w)) tag)
         (lib/g-object-unref tag)
         (swap! code-parts assoc-in [(ffi/address (native w)) :tags attrs] tag)
@@ -3717,10 +3738,22 @@ which has it already."
                      (iter-at w z (min end n))
                      (lib/text-buffer-remove-all-tags (code-buffer w) a z)
                      (doseq [[rs re attrs] runs]
-                       (when (seq attrs)
-                         (iter-at w a (min rs n))
-                         (iter-at w z (min re n))
-                         (lib/text-buffer-apply-tag (code-buffer w) (tag-for w attrs) a z)))))))))
+                       ;; A paragraph's attributes cover the run's whole lines, newlines and all
+                       ;; (the core restyles whole lines, so this stays within start to end).
+                       (let [paragraph (select-keys attrs ui/run-paragraph-attributes)
+                             own (apply dissoc attrs ui/run-paragraph-attributes)
+                             buf (:buffer w)]
+                         (when (seq own)
+                           (iter-at w a (min rs n))
+                           (iter-at w z (min re n))
+                           (lib/text-buffer-apply-tag (code-buffer w) (tag-for w own) a z))
+                         (when (seq paragraph)
+                           (let [first-line (ui/position-line buf (min rs n))
+                                 last-line (ui/position-line buf (max (min rs n) (dec (min re n))))]
+                             (iter-at w a (ui/line-start buf first-line))
+                             (iter-at w z (min n (inc (ui/line-end buf last-line)))))
+                           (lib/text-buffer-apply-tag (code-buffer w) (tag-for w paragraph)
+                                                      a z))))))))))
 
 (defn- update-code-placeholder! [w]
   (when-let [parts (code-parts-of w)]
@@ -3753,6 +3786,14 @@ which has it already."
   "Type s at the code view's GtkTextView cursor, as the keyboard does."
   [w s]
   (lib/text-buffer-insert-at-cursor (code-buffer w) s -1))
+
+(defn code-tag-attributes
+  "The attributes of the code view's tags at position, merged: what GTK shows there."
+  [w position]
+  (with-iters (fn [a z]
+                (iter-at w a position)
+                (reduce (fn [m [attrs tag]] (if (lib/text-iter-has-tag a tag) (merge m attrs) m))
+                        {} (:tags (code-parts-of w))))))
 
 (defn code-placeholder-shown?
   "True if the code view shows its placeholder."

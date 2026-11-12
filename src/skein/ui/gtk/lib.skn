@@ -51,6 +51,8 @@ thread, which no fiber waits to share."
   [o ptr, name c-string & value i32, end ptr])
 (ffi/defcfun ^:blocking g-object-set-double "g_object_set" void
   [o ptr, name c-string & value f64, end ptr])
+(ffi/defcfun ^:blocking g-object-set-pointer "g_object_set" void
+  [o ptr, name c-string & value ptr, end ptr])
 
 (defn emit!
   "Emit the GObject signal named name (one with no arguments) on o, as GTK does when the
@@ -632,6 +634,7 @@ hasn't placed it."
 (ffi/defcfun ^:blocking pango-tab-array-set-tab "pango_tab_array_set_tab" void
   [a ptr, i i32, align i32, location i32])
 (ffi/defcfun ^:blocking pango-tab-array-free "pango_tab_array_free" void [a ptr])
+(ffi/defcfun ^:blocking text-iter-has-tag "gtk_text_iter_has_tag" bool [i ptr, tag ptr])
 (ffi/defcfun ^:blocking text-buffer-get-insert "gtk_text_buffer_get_insert" ptr [b ptr])
 (ffi/defcfun ^:blocking text-buffer-get-selection-bound "gtk_text_buffer_get_selection_bound"
   ptr [b ptr])

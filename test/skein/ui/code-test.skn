@@ -222,3 +222,31 @@
                                                            @model))]
                            (ui/resolve-run-attributes v a))]
             (is (= expected (ui/text-style-at v p)))))))))
+
+(deftest rich-run-attributes
+  ;; Fonts and paragraphs in runs (Skein's M3.6, D-108).
+  (let [b (ui/make-text-buffer {:text "Title\nsome code here\nend"})
+        v (ui/code-view {:buffer b :text-styles {:h1 {:size 20 :bold true :space-below 6}}})
+        w (ui/window {:width 300 :height 200} v)]
+    (ui/show! w)
+    (ui/flush-layouts!)
+    (testing "the new attributes reach the backend, a style's among them"
+      (is (= {:size 20 :bold true :space-below 6}
+             (ui/resolve-run-attributes v {:style :h1})))
+      (is (= {:family :monospace :indent 8 :first-indent -4 :space-above 2 :tabs [40 80]}
+             (ui/resolve-run-attributes v {:family :monospace :indent 8 :first-indent -4
+                                           :space-above 2 :tabs [40 80]})))
+      (is (= (ui/ensure-color "#eeeeee")
+             (:block-background (ui/resolve-run-attributes v {:block-background "#eeeeee"})))))
+    (testing "values of the wrong kind"
+      (is (thrown-with-msg? error "number of pixels" (ui/resolve-run-attributes v {:indent "8"})))
+      (is (thrown-with-msg? error ":family is" (ui/resolve-run-attributes v {:family 12}))))
+    (testing "the backend restyles whole lines, with their newlines"
+      (ui/set-text-runs! v [[0 5 {:style :h1}] [11 15 {:family :monospace}]])
+      (let [before (count (headless/applied-runs v))]
+        (ui/replace-text-runs! v 11 13 [[11 13 {:bold true}]])
+        (let [[start end runs] (last (headless/applied-runs v))]
+          (is (= (inc before) (count (headless/applied-runs v))))
+          (is (= [6 21] [start end]) "the line \"some code here\" and its newline")
+          (is (= [[11 13 {:bold true}] [13 15 {:family :monospace}]] runs)))))
+    (ui/close! w)))

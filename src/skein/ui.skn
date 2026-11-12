@@ -5526,22 +5526,51 @@ left, scrolled part included, gutter excluded), where a click there puts the car
   [v start end]
   (chunk-runs-between (:run-chunks v) start end))
 
+(def run-paragraph-attributes
+  "The attributes of a run that apply to every line it touches, whole: the paragraph's."
+  #{:indent :first-indent :space-above :space-below :block-background :tabs})
+
+(defn- check-run-number [k v]
+  (when-not (number? v)
+    (error "a run's" k "is a number of pixels or points, not" (pr-str v)))
+  v)
+
 (defn resolve-run-attributes
   "A run's attributes with its :style replaced by the style's attributes from the view's
 :text-styles, and its colors made colors or system color keywords."
   [v attrs]
   (let [all (merge (get (:text-styles v) (:style attrs)) (dissoc attrs :style))
-        color (fn [k] (when-let [c (get all k)] (ensure-color c)))]
+        color (fn [k] (when-let [c (get all k)] (ensure-color c)))
+        number (fn [k] (when-let [n (get all k)] (check-run-number k n)))]
     (cond-> {}
       (color :color) (assoc :color (color :color))
       (color :background) (assoc :background (color :background))
       (:bold all) (assoc :bold true)
       (:italic all) (assoc :italic true)
-      (:underline all) (assoc :underline true))))
+      (:underline all) (assoc :underline true)
+      (number :size) (assoc :size (number :size))
+      (:family all) (assoc :family (let [f (:family all)]
+                                     (if (or (keyword? f) (string? f))
+                                       f
+                                       (error "a run's :family is :monospace, :system or a"
+                                              "family name, not" (pr-str f)))))
+      (number :indent) (assoc :indent (number :indent))
+      (number :first-indent) (assoc :first-indent (number :first-indent))
+      (number :space-above) (assoc :space-above (number :space-above))
+      (number :space-below) (assoc :space-below (number :space-below))
+      (color :block-background) (assoc :block-background (color :block-background))
+      (seq (:tabs all)) (assoc :tabs (mapv (fn [t] (check-run-number :tabs t)) (:tabs all))))))
 
-(defn- show-runs! [v start end]
+(defn- show-runs!
+  "Have the backend show the view's runs from start to end, widened to whole lines with
+their newlines: a backend gets every run of the lines it restyles, as paragraph
+attributes, which cover whole lines, need."
+  [v start end]
   (when (< start end)
     (let [b (current-backend)
+          buf (:buffer v)
+          start (line-start buf (position-line buf start))
+          end (min (text-length v) (inc (line-end buf (position-line buf (dec end)))))
           runs (mapv (fn [[s e a]] [s e (resolve-run-attributes v a)]) (runs-between v start end))]
       (in-ui (fn [] (backend-code-apply-runs b v start end runs))))))
 
@@ -5572,8 +5601,13 @@ left, scrolled part included, gutter excluded), where a click there puts the car
 (defn set-text-runs!
   "Make runs all of the code view's styled runs: each [start end attributes], attributes a
 map of :style (a name in :text-styles giving defaults for the rest), :color and
-:background (color designators), :bold, :italic and :underline. Text outside any run has
-the plain style. Only what shows is styled at once; the rest as it scrolls into view."
+:background (color designators), :bold, :italic and :underline, :size (points) and :family
+(:monospace, :system or a family name). These apply to every line a run touches, whole:
+:indent and :first-indent (pixels from the left, the first line's from :indent, negative
+to hang it, as a list's bullet does), :space-above and :space-below (pixels),
+:block-background (a color across the lines' whole width) and :tabs (tab stops, pixels
+from the left). Text outside any run has the plain style. Only what shows is styled at
+once; the rest as it scrolls into view."
   [v runs]
   (let [rs (into [] (comp (map normalize-run) (filter (fn [[s e _]] (< s e)))) runs)
         sorted (if (every? (fn [i] (<= (first (nth rs i)) (first (nth rs (inc i)))))

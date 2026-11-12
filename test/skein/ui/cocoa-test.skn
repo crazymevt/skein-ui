@@ -566,6 +566,37 @@
       (ui/set-text-runs! v [[4 8 {:color :purple :bold true}]])
       (cocoa/run-for! 0.05)
       (is (= [[4 8 {:color :purple :bold true}]] (ui/text-runs v))))
+    (testing "fonts and paragraphs in runs (Skein's M3.6, D-108)"
+      (let [b (ui/make-text-buffer {:text "Title\nsome code here\n- item one\na\tb\tc"})
+            r (ui/code-view {:buffer b :line-numbers false :wrap true
+                             :font {:family :system :size 13}})
+            w2 (ui/window {:width 400 :height 300} r)]
+        (ui/show! w2)
+        (ui/set-text-runs! r [[0 5 {:size 20 :bold true :space-below 6}]
+                              [11 15 {:family :monospace}]
+                              [6 21 {:block-background "#eeeeee" :indent 8 :space-above 4}]
+                              [22 32 {:indent 24 :first-indent -12}]
+                              [33 38 {:tabs [100 200]}]])
+        (cocoa/run-for! 0.05)
+        (let [title (cocoa/code-text-attributes r 2)
+              plain (cocoa/code-text-attributes r 7)
+              code (cocoa/code-text-attributes r 12)
+              item (cocoa/code-text-attributes r 25)
+              row (cocoa/code-text-attributes r 34)]
+          (is (= [20.0 true false] [(:size title) (:bold title) (:monospace title)]))
+          (is (= 6.0 (:space-below title)))
+          (is (= [13.0 false] [(:size plain) (:monospace plain)]))
+          (is (:monospace code) "a family of its own inside the line")
+          (is (= [8.0 4.0 true] [(:indent plain) (:space-above plain) (:block-background plain)])
+              "the whole line, though the run starts after it")
+          (is (= [24.0 -12.0] [(:indent item) (:first-indent item)]) "a hanging indent")
+          (is (= [100.0 200.0] (:tabs row)))
+          (is (not (:block-background item))))
+        (testing "restyling a line takes its paragraph style away"
+          (ui/replace-text-runs! r 22 32 [])
+          (cocoa/run-for! 0.05)
+          (is (nil? (:indent (cocoa/code-text-attributes r 25)))))
+        (ui/close! w2)))
     (testing "the placeholder shows while empty"
       (is (cocoa/code-placeholder-shown? empty))
       (ui/set-code-text! empty "x")
