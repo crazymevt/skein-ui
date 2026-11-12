@@ -502,6 +502,31 @@
   (is (< (first (ui/preferred-size (ui/button {:label "Go" :control-size :mini})))
          (first (ui/preferred-size (ui/button {:label "Go"}))))))
 
+(deftest cards
+  (let [card (ui/vbox {:padding 8 :background "#336699" :corner-radius 10
+                       :border-color "#ff0000" :border-width 2}
+                      (ui/label {:text "inside"}))
+        tint (ui/vbox {:padding 8 :background [:accent 0.15] :corner-radius 6}
+                      (ui/label {:text "tinted"}))
+        outline (ui/vbox {:padding 8 :border-color "#00ff00"} (ui/label {:text "outlined"}))
+        plain (ui/vbox {} (ui/label {:text "plain"}))
+        w (ui/window {:title "Cards"} (ui/vbox {:padding 10 :spacing 10} card tint outline plain))]
+    (ui/show! w)
+    (let [n (cocoa/native-card card)]
+      (is (= 10.0 (:corner-radius n)))
+      (is (= 2.0 (:border-width n)))
+      (is (= "#ff0000" (ui/color-hex (:border-color n))))
+      (is (= "#336699" (ui/color-hex (:fill n)))))
+    (let [a (ui/color-alpha (:fill (cocoa/native-card tint)))]
+      (is (< 0.14 a 0.16) "the accent at 15%"))
+    (is (= 0.0 (ui/color-alpha (:fill (cocoa/native-card outline)))) "clear inside")
+    (is (= 1.0 (:border-width (cocoa/native-card outline))))
+    (is (nil? (cocoa/native-card plain)))
+    (set-slot! card :corner-radius 0)
+    (set-slot! card :border-color nil)
+    (is (= 0.0 (:border-width (cocoa/native-card card))) "no border once it has no color")
+    (ui/close! w)))
+
 (deftest stacks-and-tabbed-panes
   (let [a (ui/label {:text "one"})
         b (ui/label {:text "two"})

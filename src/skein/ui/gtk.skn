@@ -902,7 +902,9 @@ skein.ui image, or null for nil."
 (GTK has no named system colors)."
   [d]
   (let [c (ui/ensure-color d)
-        c (if (keyword? c) (ui/system-color c) c)]
+        c (cond (keyword? c) (ui/system-color c)
+                (ui/system-tint? c) (ui/with-alpha (ui/system-color (first c)) (second c))
+                :else c)]
     [(f64 (ui/color-red c)) (f64 (ui/color-green c)) (f64 (ui/color-blue c))
      (f64 (ui/color-alpha c))]))
 
@@ -2690,7 +2692,15 @@ colors, the palette's text and background colors, a container's surface or backg
                         (when (or (instance? ui/entry-widget w) (instance? ui/text-view-widget w)
                                   (instance? ui/list-box-widget w))
                           palette-bg))]
-           (str "background-color: " (css-color c) "; ") ""))))
+           (str "background-color: " (css-color (ui/widget-color w c)) "; ") "")
+         ;; a card: rounded, and outlined inside its bounds (a CSS border would take room
+         ;; the layout gives the children)
+         (if (and (instance? ui/container-widget w) (pos? (or (:corner-radius w) 0)))
+           (str "border-radius: " (:corner-radius w) "px; ") "")
+         (if-let [b (and (instance? ui/container-widget w) (:border-color w))]
+           (str "box-shadow: inset 0 0 0 " (or (:border-width w) 1) "px "
+                (css-color (ui/widget-color w b)) "; ")
+           ""))))
 
 (defn- restyle!
   "Give the widget's GTK widget a CSS rule of its own look (declarations)."
@@ -2715,6 +2725,15 @@ colors, the palette's text and background colors, a container's surface or backg
 (defmethod set-native [(l ui/label-widget) (p (= :background)) c] (restyle! l))
 (defmethod set-native [(c ui/container-widget) (p (= :surface)) v] (restyle! c))
 (defmethod set-native [(c ui/container-widget) (p (= :background)) v] (restyle! c))
+(defmethod set-native [(c ui/container-widget) (p (= :corner-radius)) v] (restyle! c))
+(defmethod set-native [(c ui/container-widget) (p (= :border-color)) v] (restyle! c))
+(defmethod set-native [(c ui/container-widget) (p (= :border-width)) v] (restyle! c))
+
+(defn css-declarations
+  "The CSS declarations of the widget's own look, as its rule has them, or nil."
+  [w]
+  (when-let [class (get @css-classes (ffi/address (style-target w)))]
+    (get @css-rules class)))
 (defmethod set-native [(w ui/window-widget) (p (= :surface)) v] (restyle! w))
 (defmethod set-native [(w ui/window-widget) (p (= :background)) v] (restyle! w))
 

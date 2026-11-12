@@ -908,11 +908,17 @@ With homogeneous every item gets the same size. Returns a vector of sizes."
 (defclass container-widget [widget]
   "The superclass of widgets that hold others. :surface is a semantic surface role (one of
 surface-roles), drawn with the platform's material or theme color; :background, when set,
-fills it with a color instead."
+fills it with a color instead. With :corner-radius, :border-color and :border-width it is
+a card: its background rounded, and outlined inside its bounds (children aren't clipped to
+the corners, so give it padding)."
   (surface :cell :atom :init :automatic)
-  (background :cell :atom :init nil))
+  (background :cell :atom :init nil)
+  (corner-radius :cell :atom :init 0 :doc "Pixels of rounding at the background's corners.")
+  (border-color :cell :atom :init nil :doc "The color of a line around it, or nil for none.")
+  (border-width :cell :atom :init 1 :doc "The width of that line, in pixels."))
 
-(declare-widget! container-widget {:properties [:surface :background]})
+(declare-widget! container-widget
+                 {:properties [:surface :background :corner-radius :border-color :border-width]})
 
 (defclass box-widget [container-widget]
   "Lays its children out in a column or a row. Children with :vexpand (in a column) or
@@ -2094,7 +2100,8 @@ handler vetoes, closes (ending run-dialog)."
 (defstruct color :value
   "An sRGB color: each component an f32 from 0 to 1. Make one with rgb, rgb255, hsv or
 parse-color; properties and drawing also take a string such as \"#3a7bd5\", a named color
-keyword such as :steelblue, or a system color keyword such as :accent."
+keyword such as :steelblue, a system color keyword such as :accent, or [designator alpha]
+for one of those at an opacity, [:accent 0.15] for a tint of the accent."
   (red f32) (green f32) (blue f32) (alpha f32))
 
 (defn- unit [x] (f32 (math/clamp x 0 1)))
@@ -2160,18 +2167,35 @@ resolves them when they are used (system-color gives one's value now)."
       (or (get named-colors (keyword (string/lower-case (string/replace s " " ""))))
           (error "unknown color" (pr-str s))))))
 
+(defn with-alpha
+  "The color c with its opacity multiplied by alpha (from 0 to 1)."
+  [c alpha]
+  (rgb (color-red c) (color-green c) (color-blue c) (* (color-alpha c) alpha)))
+
 (defn ensure-color
   "The color designator d as a color, or as a system color keyword, which the backend
-resolves; nil stays nil. d is a color, a string parse-color takes, or a keyword of
-named-colors or system-colors."
+resolves, or as [keyword alpha], a system color at an opacity; nil stays nil. d is a color,
+a string parse-color takes, a keyword of named-colors or system-colors, or [designator
+alpha] with alpha from 0 to 1."
   [d]
   (cond (nil? d) nil
         (instance? color d) d
         (string? d) (parse-color d)
         (contains? system-colors d) d
         (keyword? d) (or (get named-colors d) (error "unknown color" (pr-str d)))
-        :else (error "a color is a color, a string such as \"#3a7bd5\" or a keyword, not"
-                     (pr-str d))))
+        (and (vector? d) (= 2 (count d)) (number? (second d)) (<= 0 (second d) 1))
+        (let [base (ensure-color (first d))]
+          (cond (vector? base) [(first base) (* (second base) (second d))]
+                (keyword? base) [base (second d)]
+                :else (with-alpha base (second d))))
+        :else (error "a color is a color, a string such as \"#3a7bd5\", a keyword or"
+                     "[color alpha], not" (pr-str d))))
+
+(defn system-tint?
+  "True if the color designator d, made by ensure-color, is a system color at an opacity:
+[keyword alpha]."
+  [d]
+  (vector? d))
 
 (defn color-lerp
   "The color fraction of the way from color a to color b."
@@ -3483,7 +3507,7 @@ as they were: (with-saved-state [gc] (translate! gc 10 10) ...)."
 palette, if it has one."
   [gc color]
   (let [c (ensure-color color)]
-    (if (and (keyword? c) (:widget gc)) (widget-color (:widget gc) c) c)))
+    (if (and (or (keyword? c) (system-tint? c)) (:widget gc)) (widget-color (:widget gc) c) c)))
 
 (defn set-fill-color!
   "Fill shapes with color, a color designator."
@@ -6622,8 +6646,11 @@ is itself."
   ([w d] (widget-color w d #{}))
   ([w d seen]
    (let [c (if (and (keyword? d) (contains? palette-roles d)) d (ensure-color d))]
-     (if-not (keyword? c)
-       c
+     (cond
+       ;; a system color at an opacity: that color as the widget shows it, at the opacity
+       (system-tint? c) (with-alpha (widget-color w (first c) seen) (second c))
+       (not (keyword? c)) c
+       :else
        (let [override (palette-color w c)
              base (get derived-palette-roles c)]
          (cond (and override (not (contains? seen c)))

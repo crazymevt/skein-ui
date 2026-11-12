@@ -457,6 +457,24 @@
     (is (gtk/has-css-rule? l) "the palette's text color is the label's CSS")
     (ui/close! w)))
 
+(deftest cards
+  (let [card (ui/vbox {:padding 8 :background "#336699" :corner-radius 10
+                       :border-color "#ff0000" :border-width 2}
+                      (ui/label {:text "inside"}))
+        tint (ui/vbox {:padding 8 :background [:accent 0.15] :corner-radius 6}
+                      (ui/label {:text "tinted"}))
+        w (ui/window {:title "Cards"} (ui/vbox {:padding 10 :spacing 10} card tint))]
+    (ui/show! w)
+    (gtk/settle!)
+    (let [d (gtk/css-declarations card)]
+      (is (string/includes? d "border-radius: 10px;"))
+      (is (string/includes? d "box-shadow: inset 0 0 0 2px rgba(255,0,0,1.000);"))
+      (is (string/includes? d "background-color: rgba(51,102,153,1.000);")))
+    (is (string/includes? (gtk/css-declarations tint) ",0.150);") "the accent at 15%")
+    (set-slot! card :border-color nil)
+    (is (not (string/includes? (gtk/css-declarations card) "box-shadow")))
+    (ui/close! w)))
+
 (deftest stacks-and-tabbed-panes
   (let [a (ui/label {:text "one"})
         b (ui/label {:text "two"})

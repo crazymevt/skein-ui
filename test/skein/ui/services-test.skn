@@ -19,6 +19,15 @@
   (is (= (ui/rgb 0 1 0) (ui/hsv 120 1 1)))
   (is (= "#808080" (ui/color-hex (ui/color-lerp (ui/rgb 0 0 0) (ui/rgb 1 1 1) 0.5))))
   (is (thrown-with-msg? error "unknown color" (ui/ensure-color :nope)))
+  (testing "a color at an opacity: a tint"
+    (is (= [:accent 0.15] (ui/ensure-color [:accent 0.15])) "a system color's stays one")
+    (is (= (ui/rgb 1 0 0 0.5) (ui/ensure-color ["#f00" 0.5])) "a color's is a color")
+    (is (= [:accent 0.25] (ui/ensure-color [[:accent 0.5] 0.5])))
+    (is (= (ui/rgb 0 0 0 0.25) (ui/with-alpha (ui/rgb 0 0 0 0.5) 0.5)))
+    (is (thrown-with-msg? error "alpha" (ui/ensure-color [:accent 2])))
+    (let [l (ui/label {:text "x"})
+          p (ui/vbox {:palette {:accent "#ff0000"}} l)]
+      (is (= (ui/rgb 1 0 0 0.2) (ui/widget-color l [:accent 0.2])) "through a palette")))
   (is (thrown-with-msg? error "bad hex digit" (ui/parse-color "#ggg")))
   (is (= {:family :monospace :size nil :weight :regular :italic false}
          (ui/ensure-font :monospace)))

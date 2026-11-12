@@ -26,6 +26,18 @@
             :text :alignment :wrap :selectable :text-color :background]
            (ui/properties l)))))
 
+(deftest cards
+  ;; A container with rounded corners and a border: properties every backend takes.
+  (let [c (ui/vbox {:padding 8 :background [:accent 0.15] :corner-radius 10
+                    :border-color :separator}
+                   (ui/label {:text "inside"}))]
+    (ui/show! (ui/window {} c))
+    (is (= 10 (headless/native-property c :corner-radius)))
+    (is (= :separator (headless/native-property c :border-color)))
+    (is (= 1 (:border-width c)) "a border is a pixel wide unless said")
+    (set-slot! c :border-width 2)
+    (is (= 2 (headless/native-property c :border-width)))))
+
 (deftest events-and-handlers
   (let [clicks (atom [])
         b (ui/button {:label "Go" :on-clicked (fn [e] (swap! clicks conj [:option (:signal e)]))})

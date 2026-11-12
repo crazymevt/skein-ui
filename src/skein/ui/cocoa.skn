@@ -795,6 +795,9 @@ keyword gives the platform's own, which follows dark mode."
   (let [c (ui/ensure-color d)]
     (cond (nil? c) (ffi/null)
           (keyword? c) (objc/send (objc/cls "NSColor") (objc/sel (get color-selectors c)))
+          ;; still dynamic: it follows dark mode as its system color does
+          (ui/system-tint? c) (objc/send-d (ns-color (first c)) (objc/sel "colorWithAlphaComponent:")
+                                           (f64 (second c)))
           :else (objc/send-dddd (objc/cls "NSColor")
                                 (objc/sel "colorWithSRGBRed:green:blue:alpha:")
                                 (f64 (ui/color-red c)) (f64 (ui/color-green c))
@@ -1887,7 +1890,7 @@ down through the open ones."
   "[r g b a] of a color designator, a system color resolved now."
   [d]
   (let [c (ui/ensure-color d)
-        c (if (keyword? c) (color-of (ns-color c)) c)]
+        c (if (or (keyword? c) (ui/system-tint? c)) (color-of (ns-color c)) c)]
     [(f64 (ui/color-red c)) (f64 (ui/color-green c)) (f64 (ui/color-blue c))
      (f64 (ui/color-alpha c))]))
 
@@ -3047,14 +3050,26 @@ notebook)."
   "A container's view address -> the addresses of the hosts of its backdrops."
   (atom {}))
 
+(defn- palette-ns-color
+  "An NSColor of the designator as the widget shows it: a palette's color, or else the
+platform's dynamic one."
+  [w d]
+  (let [k (if (vector? d) (first d) d)]
+    (if (and (keyword? k) (ui/palette-color w k)) (ns-color (ui/widget-color w d)) (ns-color d))))
+
+(defn- card? [c]
+  (or (pos? (or (:corner-radius c) 0)) (some? (:border-color c))))
+
 (defn- refresh-surface! [c]
   (let [role (:surface c)
-        color (ui/container-fill c)]
+        color (ui/container-fill c)
+        ;; a card is drawn by the color backdrop, clear inside if it has no color
+        boxed (or color (card? c))]
     (doseq [host (surface-hosts c)]
       (let [a (ffi/address host)
             _ (swap! backdrop-hosts update (ffi/address (view c)) (fnil conj #{}) a)
             data (or (get @backdrops a) {})
-            data (if (and color (not (:color data)))
+            data (if (and boxed (not (:color data)))
                    (assoc data :color (make-backdrop host :color))
                    data)
             data (if (and (nil? color) (not= role :automatic) (not (:material data))
@@ -3062,8 +3077,15 @@ notebook)."
                    (assoc data :material (make-backdrop host :material))
                    data)]
         (when-let [box (:color data)]
-          (when color (objc/send-p-void box (objc/sel "setFillColor:") (ns-color color)))
-          (objc/send-b-void box (objc/sel "setHidden:") (nil? color)))
+          (when boxed
+            (objc/send-p-void box (objc/sel "setFillColor:")
+                              (palette-ns-color c (or color :transparent)))
+            (objc/send-d-void box (objc/sel "setCornerRadius:") (f64 (or (:corner-radius c) 0)))
+            (objc/send-d-void box (objc/sel "setBorderWidth:")
+                              (f64 (if (:border-color c) (or (:border-width c) 1) 0)))
+            (when-let [b (:border-color c)]
+              (objc/send-p-void box (objc/sel "setBorderColor:") (palette-ns-color c b))))
+          (objc/send-b-void box (objc/sel "setHidden:") (not boxed)))
         (when-let [m (:material data)]
           (objc/send-l-void m (objc/sel "setMaterial:") (get surface-materials role 12))
           (objc/send-l-void m (objc/sel "setBlendingMode:")
@@ -3081,6 +3103,20 @@ notebook)."
 
 (defmethod set-native [(c ui/container-widget) (p (= :surface)) v] (refresh-surface! c))
 (defmethod set-native [(c ui/container-widget) (p (= :background)) v] (refresh-surface! c))
+(defmethod set-native [(c ui/container-widget) (p (= :corner-radius)) v] (refresh-surface! c))
+(defmethod set-native [(c ui/container-widget) (p (= :border-color)) v] (refresh-surface! c))
+(defmethod set-native [(c ui/container-widget) (p (= :border-width)) v] (refresh-surface! c))
+
+(defn native-card
+  "A container's card as AppKit draws it: {:corner-radius :border-width :border-color
+:fill}, the colors as skein.ui colors, or nil if it has no backdrop box."
+  [c]
+  (when-let [box (:color (get @backdrops (ffi/address (first (surface-hosts c)))))]
+    (when-not (objc/send-bool box (objc/sel "isHidden"))
+      {:corner-radius (objc/send-double box (objc/sel "cornerRadius"))
+       :border-width (objc/send-double box (objc/sel "borderWidth"))
+       :border-color (color-of (objc/send box (objc/sel "borderColor")))
+       :fill (color-of (objc/send box (objc/sel "fillColor")))})))
 
 (defmethod ui/backend-add-child :after [(b cocoa-backend) (c ui/notebook-widget) child]
   (refresh-surface! c))
@@ -3088,12 +3124,6 @@ notebook)."
 (defmethod set-native [(w ui/window-widget) (p (= :background)) v]
   (objc/send-p-void (view w) (objc/sel "setBackgroundColor:")
                     (ns-color (or (ui/container-fill w) :window-background))))
-
-(defn- palette-ns-color
-  "An NSColor of the designator as the widget shows it: a palette's color, or else the
-platform's dynamic one."
-  [w d]
-  (if (and (keyword? d) (ui/palette-color w d)) (ns-color (ui/widget-color w d)) (ns-color d)))
 
 (def ^:private recolor-code-view!
   "Give a code view its palette's colors again (defined with code views).")
