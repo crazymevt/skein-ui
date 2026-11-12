@@ -2733,25 +2733,23 @@ colors, the palette's text and background colors, a container's surface or backg
         (:view (get @list-parts (ffi/address n)))
         :else n))
 
-(def ^:private right-clickable
-  "The addresses of the GTK widgets that have a click gesture of ours."
-  (atom #{}))
-
-(def ^:private input-gestures
-  "A GTK widget's address -> the click gesture of ours on it, for tests."
-  (atom {}))
+(defn- click-gesture
+  "The click gesture of ours on the GTK widget target, or nil. It is kept on the widget
+(its GObject data), not by its address, which a widget made later can have."
+  [target]
+  (let [g (lib/g-object-get-data target "skein-click-gesture")]
+    (when-not (ffi/null? g) g)))
 
 (defn- add-click-gesture! [w target button]
-  (when-not (contains? @right-clickable (ffi/address target))
+  (when-not (click-gesture target)
     (let [g (lib/gesture-click-new)]
-      (swap! input-gestures assoc (ffi/address target) g)
       (lib/gesture-single-set-button g button)
       (lib/controller-set-phase g 1)   ; capture: before the widget's own
       (lib/register! g w)
       (connect! g "pressed" :pressed press-imp)
       (connect! g "released" :released press-imp)
       (lib/widget-add-controller target g)
-      (swap! right-clickable conj (ffi/address target)))))
+      (lib/g-object-set-data target "skein-click-gesture" g))))
 
 (defn- install-input! [w n]
   (when (and (contains? (ui/signals w) :key-down) (not (instance? ui/canvas-widget w))
@@ -3828,7 +3826,7 @@ gesture reports a click: pressed, then released."
       (ffi/with-foreign [wy (ffi/alloc i32 1)]
         ;; GTK_TEXT_WINDOW_WIDGET 1: from the content to the text view's own
         (lib/text-view-buffer-to-window-coords tv 1 (+ x 2) (+ y 4) wx wy)
-        (let [g (get @input-gestures (ffi/address tv))]
+        (let [g (click-gesture tv)]
           (doseq [signal ["pressed" "released"]]
             (lib/g-signal-emit-press g signal 1 (f64 (ffi/get wx i32)) (f64 (ffi/get wy i32))
                                      (ffi/null))))))))
@@ -3881,10 +3879,6 @@ gesture reports a click: pressed, then released."
 ;;; Window states, from the toplevel surface's state. GTK 4 keeps a window's default size
 ;;; as its normal one, so the content's actual size is read back when the state settles.
 
-(def ^:private watched-surfaces
-  "The addresses of the window surfaces whose state we watch."
-  (atom #{}))
-
 (defmethod ui/backend-window-state [(b gtk-backend) w]
   (let [win (native w)
         surface (lib/native-get-surface win)
@@ -3917,8 +3911,10 @@ gesture reports a click: pressed, then released."
 
 (defn- watch-surface! [w]
   (let [surface (lib/native-get-surface (native w))]
-    (when (and (not (ffi/null? surface)) (not (contains? @watched-surfaces (ffi/address surface))))
-      (swap! watched-surfaces conj (ffi/address surface))
+    ;; Marked on the surface itself: a later window's surface can have a freed one's address.
+    (when (and (not (ffi/null? surface))
+               (ffi/null? (lib/g-object-get-data surface "skein-watched")))
+      (lib/g-object-set-data surface "skein-watched" surface)
       (lib/register! surface w)
       (connect! surface "notify::state" :window-state signal-arg-imp))))
 

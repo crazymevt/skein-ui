@@ -413,6 +413,9 @@ hasn't placed it."
 (ffi/defcfun ^:blocking render-node-unref "gsk_render_node_unref" void [n ptr])
 (ffi/defcfun ^:blocking texture-save-to-png-bytes "gdk_texture_save_to_png_bytes" ptr [t ptr])
 (ffi/defcfun ^:blocking g-bytes-get-data "g_bytes_get_data" ptr [b ptr, size ptr])
+(ffi/defcfun ^:blocking g-object-set-data "g_object_set_data" void
+  [o ptr, key c-string, data ptr])
+(ffi/defcfun ^:blocking g-object-get-data "g_object_get_data" ptr [o ptr, key c-string])
 (ffi/defcfun ^:blocking memcpy "memcpy" ptr [to ptr, from ptr, n u64])
 (ffi/defcfun ^:blocking widget-get-native "gtk_widget_get_native" ptr [w ptr])
 (ffi/defcfun ^:blocking native-get-surface-transform "gtk_native_get_surface_transform" void
