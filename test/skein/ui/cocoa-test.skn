@@ -668,8 +668,11 @@
       (is (= [b a] (:children p))))
     (testing "dropping a tab on another pane"
       (cocoa/drag-tab! a q)
-      (cocoa/run-for! 0.1)
-      (is (= [b] (:children p)))
+      ;; the move may take a few turns of the loop on a slow machine (CI's); widgets are
+      ;; compared by identity, which = on a widget's graph of parents and children isn't
+      (run-until! (fn [] (identical? a (last (:children q)))))
+      (is (= 1 (count (:children p))))
+      (is (identical? b (first (:children p))))
       (is (identical? a (last (:children q))))
       (is (:selected (cocoa/native-tab a))))
     (ui/close! w)))
