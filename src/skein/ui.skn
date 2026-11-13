@@ -3595,12 +3595,14 @@ methods on handle-event, to make a custom widget. Coordinates start at its top l
   [(or (:width c) 100) (or (:height c) 100)])
 
 (defn redraw!
-  "Draw the canvas again soon, all of it or the rectangle given. Returns the canvas."
+  "Draw the canvas again soon, all of it or the rectangle given; nothing once it's
+destroyed. Returns the canvas."
   ([c] (redraw! c nil))
   ([c x y width height] (redraw! c [x y width height]))
   ([c rect]
-   (let [b (current-backend)]
-     (in-ui (fn [] (backend-redraw b c rect))))
+   (when (and (realized? c) (not (:destroyed c)))
+     (let [b (current-backend)]
+       (in-ui (fn [] (backend-redraw b c rect)))))
    c))
 
 (defn text-extent

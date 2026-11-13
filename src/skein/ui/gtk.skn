@@ -354,6 +354,13 @@ for the user's doing."
 (defmethod ui/backend-remove-child [(b gtk-backend) parent child]
   (lib/fixed-remove (container-view parent) (native child)))
 
+(defmethod native-natural-size [(l ui/label-widget)]
+  ;; A wrapping label with a :width is that wide, as on Cocoa (GTK's natural width is its
+  ;; text's on one line): what it would take there.
+  (if (and (:wrap l) (:width l))
+    [(:width l) (lib/height-for-width (native l) (:width l))]
+    (call-next-method)))
+
 (defmethod native-natural-size [w]
   (let [n (native w)
         size (lib/natural-size n)]
