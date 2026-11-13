@@ -382,6 +382,10 @@ for the user's doing."
                (not (instance? ui/tab-bar-widget w)))
       (lib/fixed-move (lib/widget-get-parent n) n (f64 x) (f64 y)))
     (lib/widget-set-size-request n width height)
+    ;; a split pane's panes placed anew (one shown, say): its divider goes where they
+    ;; meet, though its own bounds didn't change
+    (when-let [[_ _ pw ph] (when (instance? ui/paned-widget p) (:allocation p))]
+      (layout-native p pw ph))
     (layout-native w width height)))
 
 (defmethod set-native [(w ui/widget) (p (= :visible)) v]
@@ -1169,8 +1173,10 @@ skein.ui image, or null for nil."
 
 (defmethod make-native [(p ui/paned-widget)]
   (let [n (owned (lib/paned-new (if (= :vertical (:orientation p)) 1 0)))]
-    (lib/paned-set-shrink-start n false)
-    (lib/paned-set-shrink-end n false)
+    ;; skein.ui gives the panes their lengths, which may be less than they'd take (a pane
+    ;; the paned widget doesn't keep): GTK mustn't widen the window to fit them
+    (lib/paned-set-shrink-start n true)
+    (lib/paned-set-shrink-end n true)
     (connect! n "notify::position" :position signal-arg-imp)))
 
 (defmethod set-native [(p ui/paned-widget) (k (= :orientation)) v]

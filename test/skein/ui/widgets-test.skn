@@ -158,7 +158,29 @@
     (testing "three panes share what the first leaves"
       (let [p (ui/paned {:orientation :vertical :position 10} (ui/label {}) (ui/label {})
                         (ui/label {}))]
-        (is (= [10 44 45] (ui/pane-lengths p 101)))))))
+        (is (= [10 44 45] (ui/pane-lengths p 101))))))
+  (testing "with :keep :end, the last pane keeps its length and the first takes the rest"
+    (let [a (ui/label {:text "abcd"})
+          side (ui/label {:text "ab" :width 40})
+          p (ui/paned {:keep :end :position 40} a side)
+          w (ui/window {:width 201 :height 50} p)
+          seen (atom nil)]
+      (ui/on p :divider-moved (fn [e] (reset! seen (:value e))))
+      (ui/show! w)
+      (is (= [0 0 160 50] (bounds a)))
+      (is (= [161 0 40 50] (bounds side)))
+      (set-slot! w :width 301)
+      (headless/run-pending!)
+      (is (= [261 0 40 50] (bounds side)) "a wider window widens the first pane")
+      (is (= 260 (nth (bounds a) 2)))
+      (headless/drag-divider! p 200)
+      (is (= 100 @seen) "the divider at 200 leaves the last pane 100")
+      (is (= [201 0 100 50] (bounds side)))))
+  (testing "a pane it doesn't keep asks for at most shrinkable-pane-length"
+    (let [wide (ui/label {:text (apply str (repeat 50 "x"))})
+          p (ui/paned {:position 30} (ui/label {:text "a"}) wide)]
+      (is (= (+ 30 1 ui/shrinkable-pane-length) (first (ui/preferred-size p)))
+          "a window holding it can be narrower than the wide pane"))))
 
 (deftest scrolled-windows
   (let [big (ui/label {:text "abcdefghijklmnopqrstuvwxyz" :height 300})

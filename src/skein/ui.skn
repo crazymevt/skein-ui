@@ -2943,16 +2943,27 @@ event."
 
 (defclass paned-widget [container-widget]
   "Panes side by side, or one above another, with dividers the user drags. It emits
-:divider-moved (a value-event with the new :position) when the user drags one."
+:divider-moved (a value-event with the new :position) when the user drags one. The pane it
+keeps (the first, or with :keep :end the last) has its :position; the others share the
+rest, and ask for at most shrinkable-pane-length of it, since the user can drag the
+divider: a window holding it needn't fit them whole."
   (orientation :cell :atom :init :horizontal
                :doc ":horizontal puts the panes side by side, :vertical one above another.")
+  (keep :cell :atom :init :start
+        :doc ":start keeps the first pane's length when the paned widget is resized, :end
+the last's (a sidebar on the right, say).")
   (position :cell :atom :init nil
-            :doc "The first pane's length, in pixels, or nil for its natural length. It
+            :doc "The kept pane's length, in pixels, or nil for its natural length. It
 keeps it when the paned widget is resized; the other panes share the rest."))
 
 (declare-widget! paned-widget {:properties [:orientation :position]
-                               :layout [:orientation :position]
+                               :layout [:orientation :position :keep]
                                :signals {:divider-moved value-event}})
+
+(def shrinkable-pane-length
+  "The most a paned widget's panes other than the one it keeps ask for, in pixels: the
+user can drag the divider to give them less."
+  120)
 
 (defn paned
   "A paned widget: (paned {:position 200} sidebar content)."
@@ -2964,18 +2975,29 @@ keeps it when the paned widget is resized; the other panes share the rest."))
   [p]
   (first (backend-decoration-size (current-backend) p)))
 
+(defn- kept-index [p n] (if (= :end (:keep p)) (dec n) 0))
+
 (defmethod measure [(p paned-widget)]
   (let [h? (= :horizontal (:orientation p))
         kids (visible-children p)
-        sizes (map outer-size kids)
-        main (+ (reduce + 0 (map (fn [[w h]] (if h? w h)) sizes))
-                (* (divider-size p) (max 0 (dec (count kids)))))
-        cross (reduce max 0 (map (fn [[w h]] (if h? h w)) sizes))]
+        n (count kids)
+        ;; the pane it keeps, shown or not: the others give way, even shown alone
+        kept (let [all (:children p)] (if (= :end (:keep p)) (last all) (first all)))
+        lengths (map (fn [c]
+                       (let [[w h] (outer-size c)
+                             len (if h? w h)]
+                         (cond (not (identical? c kept)) (min len shrinkable-pane-length)
+                               (= n 1) len
+                               :else (or (:position p) len))))
+                     kids)
+        main (+ (reduce + 0 lengths) (* (divider-size p) (max 0 (dec n))))
+        cross (reduce max 0 (map (fn [c] (let [[w h] (outer-size c)] (if h? h w))) kids))]
     (if h? [main cross] [cross main])))
 
 (defn pane-lengths
-  "The length of each shown pane of p along the split, for total pixels: the first gets
-its :position (or its natural length), and the others share the rest."
+  "The length of each shown pane of p along the split, for total pixels: the kept one
+(the first, or with :keep :end the last) gets its :position (or its natural length), and
+the others share the rest."
   [p total]
   (let [h? (= :horizontal (:orientation p))
         kids (visible-children p)
@@ -2984,12 +3006,13 @@ its :position (or its natural length), and the others share the rest."
     (cond
       (zero? n) []
       (= n 1) [available]
-      :else (let [natural (let [[w h] (outer-size (first kids))] (if h? w h))
-                  first-length (max 0 (min (or (:position p) natural) available))
-                  rest-length (- available first-length)
-                  each (quot rest-length (dec n))]
-              (into [first-length]
-                    (concat (repeat (- n 2) each) [(- rest-length (* each (- n 2)))]))))))
+      :else (let [k (kept-index p n)
+                  natural (let [[w h] (outer-size (nth kids k))] (if h? w h))
+                  kept (max 0 (min (or (:position p) natural) available))
+                  rest-length (- available kept)
+                  each (quot rest-length (dec n))
+                  others (concat (repeat (- n 2) each) [(- rest-length (* each (- n 2)))])]
+              (vec (if (zero? k) (cons kept others) (concat others [kept])))))))
 
 (defmethod arrange [(p paned-widget) width height]
   (let [h? (= :horizontal (:orientation p))
@@ -3003,14 +3026,28 @@ its :position (or its natural length), and the others share the rest."
             (map vector (visible-children p) (pane-lengths p (if h? width height))))
     nil))
 
+(defn- divider-moved-to! [p position]
+  (let [position (if (and (= :end (:keep p)) (:allocation p))
+                   (let [[_ _ w h] (:allocation p)]
+                     (max 0 (- (if (= :horizontal (:orientation p)) w h) position
+                               (divider-size p))))
+                   position)]
+    (sync-property! p :position position)
+    (when-let [[_ _ w h] (:allocation p)]
+      (arrange p w h))
+    (emit! p (event-for p :divider-moved :value position))))
+
 (defn divider-moved-by-user!
   "Backends call this when the user dragged the paned widget's first divider to
-position: it places the panes again and emits :divider-moved. Returns the event."
+position (the first pane's length): it places the panes again and emits :divider-moved
+with the kept pane's length. Returns the event, or nil for where layout put it."
   [p position]
-  (sync-property! p :position position)
-  (when-let [[_ _ w h] (:allocation p)]
-    (arrange p w h))
-  (emit! p (event-for p :divider-moved :value position)))
+  (if (or (< (count (visible-children p)) 2)  ; one pane shown: no divider to drag
+          (when-let [[_ _ w h] (:allocation p)]
+            ;; where layout put it, which a platform may report as a move: not the user's
+            (= position (first (pane-lengths p (if (= :horizontal (:orientation p)) w h))))))
+    nil
+    (divider-moved-to! p position)))
 
 (defgeneric backend-set-scroll-extent [backend scrolled width height]
   "Make the scrolled window's content area width by height. Returns the view's new [width

@@ -601,6 +601,22 @@
       (is (= [:clicked :enter :leave] @events)))
     (ui/close! w)))
 
+(deftest a-side-pane-kept-at-the-end
+  ;; A pane on the right, kept at its length, hidden and then shown: it gets its length,
+  ;; the first pane gives it up, and the window doesn't grow for the first's natural width.
+  (let [main (ui/label {:text (apply str (repeat 60 "m"))})
+        side (ui/vbox {:visible false} (ui/label {:text "side"}))
+        split (ui/paned {:keep :end :position 150} main side)
+        w (ui/window {:title "Side" :width 400 :height 200} split)]
+    (ui/show! w)
+    (cocoa/run-for! 0.2)
+    (set-slot! side :visible true)
+    (cocoa/run-for! 0.2)
+    (is (= 400 (:width w)) "the window keeps its width")
+    (is (= 150 (nth (:allocation side) 2)) "the side pane has its length")
+    (is (< (nth (:allocation main) 2) 250) "the first pane gave it up")
+    (ui/close! w)))
+
 (deftest stacks-and-tabbed-panes
   (let [a (ui/label {:text "one"})
         b (ui/label {:text "two"})
