@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/render", "crates/desktop", "crates/host"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+norn-ui-engine = { path = "crates/engine" }
+norn-ui-render = { path = "crates/render" }
+norn-ui-desktop = { path = "crates/desktop" }
+taffy = "0.9"
+parley = { version = "0.13", features = ["complex-scripts"] }
+swash = "0.2"
+num-bigint = "0.4"
+num-rational = "0.4"
+num-traits = "0.2"

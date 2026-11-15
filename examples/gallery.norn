@@ -1,0 +1,144 @@
+;;;; The norn.ui widget gallery (M7.5's done-check app).
+;;;; Run it with: ./target/debug/norn-ui examples/gallery.norn
+
+(require '[norn.ui :as ui])
+
+(ui/theme! ui/base-theme)
+
+(def files
+  [{:id :src :label "src" :icon :folder :color "#3070e0"
+    :children [{:id :main :label "main.norn" :icon :file-code} {:id :ui :label "ui.norn" :icon :file-code}
+               {:id :widgets :label "widgets" :icon :folder
+                :children [{:id :tabs :label "tabs.norn" :icon :file-code} {:id :tree :label "tree.norn" :icon :file-code}]}]}
+   {:id :docs :label "docs" :icon :folder :color "#c0752d" :children [{:id :readme :label "README.md" :icon :file-text}]}
+   {:id :build :label "build.norn" :icon :file-code :color "#3a8a3a"}])
+
+(def state
+  (atom {:sidebar 200 :tab :controls :expanded #{:src} :selected :main
+         :dark? (ui/recall "norn-ui gallery" :dark? false) :wrap? true :name "" :clicks 0 :fruit :pear :level 0.5
+         :grid-sort [:n :asc] :grid-sel nil :grid-y 0 :grid-widths {:n 70 :name 200 :size 100}
+         :items (vec (for [i (range 10000)] (str "Row " i))) :scroll-y 0}))
+
+;; A self-drawing widget: a CLOS class painted on a canvas.
+(defclass Level (ui/Widget) ((value :initform 0.5) (on-change :initform nil)))
+(defmethod ui/measure ((l Level)) [240 18])
+(defmethod ui/paint ((l Level) size)
+  (let [[w h] size]
+    [[:rounded-rect [0 0 w h] 9 {:fill :line}]
+     [:rounded-rect [0 0 (max h (* w (:value l))) h] 9 {:fill :accent}]
+     [:circle [(max (/ h 2) (- (* w (:value l)) (/ h 2))) (/ h 2)] (- (/ h 2) 2) {:fill :knob}]]))
+(defmethod ui/widget-events ((l Level)) #{:click :drag})
+(defmethod ui/on-event ((l Level) e)
+  ;; a click's :x, or where a drag has got to, in the widget
+  (let [x (if (= :drag (:event e)) (:local-x e) (:x e))]
+    ((:on-change l) (min 1 (max 0 (/ x 240.0))))))
+
+(defn controls [{:keys [dark? wrap? name clicks fruit level]}]
+  [:column {:padding 16 :gap 14}
+   [:row {:gap 10 :align-items :center}
+    [:button {:id :click :tooltip "Adds one to the count" :on-click (fn [_] (swap! state update :clicks inc))} "Click me"]
+    [:text {:id :clicks :context-menu [["Reset the count" :reset] ["Add ten" :add-ten]]
+            :on-command (fn [e] (if (= :reset (:command e)) (swap! state assoc :clicks 0) (swap! state update :clicks + 10)))}
+     "Clicked " clicks " times (right-click me)"]]
+   [:row {:gap 10 :align-items :center}
+    [:text "Fruit:"]
+    (ui/dropdown {:id :fruit :width 140 :value fruit :on-change (fn [v] (swap! state assoc :fruit v))
+                  :options [[:apple "Apple"] [:pear "Pear"] [:plum "Plum"] [:quince "Quince"]]})]
+   [:row {:gap 10 :align-items :center}
+    [:text "Level:"]
+    (Level :value level :on-change (fn [v] (swap! state assoc :level v)))
+    [:text (str (int (* 100 level)) "%")]]
+   (ui/toggle {:id :dark :on? dark? :label "Dark mode"
+               :on-change (fn [v]
+                            (swap! state assoc :dark? v)
+                            (ui/remember! "norn-ui gallery" :dark? v)
+                            (ui/theme! (if v ui/dark-theme ui/base-theme)))})
+   (ui/checkbox {:id :wrap :checked? wrap? :label "Wrap long lines" :on-change (fn [v] (swap! state assoc :wrap? v))})
+   [:text-field {:id :name :value name :placeholder "Your name" :width 240
+                 :on-input (fn [e] (swap! state assoc :name (:value e)))}]
+   [:text (if (= "" name) "Type a name above." (str "Hello, " name "!"))]])
+
+(defn big-list [{:keys [items scroll-y]}]
+  [:column {:padding 16 :gap 8}
+   [:text {:class :muted} (count items) " rows; only the visible ones exist"]
+   (ui/vlist {:id :rows :items items :row-height 24 :height 260 :scroll-y scroll-y
+              :on-scroll (fn [y] (swap! state assoc :scroll-y y))
+              :row (fn [item i] [:row {:padding [4 8] :background (if (even? i) :panel :row-alt)} [:text item]])})])
+
+(def doc (ui/editor-model ";; The editor surface: the text is a rope in Norn; the engine draws
+;; only the lines in view and repaints only the lines that change.
+(defn fib [n]
+  (if (< n 2)
+    n
+    (+ (fib (- n 1)) (fib (- n 2)))))
+
+(def answer (fib 20)) ; => 6765
+"))
+
+(def files-table
+  (vec (for [i (range 10000)] {:n i :name (str "file-" i ".norn") :size (mod (* i 7919) 100000)})))
+
+(def sorted-cache (atom {}))
+
+(defn sorted-rows
+  "The table sorted by [key dir], computed once per order."
+  [[k dir :as order]]
+  (or (get @sorted-cache order)
+      (let [rows (sort-by k files-table)
+            rows (vec (if (= dir :desc) (reverse rows) rows))]
+        (swap! sorted-cache assoc order rows)
+        rows)))
+
+(defn grid-tab [{:keys [grid-sort grid-sel grid-y grid-widths]}]
+  [:column {:padding 16 :flex-grow 1}
+   (ui/grid {:id :files-grid :height 340 :rows (sorted-rows grid-sort) :sort grid-sort
+             :selected grid-sel :scroll-y grid-y
+             :columns [{:key :n :title "#" :width (:n grid-widths)} {:key :name :title "Name" :width (:name grid-widths)}
+                       {:key :size :title "Size" :width (:size grid-widths)}]
+             :on-select (fn [i] (swap! state assoc :grid-sel i))
+             :on-scroll (fn [y] (swap! state assoc :grid-y y))
+             :on-sort (fn [k] (swap! state update :grid-sort (fn [[k0 d]] [k (if (and (= k k0) (= d :asc)) :desc :asc)])))
+             :on-resize-column (fn [k w] (swap! state assoc-in [:grid-widths k] w))})])
+
+(defn text-tab [_]
+  [:column {:padding 16 :gap 10}
+   [:text {:font-size 20 :font-weight :bold} "Text"]
+   [:text "Inter for the interface, shaped by parley, with font fallback and line breaking. This paragraph wraps to the width of its panel."]
+   [:text {:font-family "code"} "(defn greet [name] (str \"Hello, \" name))"]
+   [:text {:font-style :italic :class :muted} "Italic, muted, and ünïcödé."]])
+
+(defn gallery [{:keys [sidebar tab expanded selected] :as s}]
+  [:column {:flex-grow 1}
+   (ui/split {:id :split :size sidebar :on-resize (fn [dx] (swap! state update :sidebar (fn [w] (max 120 (+ w dx)))))}
+             [:column {:padding 8 :background :panel :flex-grow 1}
+              (ui/tree {:id :files :nodes files :expanded expanded :selected selected
+                        :on-toggle (fn [id] (swap! state update :expanded (fn [e] (if (contains? e id) (disj e id) (conj e id)))))
+                        :on-select (fn [id] (swap! state assoc :selected id))})]
+             (ui/tabs {:id :tabs :selected tab :on-select (fn [k] (swap! state assoc :tab k))}
+                      [[:controls "Controls" (fn [] (controls s))]
+                       [:list "List" (fn [] (big-list s))]
+                       [:grid "Grid" (fn [] (grid-tab s))]
+                       [:markdown "Markdown" (fn [] [:scroll {:flex-grow 1}
+                                                     [:column {:padding 16}
+                                                      (ui/markdown (slurp "README.md") {:on-link (fn [h] (println "link:" h))})]])]
+                       [:text "Text" (fn [] (text-tab s))]
+                       [:editor "Editor" [:editor {:id :ed :model doc :highlight ui/highlight-norn}]]]))])
+
+;; The menu bar, and files opened or dropped land in the editor tab.
+(defn open-in-editor! [path]
+  (when path
+    (ui/editor-set-text! doc (slurp path))
+    (swap! state assoc :tab :editor)))
+
+(ui/menu! [["Gallery" [["Quit Gallery" :quit "cmd+q"]]]
+           ["File" [["Open…" :open "cmd+o"]]]
+           ["Edit" [["Cut" :cut "cmd+x"] ["Copy" :copy "cmd+c"] ["Paste" :paste "cmd+v"]
+                    :separator ["Select All" :select-all "cmd+a"]]]])
+(ui/on-command! :open (fn [_] (open-in-editor! (ui/choose-file {:title "Open a file"}))))
+
+(when (:dark? @state) (ui/theme! ui/dark-theme))
+
+(def w (ui/window {:title "norn.ui gallery" :size [720 480] :remember ["norn-ui gallery" :main]
+                   :on-drop (fn [e] (open-in-editor! (first (:paths e))))}
+                  #'gallery state))
+(when-not (= "1" (norn.core/%getenv "NORN_UI_HEADLESS")) (ui/wait-closed))

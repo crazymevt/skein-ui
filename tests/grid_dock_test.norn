@@ -1,0 +1,179 @@
+;;;; Virtualized grids, controlled scrolling and docks (headless).
+
+(ns grid-dock-test
+  (:refer-core :exclude [settle])
+  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+
+(ui/theme! ui/base-theme)
+(defn settle [] (sleep 100))
+
+(defn centre [w id]
+  (let [{:keys [x y w h]} (ui/node-rect w (ui/node-of w id))] [(+ x (quot w 2)) (+ y (quot h 2))]))
+
+(def rows (vec (for [i (range 5000)] {:n i :name (str "item " i) :size (* i 7)})))
+
+(def gstate (atom {:widths {:n 60 :name 140 :size 80} :selected nil :scroll-y 0 :sort [:n :asc]}))
+
+(defn gview [{:keys [widths selected scroll-y sort]}]
+  [:column {:padding 0 :flex-grow 1}
+   (ui/grid {:id :g :height 200 :rows rows :selected selected :scroll-y scroll-y :sort sort
+             :columns [{:key :n :title "#" :width (:n widths)} {:key :name :title "Name" :width (:name widths)}
+                       {:key :size :title "Size" :width (:size widths)}]
+             :on-select (fn [i] (swap! gstate assoc :selected i))
+             :on-scroll (fn [y] (swap! gstate assoc :scroll-y y))
+             :on-sort (fn [k] (swap! gstate update :sort (fn [[k0 d]] [k (if (and (= k k0) (= d :asc)) :desc :asc)])))
+             :on-resize-column (fn [k wd] (swap! gstate assoc-in [:widths k] wd))})])
+
+(deftest grids
+  (let [w (ui/window {:size [320 220]} #'gview gstate)]
+    (settle)
+    (testing "only the visible rows exist"
+      (is (some? (ui/node-of w :grid-row-0)))
+      (is (nil? (ui/node-of w :grid-row-100))))
+    (testing "clicking selects; the keyboard moves and scrolls"
+      (let [[x y] (centre w :grid-row-2)] (ui/simulate! [:click w x y]))
+      (settle)
+      (is (= 2 (:selected @gstate)))
+      (dotimes [_ 20] (ui/simulate! [:key w :arrow-down #{}]))
+      (settle)
+      (is (= 22 (:selected @gstate)))
+      (is (pos? (:scroll-y @gstate)))
+      (is (some? (ui/node-of w :grid-row-22)))
+      (ui/simulate! [:key w :end #{}])
+      (settle)
+      (is (= 4999 (:selected @gstate)))
+      (is (some? (ui/node-of w :grid-row-4999)) "End scrolls to the last row")
+      (ui/simulate! [:key w :home #{}])
+      (settle)
+      (is (= 0 (:scroll-y @gstate))))
+    (testing "sorting and resizing columns"
+      (let [[x y] (centre w :grid-col-name)] (ui/simulate! [:click w x y]))
+      (settle)
+      (is (= [:name :asc] (:sort @gstate)))
+      (let [[x y] (centre w :grid-resize-name)]
+        (ui/simulate! [:down w x y])
+        (ui/simulate! [:move w (+ x 10) y])
+        (ui/simulate! [:move w (+ x 30) y])
+        (ui/simulate! [:up w (+ x 30) y]))
+      (settle)
+      (is (= 170 (get-in @gstate [:widths :name]))))
+    (ui/screenshot w "/tmp/norn-ui-grid.png" 1)
+    (ui/close-window w)))
+
+(def dstate (atom {:groups [[:left [:files :search]] [:right [:editor :repl]]]
+                   :active {:left :files :right :editor}}))
+
+(def panels {:files ["Files" [:text "files"]] :search ["Search" [:text "search"]]
+             :editor ["Editor" [:text "editor"]] :repl ["REPL" [:text "repl"]]})
+
+(defn dview [layout]
+  [:column {:flex-grow 1}
+   (ui/dock {:id :d :layout layout :panels panels :on-change (fn [l] (reset! dstate l))})])
+
+(deftest docks
+  (let [w (ui/window {:size [400 200]} #'dview dstate)]
+    (settle)
+    (testing "a click picks a tab"
+      (let [[x y] (centre w :d-tab-search)] (ui/simulate! [:click w x y]))
+      (settle)
+      (is (= :search (get-in @dstate [:active :left]))))
+    (testing "dragging a tab to the other group moves it there"
+      (let [[x y] (centre w :d-tab-search)
+            [tx ty] (centre w :d-tab-repl)]
+        (ui/simulate! [:down w x y])
+        (ui/simulate! [:move w (+ x 10) y])
+        (settle)
+        (ui/simulate! [:move w (+ tx 20) ty])
+        (settle)
+        (ui/simulate! [:up w (+ tx 20) ty]))
+      (settle)
+      (is (= [[:left [:files]] [:right [:editor :repl :search]]] (:groups @dstate)))
+      (is (= {:left :files :right :search} (:active @dstate))))
+    (testing "and back, before the first tab"
+      (let [[x y] (centre w :d-tab-search)
+            [tx ty] (centre w :d-tab-files)]
+        (ui/simulate! [:down w x y])
+        (ui/simulate! [:move w (- x 10) y])
+        (settle)
+        (ui/simulate! [:move w (- tx 10) ty])
+        (settle)
+        (ui/simulate! [:up w (- tx 10) ty]))
+      (settle)
+      (is (= [[:left [:search :files]] [:right [:editor :repl]]] (:groups @dstate))))
+    (ui/screenshot w "/tmp/norn-ui-dock.png" 1)
+    (ui/close-window w)))
+
+;; Groups placed apart (as an editor's left, right and bottom docks), with an
+;; empty group shown only while a tab is dragged.
+(def pstate (atom {:layout {:groups [[:left [:files :search]] [:bottom [:editor :repl]] [:right []]]
+                            :active {:left :files :bottom :editor}}
+                   :closed []}))
+
+(defn pview [{:keys [layout]}]
+  (let [opts {:id :p :layout layout :panels panels :on-change (fn [l] (swap! pstate assoc :layout l))
+              :on-close (fn [t] (swap! pstate update :closed conj t))
+              :empty "Drop a tool here"}
+        shown? (fn [g] (or (ui/dock-dragging? :p) (seq (get (into {} (:groups layout)) g))))]
+    [:row {:flex-grow 1}
+     [:column {:key :main :flex-grow 1}
+      [:row {:key :top :flex-grow 1} (ui/dock-group (assoc opts :group :left))]
+      [:row {:key :bottom :height 80} (ui/dock-group (assoc opts :group :bottom))]]
+     (when (shown? :right) [:column {:key :right :width 120} (ui/dock-group (assoc opts :group :right))])]))
+
+(deftest dock-groups-apart
+  (let [w (ui/window {:size [400 240]} #'pview pstate)]
+    (settle)
+    (is (nil? (ui/node-of w :p-group-right)) "the empty group isn't shown")
+    (testing "a tab dragged to a group that appears only while dragging"
+      (let [[x y] (centre w :p-tab-repl)]
+        (ui/simulate! [:down w x y])
+        (ui/simulate! [:move w (+ x 10) y])
+        (settle)
+        (is (ui/dock-dragging? :p))
+        (is (some? (ui/node-of w :p-group-right)) "shown while dragging")
+        (let [[tx ty] (centre w :p-group-right)]
+          (ui/simulate! [:move w tx ty])
+          (settle)
+          (ui/simulate! [:move w (inc tx) ty])
+          (settle)
+          (ui/simulate! [:up w (inc tx) ty])))
+      (settle)
+      (is (= [[:left [:files :search]] [:bottom [:editor]] [:right [:repl]]] (:groups (:layout @pstate))))
+      (is (= :repl (get-in @pstate [:layout :active :right]))))
+    (testing "the close button"
+      (ui/click! w :p-tab-search-close)
+      (settle)
+      (is (= [:search] (:closed @pstate))))
+    (ui/close-window w)))
+
+(deftest a-narrow-group-scrolls-its-tabs
+  ;; More tabs than fit: the strip stays one tab high (the tabs used to
+  ;; shrink, wrap and grow taller), scrolls sideways, and brings the
+  ;; chosen tab into view.
+  (let [names [:inspector :repl :output :problems :tests :debugger :chat]
+        st (atom {:groups [[:right names]] :active {:right :inspector}})
+        w (ui/window {:size [260 160]}
+                     (fn [layout]
+                       [:row {:flex-grow 1}
+                        (ui/dock-group {:id :t :group :right :layout layout
+                                        :panels (into {} (for [n names] [n [(str "Tab " (name n)) [:text (name n)]]]))
+                                        :on-change (fn [l] (reset! st l))})])
+                     st)
+        tab (fn [n] (ui/node-rect w (ui/node-of w (keyword (str "t-tab-" (name n))))))]
+    (settle)
+    (testing "one line of tabs"
+      (is (= (:h (tab :inspector)) (:h (tab :chat))))
+      (is (= (:y (tab :inspector)) (:y (tab :chat))))
+      (is (< (:h (tab :inspector)) 40)))
+    (testing "the last is past the edge; choosing it brings it into view"
+      (is (> (+ (:x (tab :chat)) (:w (tab :chat))) 260))
+      (swap! st assoc-in [:active :right] :chat)
+      (settle)
+      (is (<= (+ (:x (tab :chat)) (:w (tab :chat))) 260)))
+    (testing "a plain wheel scrolls the strip sideways"
+      (let [x0 (:x (tab :inspector))
+            {:keys [x y h]} (tab :chat)]
+        (ui/simulate! [:wheel w (+ x 5) (+ y (quot h 2)) 0 -400])
+        (settle)
+        (is (> (:x (tab :inspector)) x0))))
+    (ui/close-window w)))

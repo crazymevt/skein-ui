@@ -1,0 +1,100 @@
+;;;; The code editor: multiple carets, the clipboard, selecting by
+;;;; dragging, and horizontal scrolling (headless).
+
+(ns editor-test
+  (:refer-core :exclude [settle])
+  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+
+(defn settle [] (sleep 100))
+
+(defn open [text]
+  (let [doc (ui/editor-model text)
+        w (ui/window {:size [300 120]} (fn [_] [:column {:flex-grow 1} [:editor {:id :ed :model doc}]]) (atom nil))]
+    (settle)
+    (ui/click! w :ed)
+    (settle)
+    [doc w]))
+
+(defn keys! [w & ks]
+  (doseq [k ks] (if (vector? k) (ui/simulate! [:key w (first k) (second k)]) (ui/simulate! [:key w k #{}])))
+  (settle))
+
+(deftest multiple-carets
+  (let [[doc w] (open "alpha\nbeta\ngamma")]
+    (keys! w [:arrow-up #{:cmd}] [:arrow-down #{:cmd :alt}] [:arrow-down #{:cmd :alt}])
+    (is (= 3 (count (ui/editor-carets doc))))
+    (ui/simulate! [:type w "> "])
+    (settle)
+    (is (= "> alpha\n> beta\n> gamma" (ui/editor-text doc)))
+    (testing "Backspace at every caret"
+      (keys! w :backspace)
+      (is (= ">alpha\n>beta\n>gamma" (ui/editor-text doc))))
+    (testing "Enter at every caret keeps each line's indentation"
+      (keys! w :end :enter)
+      (is (= ">alpha\n\n>beta\n\n>gamma\n" (ui/editor-text doc)))
+      (is (= 3 (count (ui/editor-carets doc)))))
+    (testing "Escape leaves the primary caret"
+      (keys! w :escape)
+      (is (= 1 (count (ui/editor-carets doc))))
+      (is (= [5 0] (first (first (ui/editor-carets doc))))))
+    (ui/close-window w)))
+
+(deftest select-next-occurrence
+  (let [[doc w] (open "foo bar foo baz foo")]
+    (keys! w [:arrow-up #{:cmd}] [:arrow-left #{:cmd}] [:arrow-right #{:alt}] [:arrow-left #{}])
+    (keys! w ["d" #{:cmd}])
+    (is (= [[[0 3] [0 0]]] (ui/editor-carets doc)))
+    (keys! w ["d" #{:cmd}] ["d" #{:cmd}])
+    (is (= 3 (count (ui/editor-carets doc))))
+    (ui/simulate! [:type w "qux"])
+    (settle)
+    (is (= "qux bar qux baz qux" (ui/editor-text doc)))
+    (ui/close-window w)))
+
+(deftest the-clipboard
+  (let [[doc w] (open "one\ntwo\nthree")]
+    (keys! w [:arrow-up #{:cmd}] [:arrow-right #{:cmd :shift}] ["c" #{:cmd}])
+    (is (= "one" (ui/clipboard)))
+    (keys! w [:arrow-down #{:cmd}] ["v" #{:cmd}])
+    (is (= "one\ntwo\nthreeone" (ui/editor-text doc)))
+    (testing "cut with nothing selected takes the line"
+      (keys! w [:arrow-up #{:cmd}] ["x" #{:cmd}])
+      (is (= "one\n" (ui/clipboard)))
+      (is (= "two\nthreeone" (ui/editor-text doc))))
+    (testing "a paste with one line per caret gives each caret its line"
+      (ui/set-clipboard! "A\nB")
+      (keys! w [:arrow-down #{:cmd :alt}] ["v" #{:cmd}])
+      (is (= "Atwo\nBthreeone" (ui/editor-text doc))))
+    (testing "the menu's Copy reaches the focused editor"
+      (keys! w :escape [:arrow-up #{:cmd}] [:arrow-right #{:cmd :shift}])
+      (ui/simulate! [:command :copy])
+      (settle)
+      (is (= "Atwo" (ui/clipboard))))
+    (ui/close-window w)))
+
+(deftest dragging-selects
+  (let [[doc w] (open "abcdefgh\nijklmnop")]
+    (ui/simulate! [:down w 60 8])
+    (ui/simulate! [:move w 90 28])
+    (ui/simulate! [:up w 90 28])
+    (settle)
+    (let [[[pos anchor]] (ui/editor-carets doc)]
+      (is (= 0 (first anchor)))
+      (is (= 1 (first pos))))
+    (ui/close-window w)))
+
+(deftest horizontal-scrolling
+  (let [[doc w] (open (apply str (repeat 200 "x")))]
+    (ui/simulate! [:click w 150 8])
+    (settle)
+    (let [before (second (first (first (ui/editor-carets doc))))]
+      (ui/simulate! [:wheel w 150 8 200 0])
+      (ui/simulate! [:click w 150 8])
+      (settle)
+      (is (< before (second (first (first (ui/editor-carets doc))))))
+      (testing "typing at the end of a long line scrolls it into view"
+        (keys! w :end)
+        (ui/simulate! [:screenshot w "/tmp/norn-ui-editor-hscroll.png" 1])
+        (settle)
+        (is (= 200 (second (first (first (ui/editor-carets doc))))))))
+    (ui/close-window w)))

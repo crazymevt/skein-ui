@@ -1,0 +1,65 @@
+;;;; norn.ui's platform requests, against the headless backend's stand-ins:
+;;;; menus and commands, file dialogs, the clipboard and dropped files.
+
+(ns platform-test
+  (:refer-core :exclude [settle])
+  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+
+(def state (atom {:dropped nil :window-dropped nil}))
+
+(defn view [_]
+  [:column {:flex-grow 1}
+   [:box {:id :target :height 100 :on-drop (fn [e] (swap! state assoc :dropped (:paths e)))} "drop here"]
+   [:box {:height 100} "not here"]])
+
+(def w (ui/window {:size [300 300] :on-drop (fn [e] (swap! state assoc :window-dropped (:paths e)))} #'view state))
+(defn settle [] (sleep 100))
+(settle)
+
+(deftest menu-commands
+  (let [chosen (atom [])]
+    (ui/menu! [["App" [["Quit" :quit "cmd+q"]]]
+               ["File" [["Open…" :open "cmd+o"] :separator ["Save" :save "cmd+s"]]]])
+    (ui/on-command! :save (fn [e] (swap! chosen conj (:command e))))
+    (ui/simulate! [:command :save])
+    (ui/simulate! [:command :unhandled])
+    (settle)
+    (is (= [:save] @chosen))
+    (testing "removing a handler"
+      (ui/on-command! :save nil)
+      (ui/simulate! [:command :save])
+      (settle)
+      (is (= [:save] @chosen)))))
+
+(deftest dialogs
+  (ui/simulate! [:dialog-answer ["/tmp/a.norn"]])
+  (is (= "/tmp/a.norn" (ui/choose-file {:filters [["Norn" ["norn"]]]})))
+  (ui/simulate! [:dialog-answer ["/tmp/a" "/tmp/b"]])
+  (is (= ["/tmp/a" "/tmp/b"] (ui/choose-file {:multiple true})))
+  (ui/simulate! [:dialog-answer ["/tmp/out.txt"]])
+  (is (= "/tmp/out.txt" (ui/save-file)))
+  (testing "cancelled"
+    (is (nil? (ui/choose-file)))))
+
+(deftest clipboard
+  (ui/set-clipboard! "hello")
+  (is (= "hello" (ui/clipboard))))
+
+(deftest dropped-files
+  (ui/simulate! [:drop w 50 50 "/tmp/x.txt"])
+  (settle)
+  (is (= ["/tmp/x.txt"] (:dropped @state)))
+  (testing "outside any :on-drop, the window's handler"
+    (ui/simulate! [:drop w 50 150 "/tmp/y.txt"])
+    (settle)
+    (is (= ["/tmp/y.txt"] (:window-dropped @state)))))
+
+(deftest asking-from-a-handler
+  ;; A handler that opens a dialog parks its event loop; the answer must
+  ;; still arrive (ask keeps the loop going).
+  (let [got (atom :none)]
+    (ui/on-command! :open (fn [_] (reset! got (ui/choose-file))))
+    (ui/simulate! [:dialog-answer ["/tmp/from-handler"]])
+    (ui/simulate! [:command :open])
+    (sleep 300)
+    (is (= "/tmp/from-handler" @got))))

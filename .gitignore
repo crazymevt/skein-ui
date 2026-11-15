@@ -1,0 +1,4 @@
+/target/
+/bin/
+*.nimg
+.DS_Store

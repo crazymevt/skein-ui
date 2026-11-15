@@ -1,0 +1,15 @@
+[package]
+name = "norn-ui-desktop"
+description = "The norn-ui desktop backend: winit windows, wgpu surfaces, input (macOS first)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+norn-ui-engine.workspace = true
+norn-ui-render.workspace = true
+winit = "0.30"
+wgpu = "30"
+arboard = "3"
+muda = "0.17"
+rfd = "0.15"

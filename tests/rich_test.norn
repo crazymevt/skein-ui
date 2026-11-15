@@ -1,0 +1,97 @@
+;;;; Rich text and Markdown (headless).
+
+(ns rich-test
+  (:refer-core :exclude [settle])
+  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+
+(ui/theme! ui/base-theme)
+(defn settle [] (sleep 150))
+
+(defn centre [w id]
+  (let [{:keys [x y w h]} (ui/node-rect w (ui/node-of w id))] [(+ x (quot w 2)) (+ y (quot h 2))]))
+
+(deftest spans-from-inline-elements
+  (let [st (atom {:clicked nil})
+        w (ui/window {:size [360 120]}
+                     (fn [_]
+                       [:column {:padding 10 :gap 8}
+                        [:rich-text {:id :r} "Plain, " [:b "bold"] ", " [:i "italic"] ", " [:code "code"] " and " [:s "gone"] "."]
+                        [:rich-text {:id :l :on-link (fn [e] (swap! st assoc :clicked (:href e)))}
+                         [:a {:href "https://example.com"} "a link that is clicked"]]])
+                     st)]
+    (settle)
+    (is (some? (ui/node-of w :r)))
+    (ui/screenshot w "/tmp/norn-ui-rich-spans.png" 2)
+    (testing "clicking a link"
+      ;; on the text (the node is as wide as its column)
+      (let [{:keys [x y h]} (ui/node-rect w (ui/node-of w :l))] (ui/simulate! [:click w (+ x 20) (+ y (quot h 2))]))
+      (settle)
+      (is (= "https://example.com" (:clicked @st))))
+    (testing "dragging selects, and Copy copies the selection"
+      (let [{:keys [x y h]} (ui/node-rect w (ui/node-of w :r))
+            mid (+ y (quot h 2))]
+        (ui/simulate! [:down w (+ x 1) mid])
+        (ui/simulate! [:move w (+ x 60) mid])
+        (ui/simulate! [:move w (+ x 120) mid])
+        (ui/simulate! [:up w (+ x 120) mid]))
+      (ui/simulate! [:copy w])
+      (settle)
+      (let [copied (ui/clipboard)]
+        (is (string? copied))
+        (is (= "Plain, bold" (subs copied 0 (min 11 (count copied)))))))
+    (ui/close-window w)))
+
+(def sample "# Norn Studio
+
+An editor for **Norn**, written in *Norn*, with `inline code` and a [link](https://example.com).
+
+## Lists
+
+- one
+- two, with ~~strike~~
+  - nested
+- [x] done
+
+1. first
+2. second
+
+> A block quote that goes on long enough to wrap onto a second line in a narrow window.
+
+```norn
+(defn hello [] :world)
+```
+
+| Key | Action |
+|-----|--------|
+| ⌘⏎ | Evaluate |
+| ⇧⌘I | Format |
+
+---
+
+The end.")
+
+(deftest markdown-renders
+  (let [links (atom [])
+        w (ui/window {:size [420 640]}
+                     (fn [_] [:scroll {:flex-grow 1} [:column {:padding 14} (ui/markdown sample {:on-link (fn [h] (swap! links conj h))})]])
+                     (atom nil))]
+    (settle)
+    (ui/screenshot w "/tmp/norn-ui-markdown.png" 1)
+    (is (true? true))
+    (ui/close-window w)))
+
+(deftest growing-rich-text-grows
+  ;; Streamed text (an assistant's reply) changes a rich-text node's spans:
+  ;; it must be measured again, or its new lines draw over what follows.
+  (let [st (atom {:n 1})
+        w (ui/window {:size [200 300]}
+                     (fn [{:keys [n]}]
+                       [:column {:width 160}
+                        [:rich-text {:id :grow} (apply str (repeat n "word ")) [:b "end"]]])
+                     st)]
+    (settle)
+    (let [h1 (:h (ui/node-rect w (ui/node-of w :grow)))]
+      (swap! st assoc :n 40)
+      (settle)
+      (is (> (:h (ui/node-rect w (ui/node-of w :grow))) (* 3 h1)) "taller, once it wraps"))
+    (ui/close-window w)))

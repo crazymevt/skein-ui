@@ -1,0 +1,163 @@
+;;;; norn.ui, headless: rendering, diffing, events, live redefinition.
+;;;; Run with `norn-ui test tests/` (crates/norn-ui/tests/norn.rs does).
+
+(ns ui-test
+  (:refer-core :exclude [settle])
+  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+
+(def state (atom {:count 0 :items ["a" "b" "c"]}))
+
+(defn view [{:keys [count items]}]
+  [:column {:gap 4 :padding 8}
+   [:text {:id :title} "Count " count]
+   [:button {:id :inc :on-click (fn [_] (swap! state update :count inc)) :padding 4} "+"]
+   (for [i items] [:text {:key i :id (keyword i)} i])])
+
+(def w (ui/window {:title "test" :size [200 200]} #'view state))
+
+(defn settle [] (sleep 100))
+
+(defn click [id]
+  (is (some? (ui/node-of w id)))
+  (ui/click! w id)
+  (settle))
+
+(settle)
+
+(deftest clicks-run-handlers-and-rerender
+  (let [title (ui/node-of w :title)
+        btn (ui/node-of w :inc)]
+    (click :inc)
+    (is (= 1 (:count @state)))
+    (testing "nodes keep their identity across renders"
+      (is (= title (ui/node-of w :title)))
+      (is (= btn (ui/node-of w :inc))))
+    (testing "handlers still work after a re-render"
+      (click :inc)
+      (is (= 2 (:count @state))))))
+
+(deftest keyed-children-keep-their-nodes
+  (let [before (mapv (fn [k] (ui/node-of w k)) [:a :b :c])]
+    (swap! state assoc :items ["c" "a" "b"])
+    (settle)
+    (is (= before (mapv (fn [k] (ui/node-of w k)) [:a :b :c])))
+    (swap! state assoc :items ["a" "c"])
+    (settle)
+    (is (nil? (ui/node-of w :b)))
+    (is (= [(nth before 0) (nth before 2)] (mapv (fn [k] (ui/node-of w k)) [:a :c])))))
+
+(deftest an-idle-window-draws-nothing
+  (ui/stats)
+  (sleep 1000)
+  (let [s (ui/stats)]
+    (is (= 0 (:frames s)))
+    (is (= 0 (:layouts s)))))
+
+(deftest redefining-the-view-rerenders
+  ;; what (defn view …) at the REPL does: a new root for the var, then the
+  ;; after-evaluation hooks
+  (alter-var-root #'view (constantly (fn [{:keys [count]}] [:column [:text {:id :redefined} "v2 " count]])))
+  (%run-after-eval-hooks)
+  (settle)
+  (is (some? (ui/node-of w :redefined)))
+  (is (nil? (ui/node-of w :inc))))
+
+(deftest a-change-repaints-a-little
+  (ui/stats)
+  (swap! state update :count inc)
+  (settle)
+  (let [s (ui/stats)]
+    (is (= 1 (:frames s)))
+    ;; one text line, not the window (200×200)
+    (is (< (:area s) 4000))))
+
+(deftest themes-and-closing
+  (ui/theme! {:rules [[[:text :* :*] {:color "#333333"}]]})
+  (settle)
+  (let [w2 (ui/window {:size [100 50]} (fn [_] [:text {:id :x} "second"]) (atom nil))]
+    (settle)
+    (is (some? (ui/node-of w2 :x)))
+    (ui/close-window w2)
+    (settle)
+    (is (nil? (ui/node-of w2 :x)))))
+
+(deftest text-fields-edit-in-the-engine
+  (let [form (atom {:name "" :submitted nil})
+        fw (ui/window {:size [300 80]}
+                      (fn [{:keys [name]}]
+                        [:column {:padding 8 :gap 4}
+                         [:text-field {:id :name :value name :placeholder "Your name" :width 200 :padding 4
+                                       :on-input (fn [e] (swap! form assoc :name (:value e)))
+                                       :on-submit (fn [e] (swap! form assoc :submitted (:value e)))}]
+                         [:text {:id :echo} (str "Hello, " name)]])
+                      form)]
+    (settle)
+    (ui/click! fw :name)
+    (ui/simulate! [:type fw "Ada"])
+    (settle)
+    (is (= "Ada" (:name @form)))
+    (ui/simulate! [:key fw :enter #{}])
+    (settle)
+    (is (= "Ada" (:submitted @form)))
+    (testing "Norn can set the value"
+      (swap! form assoc :name "Grace")
+      (settle)
+      (ui/simulate! [:type fw "!"])
+      (settle)
+      (is (= "Grace!" (:name @form))))
+    (ui/close-window fw)))
+
+(deftest memos
+  ;; A memo's subtree is made again only when its deps change.
+  (let [made (atom 0)
+        st (atom {:deps [1] :n 0})
+        w (ui/window {:size [200 100]}
+                     (fn [{:keys [deps n]}]
+                       [:column {:flex-grow 1}
+                        [:text {:id :count} (str n)]
+                        (ui/memo ::part deps (fn [] (swap! made inc) [:column {:id :part} [:text "big"]]))])
+                     st)]
+    (settle)
+    (is (= 1 @made))
+    (swap! st update :n inc)
+    (settle)
+    (is (= 1 @made) "other state changed: the memo is kept")
+    (is (some? (ui/node-of w :part)))
+    (swap! st assoc :deps [2])
+    (settle)
+    (is (= 2 @made) "its deps changed: made again")
+    (ui/close-window w)))
+
+(deftest a-closed-popup-stays-closed
+  ;; A popup can hear its size after it closed: that mustn't bring back
+  ;; half a window, which then fails every render.
+  (let [w (ui/window {:size [200 100]} (fn [_] [:text "owner"]) (atom nil))
+        p (ui/popup w {:position [10 10]} (fn [_] [:text "tip"]) (atom nil))
+        app (#'norn.ui/the-app)]
+    (settle)
+    (ui/close-window p)
+    (#'norn.ui/dispatch app {:event :resize :window p :size [50 20]})
+    (#'norn.ui/dispatch app {:event :moved :window p :position [1 2]})
+    (is (not (contains? @(:windows app) p)))
+    (ui/close-window w)))
+
+(deftest duplicate-keys-are-made-separately
+  ;; Two children with one key (an app's mistake: a message and a card
+  ;; numbered alike) mustn't both become the same node: the ops would put
+  ;; it in two places, and the engine refused the batch (or crashed).
+  (let [st (atom [[1 "a"] [1 "b"] [2 "c"]])
+        w (ui/window {:size [200 200]}
+                     (fn [items] [:column {:id :list} (for [[k t] items] [:text {:key k :id (keyword (str "t-" t))} t])])
+                     st)]
+    (settle)
+    (reset! st [[2 "c"] [1 "a"] [1 "b"] [3 "d"] [1 "e"]])
+    (settle)
+    (let [ids (map (fn [t] (ui/node-of w (keyword (str "t-" t)))) ["a" "b" "c" "d" "e"])]
+      (is (= 5 (count (distinct ids))) "five nodes, not one used thrice")
+      ;; (node-rect asks the engine: a node it never got has none)
+      (is (every? (fn [id] (ui/node-rect w id)) ids)))
+    (reset! st [[1 "b"]])
+    (settle)
+    (is (some? (ui/node-rect w (ui/node-of w :t-b))))
+    (is (nil? (ui/node-of w :t-c)))
+    (ui/close-window w)))

@@ -1,0 +1,107 @@
+;;;; Popups, tooltips, context menus and drop-downs (headless).
+
+(ns popup-test
+  (:refer-core :exclude [settle])
+  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+
+(ui/theme! ui/base-theme)
+(defn settle [] (sleep 100))
+
+(def state (atom {:fruit :pear :chosen nil}))
+
+(defn view [{:keys [fruit]}]
+  [:column {:padding 10 :gap 10 :flex-grow 1}
+   (ui/dropdown {:id :fruit :width 160 :value fruit :on-change (fn [v] (swap! state assoc :fruit v))
+                 :options [[:apple "Apple"] [:pear "Pear"] [:plum "Plum"]]})
+   [:box {:id :tip :tooltip "A helpful tip" :height 30} "hover me"]
+   [:box {:id :menu-here :height 30 :context-menu [["Rename" :rename] ["Delete" :delete]]
+          :on-command (fn [e] (swap! state assoc :chosen (:command e)))}
+    "right-click me"]
+   [:box {:id :rest :flex-grow 1} "elsewhere"]])
+
+(def w (ui/window {:size [400 300]} #'view state))
+(settle)
+
+(defn popups [] (ui/popups-of w))
+
+(defn centre [id]
+  (let [{:keys [x y w h]} (ui/node-rect w (ui/node-of w id))] [(+ x (/ w 2)) (+ y (/ h 2))]))
+
+(deftest a-popup-fits-its-content-and-is-dismissed-lightly
+  (let [p (ui/popup w {:position [20 20]} (fn [_] [:box {:id :inside :width 120 :height 40} "popup"]) (atom nil))]
+    (settle)
+    (is (= [p] (popups)))
+    (is (= {:x 0 :y 0 :w 120 :h 40} (ui/node-rect p (ui/node-of p :inside))))
+    (testing "a press in the owner dismisses it"
+      (let [[x y] (centre :rest)] (ui/simulate! [:click w x y]))
+      (settle)
+      (is (empty? (popups))))
+    (testing "so does Escape"
+      (ui/popup w {:position [20 20]} (fn [_] [:box {:width 50 :height 20}]) (atom nil))
+      (settle)
+      (ui/simulate! [:key w :escape #{}])
+      (settle)
+      (is (empty? (popups))))))
+
+(deftest drop-downs
+  (let [[x y] (centre :fruit)]
+    (ui/simulate! [:click w x y])
+    (settle)
+    (is (= 1 (count (popups))))
+    (testing "clicking an option chooses it and closes the list"
+      (let [p (first (popups))
+            {:keys [x y w h]} (ui/node-rect p (ui/node-of p :option-2))]
+        (ui/simulate! [:click p (+ x (/ w 2)) (+ y (/ h 2))]))
+      (settle)
+      (is (= :plum (:fruit @state)))
+      (is (empty? (popups))))
+    (testing "the keyboard: Down opens, Up moves, Enter chooses"
+      (ui/simulate! [:key w :arrow-down #{}])
+      (settle)
+      (is (= 1 (count (popups))))
+      (ui/simulate! [:key w :arrow-up #{}])
+      (ui/simulate! [:key w :enter #{}])
+      (settle)
+      (is (= :pear (:fruit @state)))
+      (is (empty? (popups))))
+    (testing "clicking the drop-down again closes it"
+      (ui/simulate! [:click w x y])
+      (settle)
+      (ui/simulate! [:click w x y])
+      (settle)
+      (is (empty? (popups))))))
+
+(deftest tooltips
+  (let [[x y] (centre :tip)]
+    (ui/simulate! [:move w x y])
+    (settle)
+    (is (empty? (popups)) "not at once")
+    (sleep 600)
+    (is (= 1 (count (popups))))
+    (let [[x y] (centre :rest)] (ui/simulate! [:move w x y]))
+    (settle)
+    (is (empty? (popups)) "gone once the pointer leaves")))
+
+(deftest context-menus
+  (let [[x y] (centre :menu-here)]
+    (ui/simulate! [:menu-answer :rename])
+    (ui/simulate! [:down w x y])
+    (ui/simulate! [:up w x y :right])
+    (settle)
+    (is (= :rename (:chosen @state)))
+    (testing "dismissed"
+      (swap! state assoc :chosen nil)
+      (ui/simulate! [:down w x y])
+      (ui/simulate! [:up w x y :right])
+      (settle)
+      (is (nil? (:chosen @state))))))
+
+(deftest closing-the-owner-closes-its-popups
+  (let [w2 (ui/window {:size [100 100]} (fn [_] [:box]) (atom nil))
+        p (ui/popup w2 {:position [0 0]} (fn [_] [:box {:width 10 :height 10}]) (atom nil))]
+    (settle)
+    (is (= [p] (ui/popups-of w2)))
+    (ui/close-window w2)
+    (settle)
+    (is (nil? (ui/node-of p :x)))
+    (is (empty? (ui/popups-of w2)))))

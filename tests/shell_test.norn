@@ -1,0 +1,74 @@
+;;;; The workbench shell: activity bar, chips, status bar and the command
+;;;; palette (headless).
+
+(ns shell-test
+  (:refer-core :exclude [settle])
+  (:require [norn.test :refer [is are deftest testing]] [norn.ui :as ui]))
+
+(ui/theme! ui/base-theme)
+(defn settle [] (sleep 150))
+
+(defn centre [w id]
+  (let [{:keys [x y w h]} (ui/node-rect w (ui/node-of w id))] [(+ x (quot w 2)) (+ y (quot h 2))]))
+
+(deftest fuzzy-matching
+  (are [q t ok] (= ok (some? (ui/fuzzy-score q t)))
+    "fmt" "Format Document" true
+    "fd" "Format Document" true
+    "gs" "Git: Status" true
+    "xyz" "Format Document" false
+    "" "anything" true)
+  (testing "word starts and runs beat scattered letters"
+    (is (> (first (ui/fuzzy-score "fd" "Format Document")) (first (ui/fuzzy-score "fd" "fiddle"))))
+    (is (> (first (ui/fuzzy-score "eval" "Evaluate Form")) (first (ui/fuzzy-score "eval" "Revealed Values")))))
+  (is (= [0 1 2] (second (ui/fuzzy-score "for" "Format")))))
+
+(def st (atom {:side :explorer :ran []}))
+
+(def commands
+  (vec (for [t ["Format Document" "Evaluate Top-Level Form" "Evaluate File" "Toggle Sidebar" "Git: Commit" "Find in Files"]]
+         {:title t :run (fn [] (swap! st update :ran conj t))})))
+
+(defn view [{:keys [side]}]
+  [:column {:flex-grow 1}
+   (ui/top-bar [:text "loom-lang"] (ui/chip {:id :branch :icon :git-branch :label "main"}) [:spacer]
+               (ui/chip {:id :repl :dot "#3a8a3a" :label "norn: running"}))
+   [:row {:flex-grow 1}
+    (ui/activity-bar {:id :bar :selected side
+                      :items [[:explorer :file "Explorer"] [:search :search "Search"] [:git :git-branch "Source Control"]]
+                      :on-select (fn [k] (swap! st update :side (fn [s] (when-not (= s k) k))))})
+    [:column {:flex-grow 1} [:text {:id :side} (str "sidebar: " side)]]]
+   (ui/status-bar {:left [[:text "Ln 1, Col 1"]] :right [(ui/chip {:label "Norn"})]})])
+
+(deftest the-shell
+  (let [w (ui/window {:size [640 400]} #'view st)]
+    (settle)
+    (testing "the activity bar selects, and clicking the selected item collapses"
+      (let [[x y] (centre w :git)] (ui/simulate! [:click w x y]))
+      (settle)
+      (is (= :git (:side @st)))
+      (let [[x y] (centre w :git)] (ui/simulate! [:click w x y]))
+      (settle)
+      (is (nil? (:side @st))))
+    (testing "the command palette filters, moves and runs"
+      (ui/command-palette! w commands)
+      (settle)
+      (is (= 1 (count (ui/popups-of w))))
+      (ui/simulate! [:type w "ev"])
+      (settle)
+      (ui/simulate! [:key w :arrow-down #{}])
+      (settle)
+      (ui/screenshot (first (ui/popups-of w)) "/tmp/norn-ui-palette.png" 2)
+      (ui/simulate! [:key w :enter #{}])
+      (settle)
+      ;; "Evaluate File" ranks first (shorter), so Down picks the other
+      (is (= ["Evaluate Top-Level Form"] (:ran @st)))
+      (is (empty? (ui/popups-of w))))
+    (testing "Escape closes it"
+      (ui/command-palette! w commands)
+      (settle)
+      (ui/simulate! [:key w :escape #{}])
+      (settle)
+      (is (empty? (ui/popups-of w))))
+    (ui/screenshot w "/tmp/norn-ui-shell.png" 1)
+    (ui/close-window w)))

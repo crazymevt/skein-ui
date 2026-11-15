@@ -1,0 +1,102 @@
+;;;; norn.ui's widgets, headless.
+
+(ns widgets-test
+  (:refer-core :exclude [settle])
+  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+
+(ui/theme! ui/base-theme)
+
+(def state (atom {:on? false :tab :a :expanded #{} :selected nil :size 150 :scroll-y 0}))
+
+(def tree-nodes [{:id :p :label "parent" :children [{:id :c1 :label "one"} {:id :c2 :label "two"}]}])
+
+(defn view [{:keys [on? tab expanded selected size scroll-y]}]
+  [:column {:flex-grow 1}
+   (ui/split {:id :split :size size :on-resize (fn [dx] (swap! state update :size + dx))}
+             [:column
+              (ui/toggle {:id :t :on? on? :on-change (fn [v] (swap! state assoc :on? v))})
+              (ui/tree {:id :tree :nodes tree-nodes :expanded expanded :selected selected
+                        :on-toggle (fn [id] (swap! state update :expanded (fn [e] (if (e id) (disj e id) (conj e id)))))
+                        :on-select (fn [id] (swap! state assoc :selected id))})]
+             (ui/tabs {:selected tab :on-select (fn [k] (swap! state assoc :tab k))}
+                      [[:a "A" [:text {:id :in-a} "panel A"]]
+                       [:b "B" (ui/vlist {:id :list :items (vec (range 1000)) :row-height 20 :height 100 :scroll-y scroll-y
+                                          :on-scroll (fn [y] (swap! state assoc :scroll-y y))
+                                          :row (fn [x _] [:text {:id (keyword (str "row" x))} (str x)])})]]))])
+
+(def w (ui/window {:size [500 300]} #'view state))
+(defn settle [] (sleep 100))
+(settle)
+
+(deftest toggles-and-tabs
+  (ui/click! w :t)
+  (settle)
+  (is (= true (:on? @state)))
+  (is (some? (ui/node-of w :in-a)))
+  (ui/click! w :b)
+  (settle)
+  (is (= :b (:tab @state)))
+  (is (nil? (ui/node-of w :in-a))))
+
+(deftest the-tree-expands-and-selects
+  (is (nil? (ui/node-of w :c1)))
+  (ui/click! w :p) ; the row: selects
+  (settle)
+  (is (= :p (:selected @state)))
+  ;; the arrow is the row's first child: click its left edge
+  (ui/simulate! [:click w 10 (+ 4 (ui/test-y w :p))])
+  (settle)
+  (is (contains? (:expanded @state) :p))
+  (is (some? (ui/node-of w :c1))))
+
+(deftest dragging-the-split-resizes
+  (let [x (+ 150 2) y 150]
+    (ui/simulate! [:move w x y])
+    (ui/simulate! [:down w x y])
+    (ui/simulate! [:move w (+ x 20) y])
+    (ui/simulate! [:move w (+ x 40) y])
+    (ui/simulate! [:up w (+ x 40) y "left" 1])
+    (settle)
+    (is (= 190 (:size @state)))))
+
+(deftest the-virtual-list-builds-only-visible-rows
+  (swap! state assoc :tab :b)
+  (settle)
+  (is (some? (ui/node-of w :row0)))
+  (is (nil? (ui/node-of w :row500)))
+  (ui/simulate! [:wheel w 300 80 0 10000])
+  (settle)
+  (is (= 10000 (:scroll-y @state)))
+  (is (some? (ui/node-of w :row500)))
+  (is (nil? (ui/node-of w :row0))))
+
+(deftest the-editor-edits-its-rope
+  (let [doc (ui/editor-model "(defn f [x]\n  (inc x))")
+        ew (ui/window {:size [400 120]} (fn [_] [:column {:flex-grow 1} [:editor {:id :ed :model doc :highlight ui/highlight-norn}]]) (atom nil))]
+    (settle)
+    (ui/click! ew :ed) ; the middle of the editor: below the text, so the end of line 2
+    (settle)
+    (ui/simulate! [:key ew :end #{}])
+    (ui/simulate! [:type ew " ; ok"])
+    (settle)
+    (is (= "(defn f [x]\n  (inc x)) ; ok" (ui/editor-text doc)))
+    (testing "Enter keeps the indentation; Backspace joins lines"
+      (ui/simulate! [:key ew :arrow-up #{}])
+      (ui/simulate! [:key ew :end #{}])
+      (ui/simulate! [:key ew :enter #{}])
+      (ui/simulate! [:type ew "y"])
+      (settle)
+      (is (= "(defn f [x]\ny\n  (inc x)) ; ok" (ui/editor-text doc)))
+      (ui/simulate! [:key ew :backspace #{}])
+      (ui/simulate! [:key ew :backspace #{}])
+      (settle)
+      (is (= "(defn f [x]\n  (inc x)) ; ok" (ui/editor-text doc))))
+    (testing "a keystroke repaints one line"
+      (ui/stats)
+      (ui/simulate! [:type ew "z"])
+      (settle)
+      (let [s (ui/stats)]
+        (is (= 1 (:frames s)))
+        (is (= 0 (:layouts s)))
+        (is (<= (:area s) (* 400 20)))))
+    (ui/close-window ew)))

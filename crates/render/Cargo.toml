@@ -1,0 +1,16 @@
+[package]
+name = "norn-ui-render"
+description = "The norn-ui painter: wgpu pipelines for boxes and text, damage-only repaint, headless PNG output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+norn-ui-engine.workspace = true
+wgpu = "30"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
+swash.workspace = true
+parley.workspace = true
+png = "0.18"
+lyon = { version = "1.0.19", features = ["extra"] }

@@ -1,0 +1,30 @@
+;;;; A small norn.ui demo: a counter, a text field, and a scrolling list.
+;;;; Run it with: ./target/debug/norn-ui examples/demo.norn
+
+(require '[norn.ui :as ui])
+
+(ui/theme! {:tokens {:accent "#3070e0"}
+            :rules [[[:button :* :*] {:background :accent :color "#ffffff" :padding [6 14] :border-radius 6}]
+                    [[:button :* :hover] {:background "#2058c0"}]
+                    [[:text-field :* :*] {:border [1 "#bbbbbb"] :border-radius 6 :padding [6 8] :background "#ffffff"}]
+                    [[:text-field :* :focused] {:border [2 :accent]}]
+                    [[:box :card :*] {:flex-direction :column :background "#ffffff" :border [1 "#dddddd"]
+                                      :border-radius 10 :padding 14 :gap 10}]]})
+
+(def state (atom {:count 0 :name "" :items (vec (for [i (range 1 41)] (str "Item " i)))}))
+
+(defn view [{:keys [count name items]}]
+  [:column {:padding 20 :gap 14 :background "#f2f3f5"}
+   [:text {:font-size 22 :font-weight :bold} "norn.ui demo"]
+   [:box {:class :card}
+    [:row {:gap 10 :align-items :center}
+     [:button {:on-click (fn [_] (swap! state update :count inc))} "Click me"]
+     [:text "Clicked " count " times"]]
+    [:text-field {:value name :placeholder "Type your name" :width 260
+                  :on-input (fn [e] (swap! state assoc :name (:value e)))}]
+    [:text (if (= name "") "Hello!" (str "Hello, " name "!"))]]
+   [:scroll {:height 140 :background "#ffffff" :border [1 "#dddddd"] :border-radius 10 :padding 8}
+    (for [i items] [:text {:key i :padding [3 6]} i])]])
+
+(ui/window {:title "norn.ui demo" :size [420 460]} #'view state)
+(ui/wait-closed)

@@ -1,0 +1,24 @@
+;;;; Icons: SVG paths rasterized with antialiasing (headless).
+
+(ns icon-test
+  (:require [norn.test :refer [is deftest]] [norn.ui :as ui]))
+
+(ui/theme! ui/base-theme)
+
+(deftest icons-draw-at-their-size
+  (let [names (sort (keys ui/icons))
+        w (ui/window {:size [420 140]}
+                     (fn [_]
+                       [:column {:padding 10 :gap 10}
+                        [:row {:gap 10 :flex-wrap :wrap}
+                         (for [n names] [:icon {:key n :id n :name n :size 20 :color :text}])]
+                        [:row {:gap 10 :align-items :center}
+                         [:icon {:id :big :name :folder :size 32 :color :accent}]
+                         [:icon {:id :filled :d "M12 4a8 8 0 1 0 0 16a8 8 0 1 0 0-16z" :fill true :size 16 :color "#d03030"}]
+                         [:text "an icon beside text"]]])
+                     (atom nil))]
+    (sleep 150)
+    (is (= {:x 10 :y 10 :w 20 :h 20} (ui/node-rect w (ui/node-of w (first names)))))
+    (is (= 32 (:w (ui/node-rect w (ui/node-of w :big)))))
+    (ui/screenshot w "/tmp/norn-ui-icons.png" 2)
+    (ui/close-window w)))

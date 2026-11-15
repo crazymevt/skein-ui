@@ -1,0 +1,36 @@
+;;;; Remembered state: the store, and windows that come back where they
+;;;; were (headless).
+
+(ns state-test
+  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui] [norn.io :as io] [norn.sys :as sys] [norn.edn :as edn]))
+
+(def dir (io/path (sys/temp-dir) (str "norn-ui-state-" (sys/pid))))
+(ui/set-state-dir! dir)
+
+(deftest the-store
+  (is (= :none (ui/recall "app" :dock :none)))
+  (ui/remember! "app" :dock {:groups [[:left [:files]]]})
+  (ui/remember! "app" :sidebar :explorer)
+  (is (= :explorer (ui/recall "app" :sidebar)))
+  (sleep 700)
+  (let [f (ui/state-file "app")]
+    (is (io/exists? f))
+    (is (= {:dock {:groups [[:left [:files]]]} :sidebar :explorer} (edn/read-string (io/read-text f)))))
+  (testing "a fresh start reads it back"
+    (ui/set-state-dir! dir)
+    (is (= :explorer (ui/recall "app" :sidebar)))))
+
+(deftest windows-come-back
+  (let [w (ui/window {:size [300 200] :remember ["app" :main]} (fn [_] [:box {:id :root :flex-grow 1}]) (atom nil))]
+    (sleep 150)
+    (ui/simulate! [:resize w 420 260])
+    (ui/simulate! [:move-window w 80 60])
+    (sleep 700)
+    (ui/close-window w))
+  (ui/set-state-dir! dir)
+  (is (= {:size [420 260] :position [80 60]} (ui/recall "app" [:window :main])))
+  (let [w (ui/window {:size [300 200] :remember ["app" :main]} (fn [_] [:box {:id :root :flex-grow 1}]) (atom nil))]
+    (sleep 150)
+    (is (= {:x 0 :y 0 :w 420 :h 260} (ui/node-rect w (ui/node-of w :root))))
+    (ui/close-window w))
+  (io/delete! dir :recursive true))

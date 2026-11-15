@@ -1,0 +1,108 @@
+;;;; The norn.ui bridge for stock Norn. Patch batches and UI events travel
+;;;; over the renderer's pipes as length-prefixed norn.bin values.
+
+(ns norn.ui.native
+  (:require [norn.bin :as bin] [norn.io :as io] [norn.process :as process]
+            [norn.sys :as sys]))
+
+(def ^:private package-root
+  (when-let [[_ source] (norn.core/%find-lib "norn.ui.native")]
+    (let [root (nth (iterate io/parent (io/absolute source)) 4)]
+      (or (io/canonical root) root))))
+
+(def ^:private frame-limit (* 128 1024 1024))
+
+(defn- host-path []
+  (or (sys/getenv "NORN_UI_HOST")
+      (some #(when (io/file? %) %)
+            (let [{:keys [os arch]} (sys/info)]
+              [(io/path package-root "target" "release" "norn-ui-host")
+               (io/path package-root "bin" (str (name os) "-" (name arch)) "norn-ui-host")]))
+      (error "norn-ui: renderer missing. Run cargo build --release --locked -p norn-ui-host in"
+             package-root "or set NORN_UI_HOST.")))
+
+(defn- read-exact [stream size]
+  (loop [b (bytes [])]
+    (if (= size (count b))
+      b
+      (if-let [part (io/read stream (- size (count b)))]
+        (recur (bytes-concat b part))
+        (when (pos? (count b)) (error "norn-ui: truncated renderer message"))))))
+
+(defn- receive [stream]
+  (when-let [header (read-exact stream 4)]
+    (let [n (reduce + (map-indexed (fn [i b] (bit-shift-left b (* i 8))) header))]
+      (when-not (<= 5 n frame-limit)
+        (error "norn-ui: invalid renderer message length" n))
+      (if-let [body (read-exact stream n)]
+        (bin/decode body)
+        (error "norn-ui: truncated renderer message")))))
+
+(defn- send! [{:keys [outbox wake]} kind data]
+  (let [body (bin/encode [kind data])
+        n (count body)]
+    (when (> n frame-limit) (error "norn-ui: patch exceeds the renderer message limit"))
+    (let [length (bytes (mapv #(bit-and (bit-shift-right n %) 255) [0 8 16 24]))]
+      (swap! outbox conj [length body])
+      (offer! wake true)
+      nil)))
+
+(defn- close-process! [p]
+  (io/close (:in p))
+  (io/close (:out p))
+  (try (process/wait p) (finally (io/close (:process p)))))
+
+(defn- stop-app! [p stopped? message]
+  ;; An image restores with a new renderer. A reader saved in the old
+  ;; image can only be waiting on a stale pipe.
+  (when (and (resource-live? (:out p)) (compare-and-set! stopped? false true))
+    (close-process! p)
+    (when message (norn.core/%write-stderr (str "norn-ui: " message "\n")))
+    (exit (if message 1 0))))
+
+(defn- read-events! [p stopped? events]
+  (try
+    (loop []
+      (let [event (receive (:out p))]
+        (cond
+          (map? event) (do (put! events event) (recur))
+          (= [:quit] event) (stop-app! p stopped? nil)
+          (nil? event) (stop-app! p stopped? "renderer exited")
+          :else (stop-app! p stopped? "unexpected renderer message"))))
+    (catch Error e (stop-app! p stopped? (condition-message e)))))
+
+(defn- write-requests! [p stopped? outbox wake]
+  ;; Callers enqueue complete frames. A single writer keeps frames intact
+  ;; even when a fiber that submitted one is cancelled during a pipe write.
+  (try
+    (loop []
+      (when (take! wake)
+        (let [[frames _] (reset-vals! outbox [])]
+          (doseq [[header body] frames]
+            (io/write (:in p) header)
+            (io/write (:in p) body)))
+        (recur)))
+    (catch Error e (stop-app! p stopped? (condition-message e)))))
+
+(defn connect
+  "Connect to the renderer. Its events are sent to events."
+  [events]
+  (let [p (process/start (host-path) :err :inherit)]
+    (try
+      (when-not (= [:ready 1] (receive (:out p)))
+        (error "norn-ui: renderer failed to start or has an incompatible protocol"))
+      (catch Error e
+        (close-process! p)
+        (throw e)))
+    (let [outbox (atom [])
+          wake (chan 1 :dropping)
+          stopped? (atom false)]
+      (spawn-detached (write-requests! p stopped? outbox wake))
+      (spawn-detached (read-events! p stopped? events))
+      {:outbox outbox :wake wake})))
+
+(defn apply! [engine batch]
+  (send! engine :apply batch))
+
+(defn simulate! [engine input]
+  (send! engine :simulate input))

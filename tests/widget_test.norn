@@ -1,0 +1,79 @@
+;;;; Self-drawing widgets: CLOS classes painted on canvases (headless).
+
+(ns widget-test
+  (:refer-core :exclude [settle])
+  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+
+(ui/theme! ui/base-theme)
+(defn settle [] (sleep 100))
+
+(defclass Gauge (ui/Widget) ((value :initform 0) (on-change :initform nil)))
+
+(defmethod ui/measure ((g Gauge)) [200 40])
+
+(defmethod ui/paint ((g Gauge) size)
+  (let [[w h] size]
+    [[:rounded-rect [0 0 w h] 6 {:fill :line}]
+     [:rounded-rect [0 0 (* w (:value g)) h] 6 {:fill :accent}]
+     [:line [0 h] [w 0] {:stroke "#d03030" :width 2}]
+     [:path "M 150 6 L 170 34 L 130 34 Z" {:fill "#30a030" :stroke "#105010" :width 1}]
+     [:circle [184 20] 8 {:fill "#ffffff" :stroke "#333333" :width 1}]
+     [:translate [6 10] [[:text [0 0] (str (int (* 100 (:value g))) "%") {:font-size 13 :color "#ffffff"}]]]
+     [:clip [0 0 20 20] [[:polyline [[0 0] [30 30] [0 30]] {:stroke "#000000" :width 3}]]]]))
+
+(defmethod ui/widget-events ((g Gauge)) #{:click :drag})
+
+(defmethod ui/on-event ((g Gauge) e)
+  ((:on-change g) (/ (if (= :drag (:event e)) (:local-x e) (:x e)) 200.0)))
+
+(def st (atom {:v 0.25}))
+
+(defn view [{:keys [v]}]
+  [:column {:padding 10}
+   [:box {:id :holder} (Gauge :value v :on-change (fn [x] (swap! st assoc :v x)))]])
+
+(deftest widgets-paint-and-handle-events
+  (let [w (ui/window {:size [220 60]} #'view st)]
+    (settle)
+    (ui/screenshot w "/tmp/norn-ui-widget-before.png" 2)
+    (let [{:keys [x y]} (ui/node-rect w (ui/node-of w :holder))]
+      (ui/simulate! [:click w (+ x 150) (+ y 20)]))
+    (settle)
+    (is (= 0.75 (:v @st)))
+    (testing "dragging follows the pointer as it moves"
+      (let [{:keys [x y]} (ui/node-rect w (ui/node-of w :holder))]
+        (ui/simulate! [:down w (+ x 150) (+ y 20)])
+        (ui/simulate! [:move w (+ x 100) (+ y 20)])
+        (settle)
+        (is (= 0.5 (:v @st)) "before the button is released")
+        (ui/simulate! [:move w (+ x 40) (+ y 20)])
+        (settle)
+        (is (= 0.2 (:v @st)))
+        (ui/simulate! [:up w (+ x 40) (+ y 20)])
+        (settle)))
+    (testing "a new value repaints the canvas, without a layout"
+      (ui/stats)
+      (swap! st assoc :v 0.5)
+      (settle)
+      (let [s (ui/stats)]
+        (is (= 1 (:frames s)))
+        (is (= 0 (:layouts s)))))
+    (ui/screenshot w "/tmp/norn-ui-widget-after.png" 2)
+    (ui/close-window w)))
+
+(deftest switching-themes-repaints-everything
+  ;; Styles name colours by token, so a theme switch changes colours with
+  ;; no style changing: the whole window must repaint.
+  (let [w (ui/window {:size [200 100]} (fn [_] [:column {:background :panel :flex-grow 1} [:text "hi"]]) (atom nil))]
+    (settle)
+    (ui/stats)
+    (ui/theme! ui/dark-theme)
+    (settle)
+    (let [s (ui/stats)]
+      (is (pos? (:frames s)))
+      (is (<= (* 200 100) (:area s))))
+    (sleep 300)
+    (is (= 0 (:frames (ui/stats))) "and then it's idle again")
+    (ui/theme! ui/base-theme)
+    (settle)
+    (ui/close-window w)))

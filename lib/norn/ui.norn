@@ -1,0 +1,2356 @@
+;;;; norn.ui — windows with declarative views over atom state.
+;;;;
+;;;;   (def state (atom {:count 0}))
+;;;;
+;;;;   (defn counter-view [{:keys [count]}]
+;;;;     [:column {:gap 8 :padding 16}
+;;;;      [:text {:class :title} (str "Clicked " count " times")]
+;;;;      [:button {:on-click (fn [_] (swap! state update :count inc))} "Click me"]])
+;;;;
+;;;;   (ui/window {:title "Counter" :size [320 200]} #'counter-view state)
+;;;;
+;;;; A view is a function from state to an element tree:
+;;;; - `[kind props? & children]`, where kind is :box, :row, :column, :text,
+;;;;   :button, :text-field, :scroll, :image, :svg, :canvas, :spacer, … (the
+;;;;   node kinds of docs/ui-protocol.md, plus :row, :column and :spacer);
+;;;; - strings and numbers are text; nil and nested sequences are fine.
+;;;;
+;;;; Props:
+;;;; - style keys (:gap, :padding, :width, :background, :color, :font-size,
+;;;;   …) can go straight in props, or in :style;
+;;;; - `:on-click`, `:on-key`, `:on-input`, … are handlers, called with the
+;;;;   event map;
+;;;; - `:key` keeps a child's identity when a list reorders;
+;;;; - anything else (:class, :tooltip, :disabled, :value, …) goes to the
+;;;;   engine.
+;;;;
+;;;; Changing the state re-renders; only the differences reach the engine.
+;;;; Pass the view as a var (#'counter-view) and redefining it at the REPL
+;;;; updates the open window. Windows survive an image save and restore.
+
+(ns norn.ui
+  (:require [norn.ui.native :as native] [norn.rope :as rope] [norn.string :as str] [norn.markdown :as mdlib]
+            [norn.edn :as edn] [norn.io :as io] [norn.sys :as sys]))
+
+;; ---- elements ----------------------------------------------------------------------------------
+
+(def ^:private style-keys
+  #{:display :flex-direction :flex-grow :flex-shrink :flex-basis :flex-wrap :align-items :align-self
+    :justify-content :gap :padding :margin :inset :width :height :min-width :min-height :max-width
+    :max-height :position :grid-template-columns :grid-template-rows :overflow :background :color
+    :border :border-radius :opacity :shadow :font-family :font-size :font-weight :font-style
+    :line-height :text-align :transition :cursor :selection-color :caret-color :white-space})
+
+(defn- handler-key?
+  "Is k an event handler prop such as :on-click? Gives the event name."
+  [k]
+  (let [n (name k)]
+    (when (and (> (count n) 3) (= "on-" (subs n 0 3))) (keyword (subs n 3)))))
+
+(defn- flatten-children [xs]
+  (reduce (fn [acc x]
+            (cond (nil? x) acc
+                  ;; sequences, and vectors that aren't elements (as `for` gives)
+                  (or (and (seq? x) (not (vector? x))) (and (vector? x) (not (keyword? (first x)))))
+                  (into acc (flatten-children x))
+                  :else (conj acc x)))
+          [] xs))
+
+(declare normalize editor-handlers clipboard set-clipboard! context-menu-handler send-editor! send-editor-now!)
+
+(def icons
+  "The bundled icons: SVG path data in a 24 by 24 box, drawn with a
+  2-unit round stroke (or filled, with :fill). Use [:icon {:name :folder
+  :size 16 :color :muted}], or give :d (and :view, :stroke or :fill)
+  for an icon of your own."
+  {:file "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z M14 3v5h5"
+   :file-code "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z M14 3v5h5 M10 12l-2 2 2 2 M14 12l2 2-2 2"
+   :file-text "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z M14 3v5h5 M9 13h6 M9 17h6"
+   :folder "M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"
+   :folder-open "M3 7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v1 M3 7v10a2 2 0 0 0 2 2h12l3-8H7l-4 8"
+   :search "M11 4a7 7 0 1 0 0 14a7 7 0 1 0 0-14z M20 20l-4-4"
+   :git-branch "M6 3v12 M18 3a3 3 0 1 0 0 6a3 3 0 1 0 0-6z M6 15a3 3 0 1 0 0 6a3 3 0 1 0 0-6z M18 9a9 9 0 0 1-9 9"
+   :play "M7 4l13 8-13 8z"
+   :stop "M6 6h12v12H6z"
+   :bug "M8 9a4 4 0 0 1 8 0v5a4 4 0 0 1-8 0z M12 10v8 M4 13h4 M16 13h4 M5 7l3 2 M19 7l-3 2 M5 19l3-2 M19 19l-3-2"
+   :chevron-right "M9 6l6 6-6 6"
+   :chevron-down "M6 9l6 6 6-6"
+   :x "M6 6l12 12 M18 6L6 18"
+   :plus "M12 5v14 M5 12h14"
+   :minus "M5 12h14"
+   :check "M5 12l5 5 9-10"
+   :terminal "M4 17l6-5-6-5 M12 19h8"
+   :list "M8 6h13 M8 12h13 M8 18h13 M3.5 6h.5 M3.5 12h.5 M3.5 18h.5"
+   :outline "M4 6h16 M8 12h12 M8 18h12"
+   :settings "M12 9a3 3 0 1 0 0 6a3 3 0 1 0 0-6z M12 2v3 M12 19v3 M2 12h3 M19 12h3 M4.9 4.9L7 7 M17 17l2.1 2.1 M4.9 19.1L7 17 M17 7l2.1-2.1"
+   :refresh "M20 12a8 8 0 1 1-2.3-5.7 M20 4v5h-5"
+   :message "M4 5h16v11H9l-5 4z"
+   :book "M4 5a2 2 0 0 1 2-2h14v16H6a2 2 0 0 0-2 2z M4 19V5"
+   :sidebar "M3 4h18v16H3z M9 4v16"
+   :panel-bottom "M3 4h18v16H3z M3 15h18"
+   :circle "M12 4a8 8 0 1 0 0 16a8 8 0 1 0 0-16z"
+   :alert "M12 3l10 18H2z M12 10v4 M12 17.5v.5"
+   :info "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18z M12 11v6 M12 7.5v.5"
+   :eye "M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z M12 9a3 3 0 1 0 0 6a3 3 0 1 0 0-6z"
+   :sparkles "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"})
+
+(defn- icon-props
+  "An :icon element's props, with :name looked up in icons."
+  [props]
+  (let [d (or (:d props) (get icons (:name props)) (get icons :circle))]
+    (into {} (remove (fn [kv] (nil? (second kv))))
+          (merge {:size 16 :view 24 :stroke (when-not (:fill props) 2)} (dissoc props :name :fill) {:d d}))))
+
+(def ^:private inline-styles
+  "What each inline element of rich text changes."
+  {:b {:font-weight :bold} :strong {:font-weight :bold}
+   :i {:font-style :italic} :em {:font-style :italic}
+   :code {:font-family :code :background :code-bg}
+   :s {:strike true} :strike {:strike true} :del {:strike true}
+   :u {:underline true}
+   :a {:color :accent}})
+
+(defn- inline-spans
+  "Rich text's inline content as spans: [text style] pairs. Strings, and
+  [:b …] [:i …] [:code …] [:s …] [:u …] [:a {:href h} …] [:span {style} …]
+  and [:br], nested."
+  [x style]
+  (cond (nil? x) []
+        (or (string? x) (number? x) (char? x)) [[(str x) style]]
+        (and (vector? x) (keyword? (first x)))
+        (let [[tag & more] x
+              attrs (when (map? (first more)) (first more))
+              kids (if attrs (rest more) more)
+              style (merge style (get inline-styles tag)
+                           (when (= tag :a) {:link (or (:href attrs) true)})
+                           (when (= tag :span) attrs))]
+          (if (= tag :br) [["\n" style]] (vec (mapcat (fn [k] (inline-spans k style)) kids))))
+        (sequential? x) (vec (mapcat (fn [k] (inline-spans k style)) x))
+        :else [[(str x) style]]))
+
+(defn- case-kind
+  "Shorthand kinds: :row and :column are boxes with a direction; :spacer
+  fills the space left."
+  [kind]
+  (cond (= kind :row) [:box {:flex-direction :row}]
+        (= kind :column) [:box {:flex-direction :column}]
+        (= kind :spacer) [:box {:flex-grow 1}]
+        :else [kind {}]))
+
+(defn- element [kind props children]
+  (let [[kind extra] (case-kind kind)
+        split (reduce-kv (fn [acc k v]
+                           (let [ev (handler-key? k)]
+                             (cond (= k :key) (assoc acc :key v)
+                                   (= k :style) (update acc :style merge v)
+                                   (and ev (fn? v)) (assoc-in acc [:handlers ev] v)
+                                   (contains? style-keys k) (assoc-in acc [:style k] v)
+                                   :else (assoc-in acc [:props k] v))))
+                         {:props {} :style extra :handlers {}}
+                         (or props {}))
+        kids (flatten-children children)
+        text? (= kind :text)
+        rich? (= kind :rich-text)
+        split (if (= kind :icon) (update split :props icon-props) split)
+        ;; an editor's model and highlighter stay in Norn; its events are
+        ;; wired to them
+        ed (when (= kind :editor) (select-keys (:props split) [:model :highlight]))
+        split (if ed
+                (-> split
+                    (update :props dissoc :model :highlight)
+                    (update :handlers merge (editor-handlers (:model ed) (:highlight ed))))
+                split)
+        ;; :context-menu items: a right click shows them; the choice goes
+        ;; to the element's :on-command, else the app's commands
+        split (if-let [items (get-in split [:props :context-menu])]
+                (-> split
+                    (update :props dissoc :context-menu)
+                    (assoc-in [:handlers :context-menu] (context-menu-handler items (get-in split [:handlers :command]))))
+                split)]
+    {:kind kind
+     :key (:key split)
+     :props (let [p (:props split)
+                  p (if text? (assoc p :text (apply str (map str kids))) p)
+                  p (if rich? (assoc p :spans (mapv (fn [[t st]] (if (empty? st) t [t st])) (inline-spans (vec kids) {}))) p)]
+              (if (seq (:handlers split)) (assoc p :on (set (keys (:handlers split)))) p))
+     :style (:style split)
+     :editor ed
+     :handlers (:handlers split)
+     :children (if (or text? rich?) [] (vec (keep normalize kids)))}))
+
+(declare Widget widget-element)
+
+(def ^:private memos "Memo key → {:deps :node}: its subtree, normalized." (atom {}))
+(def ^:private memo-gen (atom 0))
+
+(defn memo
+  "An element made by (f) only when deps change (compared with identical?,
+  then =); else the subtree made last time, which the diff skips without
+  looking inside. key names the memo (one per place it's used): for large
+  parts of a view that rarely change, such as a document's preview."
+  [key deps f]
+  [::memo {:key key :deps deps :f f}])
+
+(defn- memo-node [{:keys [key deps f]}]
+  (let [c (get @memos key)]
+    (if (and c (or (identical? deps (:deps c)) (= deps (:deps c))))
+      (:node c)
+      (let [n (assoc (normalize (f)) ::memo-src (swap! memo-gen inc))]
+        (swap! memos assoc key {:deps deps :node n})
+        n))))
+
+(defn- normalize
+  "An element (vector, string, number, nil or a Widget) as a node map."
+  [x]
+  (cond (nil? x) nil
+        (and (vector? x) (= ::memo (first x))) (memo-node (second x))
+        (instance? Widget x) (widget-element x)
+        (or (string? x) (number? x)) (element :text {} [x])
+        (and (vector? x) (keyword? (first x)))
+        (let [[kind & more] x
+              props (when (map? (first more)) (first more))
+              children (if props (rest more) more)]
+          (element kind props children))
+        :else (error "Not a UI element:" (pr-str x))))
+
+;; ---- diffing -----------------------------------------------------------------------------------
+
+(defn- map-diff
+  "Entries of b that differ from a, and nil for keys only a has."
+  [a b]
+  (let [changed (reduce-kv (fn [acc k v] (if (= v (get a k ::none)) acc (assoc acc k v))) {} b)]
+    (reduce-kv (fn [acc k _] (if (contains? b k) acc (assoc acc k nil))) changed a)))
+
+(defn- create
+  "Ids for a new subtree, and the ops that make it."
+  [node next-id ops]
+  (let [id (swap! next-id inc)
+        _ (swap! ops conj [:create id (:kind node) (:props node)])
+        _ (when (seq (:style node)) (swap! ops conj [:style id (:style node)]))
+        kids (vec (map-indexed (fn [i c]
+                                 (let [c (create c next-id ops)]
+                                   (swap! ops conj [:insert id i (:id c)])
+                                   c))
+                               (:children node)))]
+    (assoc node :id id :children kids)))
+
+(declare diff diff-node)
+
+(defn- subvec* [v from to] (vec (take (- to from) (drop from v))))
+
+(defn- reconcile
+  "New children of parent id, matched to the old ones by :key, else by kind
+  in order; ops to remove, create, update and order them."
+  [id old-kids new-kids next-id ops]
+  (let [keyed (atom (into {} (keep (fn [c] (when (:key c) [[(:kind c) (:key c)] c]))) old-kids))
+        unkeyed (atom (group-by :kind (remove :key old-kids)))
+        ;; each old child is matched once at most (two new children with the
+        ;; same key: the second is made anew, not the same node twice)
+        take-old (fn [c]
+                   (if (:key c)
+                     (let [k [(:kind c) (:key c)]
+                           o (get @keyed k)]
+                       (when o (swap! keyed dissoc k))
+                       o)
+                     (let [q (get @unkeyed (:kind c))]
+                       (when (seq q)
+                         (swap! unkeyed assoc (:kind c) (rest q))
+                         (first q)))))
+        matched (mapv (fn [c] [c (take-old c)]) new-kids)
+        used (set (keep (fn [[_ o]] (:id o)) matched))]
+    (doseq [o old-kids]
+      (when-not (contains? used (:id o)) (swap! ops conj [:remove (:id o)])))
+    (let [kids (mapv (fn [[c o]] (if o (diff o c next-id ops) (create c next-id ops))) matched)]
+      ;; put them in order, moving only what is out of place
+      (loop [i 0 cur (vec (filter (fn [x] (contains? used x)) (map :id old-kids)))]
+        (when (< i (count kids))
+          (let [cid (:id (nth kids i))]
+            (if (= cid (get cur i))
+              (recur (inc i) cur)
+              (do (swap! ops conj [:insert id i cid])
+                  (recur (inc i) (let [without (vec (remove (fn [x] (= x cid)) cur))]
+                                   (vec (concat (subvec* without 0 (min i (count without))) [cid] (subvec* without (min i (count without)) (count without)))))))))))
+      kids)))
+
+(defn- diff
+  "The new node (with ids) for old node o being replaced by n of the same
+  kind and key; ops for the differences."
+  [o n next-id ops]
+  (if (and (::memo-src n) (= (::memo-src o) (::memo-src n)))
+    o                                   ; a memo that didn't change: as it was
+    (diff-node o n next-id ops)))
+
+(defn- diff-node [o n next-id ops]
+  (let [id (:id o)
+        pd (map-diff (:props o) (:props n))
+        sd (map-diff (:style o) (:style n))]
+    (when (seq pd) (swap! ops conj [:set id pd]))
+    (when (seq sd) (swap! ops conj [:style id sd]))
+    (assoc n :id id :children (reconcile id (:children o) (:children n) next-id ops))))
+
+(defn- register-editors!
+  "Tell each editor model which node and window show it."
+  [node wid]
+  (when-let [m (get-in node [:editor :model])]
+    (let [new? (not= (::node @m) (:id node))]
+      (swap! m assoc ::node (:id node) ::window wid)
+      ;; a new node (a tab shown again): its carets and decorations
+      (when new?
+        (swap! m dissoc ::sent-decs)
+        (send-editor! m []))))
+  (doseq [c (:children node)] (register-editors! c wid)))
+
+(defn- editor-nodes
+  "[model node-id] for each editor in a tree."
+  [node acc]
+  (let [acc (if-let [m (get-in node [:editor :model])] (conj acc [m (:id node)]) acc)]
+    (reduce (fn [acc c] (editor-nodes c acc)) acc (:children node))))
+
+(defn- forget-gone-editors!
+  "Editors in the old tree but not the new one: their models no longer
+  have a node (so edits to them, such as a hidden tab's, send nothing)."
+  [old new]
+  (when old
+    (let [now (set (map second (editor-nodes new [])))]
+      (doseq [[m n] (editor-nodes old [])]
+        (when (and (not (contains? now n)) (= n (::node @m)))
+          (swap! m dissoc ::node ::window))))))
+
+(defn- collect-handlers [node acc]
+  (reduce (fn [acc c] (collect-handlers c acc))
+          (if (seq (:handlers node)) (assoc acc (:id node) (:handlers node)) acc)
+          (:children node)))
+
+;; ---- the app: the engine connection, windows and the event loop ----------------------------
+
+;; conn holds what belongs to one engine connection: the engine handle, its
+;; event channel and the render-request channel. A restored image gets a new
+;; connection; fibers saved with the old one stay parked on its channels.
+(defclass UiApp () ((conn) (windows) (handlers) (next-id) (pending) (commands) (menu) (dispatcher)))
+
+(defn- engine-of [a] (:engine @(:conn a)))
+(defn- events-of [a] (:events @(:conn a)))
+
+(def ^:private app (atom nil))
+
+(declare dispatch render-all! request-render! close-window find-node show-tooltip! node-rect remember-window!)
+
+(defn- start-loops!
+  "The event loop and the render loop of a's current connection. Each holds
+  its own connection's channel, so loops saved in an image with an old
+  connection never compete with the new ones."
+  [a]
+  (let [{:keys [events renders]} @(:conn a)]
+    (spawn-detached
+      (reset! (:dispatcher a) (current-fiber))
+      (loop []
+        (when-let [e (take! events)]
+          (handler-case (dispatch a e)
+            (Error [c] (println "norn.ui: an event handler failed:" (condition-text c))))
+          (recur))))
+    (spawn-detached
+      (loop []
+        (when (take! renders)
+          (handler-case (render-all! a)
+            (Error [c] (println "norn.ui: rendering failed:" (condition-text c))))
+          (recur))))))
+
+(defn- connect!
+  "A new engine connection for a (in its conn atom)."
+  [a]
+  (let [events (chan 1024)]
+    (reset! (:conn a) {:events events :engine (native/connect events) :renders (chan 1 :dropping)})
+    (native/apply! (engine-of a) [[:hello 1]])
+    a))
+
+(def ^:private app-token (let [c (chan 1)] (put! c true) c))
+
+(defn- the-app []
+  (or @app
+      (do
+        (take! app-token)
+        (try
+          (or @app
+              (let [a (UiApp :conn (atom nil) :windows (atom {}) :handlers (atom {}) :next-id (atom 0) :pending (atom {})
+                             :commands (atom {}) :menu (atom nil) :dispatcher (atom nil))]
+                (connect! a)
+                (register-resource! a)
+                (start-loops! a)
+                (add-after-eval-hook! ::refresh (fn [] (request-render! a)))
+                (reset! app a)
+                a))
+          (finally (put! app-token true))))))
+
+(defn- request-render! [a] (offer! (:renders @(:conn a)) true))
+
+(def ^:private render-token
+  "Held while a window renders, and while ops that name nodes of the last
+  rendered tree are sent: two renders of one window at once (the render
+  loop's and a refresh!'s) would each diff against the same old tree, and
+  an op naming a node could arrive just after a render removed it."
+  (let [c (chan 1)] (put! c true) c))
+
+(def ^:private render-holder "The fiber holding render-token." (atom nil))
+
+(defn- with-render-lock
+  "(f) holding render-token (at once if this fiber holds it already)."
+  [f]
+  (if (identical? @render-holder (current-fiber))
+    (f)
+    (do (take! render-token)
+        (reset! render-holder (current-fiber))
+        (try (f)
+             (finally (reset! render-holder nil)
+                      (put! render-token true))))))
+
+(declare render-window-now!)
+
+(defn- render-window!
+  "Re-render window wid: diff its view's new tree against the last one."
+  [a wid]
+  (with-render-lock (fn [] (render-window-now! a wid))))
+
+(defn- render-window-now! [a wid]
+  (when-let [w (get @(:windows a) wid)]
+    (let [view (:view w)
+          f (if (var? view) (var-get view) view)
+          new (normalize (f @(:state w)))
+          old (:tree w)
+          ops (atom [])
+          tree (if (and old (= (:kind old) (:kind new)) (= (:key old) (:key new)))
+                 (diff old new (:next-id a) ops)
+                 (do (when old (swap! ops conj [:remove (:id old)]))
+                     (create new (:next-id a) ops)))]
+      (when (not= (:id tree) (:id old))
+        (swap! ops conj [:window wid (assoc (:props w) :root (:id tree))]))
+      ;; The new nodes' handlers first: the engine may ask a new node
+      ;; something (an editor its lines) as soon as it has the ops, and an
+      ;; event no handler is there for yet is lost.
+      (swap! (:handlers a) (fn [hs] (merge (apply dissoc hs (keys (collect-handlers (or old {}) {})))
+                                           (collect-handlers tree {}))))
+      ;; The window may have closed meanwhile: then send nothing, and
+      ;; don't bring its entry back.
+      (when (and (seq @ops) (contains? @(:windows a) wid))
+        (when (= "1" (sys/getenv "NORN_UI_OPS")) (println "OPS" wid (pr-str @ops)))
+        (native/apply! (engine-of a) @ops))
+      (swap! (:windows a) (fn [ws] (if (contains? ws wid) (assoc-in ws [wid :tree] tree) ws)))
+      ;; (a dragged tab's drop targets were measured on the old tree: the
+      ;; groups that show while dragging appear in a render after it began)
+      (when (and (seq @ops) @dock-drag) (swap! dock-drag assoc :rects nil))
+      (register-editors! tree wid)
+      (forget-gone-editors! old tree))))
+
+(defn- render-all! [a]
+  ;; (A window may close while others render.)
+  ;; One window failing doesn't stop the others.
+  (doseq [wid (keys @(:windows a))]
+    (when (contains? @(:windows a) wid)
+      (handler-case (render-window! a wid)
+        (Error [c] (println "norn.ui: rendering window" wid "failed:" (condition-text c)))))))
+
+(defn- update-open
+  "ws (the windows by id) with window wid's entry as (f entry args…), if
+  that window is open."
+  [ws wid f & args]
+  (if (contains? ws wid) (assoc ws wid (apply f (get ws wid) args)) ws))
+
+(defn- dispatch [a e]
+  (let [kind (:event e)
+        node (:node e)
+        f (when node (get-in @(:handlers a) [node kind]))
+        w (get @(:windows a) (:window e))]
+    (cond (and (:req e) (contains? #{:command :menu-dismissed} kind) (contains? @(:pending a) (:req e)))
+          (let [ch (get @(:pending a) (:req e))]
+            (swap! (:pending a) dissoc (:req e))
+            (put! ch e))
+          (and f (= kind :command)) (when (= ::pass (f e))
+                                      (when-let [h (get @(:commands a) (:command e))] (h e)))
+          f (f e)
+          (= kind :close-requested) (if-let [on-close (:on-close w)] (on-close e) (close-window (:window e)))
+          (and (= kind :key) (:on-key w)) ((:on-key w) e)
+          (= kind :command) (when-let [h (get @(:commands a) (:command e))] (h e))
+          (and (= kind :drop) (:on-drop w)) ((:on-drop w) e)
+          (= kind :dismiss) (if-let [f (:on-dismiss w)] (f e) (close-window (:window e)))
+          (= kind :tooltip) (show-tooltip! e)
+          ;; (only for a window still open: a popup can hear its size
+          ;; after it closed, and that mustn't bring back half an entry)
+          (= kind :resize) (do (swap! (:windows a) update-open (:window e) assoc-in [:props :size] (:size e))
+                               (remember-window! w (:window e)))
+          (= kind :moved) (do (swap! (:windows a) update-open (:window e) assoc-in [:props :position] (:position e))
+                              (remember-window! w (:window e)))
+          (contains? #{:stats :screenshot :dialog :clipboard :rect} kind)
+          (when-let [ch (get @(:pending a) (or (:req e) (:path e)))]
+            (swap! (:pending a) dissoc (or (:req e) (:path e)))
+            (put! ch e))
+          (= kind :error) (println "norn.ui: the engine rejected a batch:" (:message e))
+          :else nil)))
+
+;; ---- the API ----------------------------------------------------------------------------------
+
+(def ^:private window-ids (atom 0))
+
+(declare recall remember!)
+
+(defn- remember-window!
+  "Save window wid's size and position, if it was opened with :remember."
+  [w wid]
+  (when-let [[app k] (:remember w)]
+    (let [p (get-in @(:windows (the-app)) [wid :props])]
+      (remember! app [:window k] (select-keys p [:size :position])))))
+
+(defn window
+  "Open a window showing (view @state): props are :title, :size [w h],
+  :position [x y] (on screen), :min-size, :resizable, plus :on-close,
+  :on-key and :on-drop handlers (:on-drop gets files dropped where no
+  element's :on-drop takes them). :remember [app key] restores the size
+  and position the window last had (see remember!) and saves them as
+  they change. view is a function or a var (redefining a var's function
+  re-renders). The window re-renders whenever state changes. Returns the
+  window id."
+  [props view state]
+  (let [a (the-app)
+        wid (swap! window-ids inc)
+        handlers (select-keys props [:on-close :on-key :on-drop :on-dismiss :remember])
+        props (apply dissoc props (keys handlers))
+        props (if-let [[app k] (:remember handlers)] (merge props (recall app [:window k] {})) props)]
+    (swap! (:windows a) assoc wid (merge handlers {:props props :view view :state state :tree nil}))
+    (add-watch state [::window wid] (fn [_ _ old new] (when-not (identical? old new) (request-render! a))))
+    (render-window! a wid)
+    wid))
+
+(defn close-window "Close window wid (and the popups it owns)." [wid]
+  (let [a (the-app)
+        w (get @(:windows a) wid)]
+    (doseq [[pid p] @(:windows a)]
+      (when (= wid (get-in p [:props :owner])) (close-window pid)))
+    (when w
+      (remove-watch (:state w) [::window wid])
+      (with-render-lock
+        (fn []
+          (swap! (:windows a) dissoc wid)
+          (native/apply! (engine-of a) (if (:tree w) [[:close-window wid] [:remove (:id (:tree w))]] [[:close-window wid]]))
+          ;; (its editors' models no longer have a node: a late edit or
+          ;; decoration, as a lint's, sends nothing, rather than a batch
+          ;; the engine rejects for naming a node that's gone)
+          (forget-gone-editors! (:tree w) nil))))
+    nil))
+
+(defn window-size "Window wid's size [w h] as it was last laid out, or nil." [wid]
+  (get-in @(:windows (the-app)) [wid :props :size]))
+
+(defn set-title! "Change window wid's title." [wid title]
+  (let [a (the-app)]
+    (when (contains? @(:windows a) wid)
+      (swap! (:windows a) assoc-in [wid :props :title] title)
+      (native/apply! (engine-of a) [[:window wid {:title title}]]))
+    nil))
+
+(defn refresh! "Re-render every window now." [] (render-all! (the-app)))
+
+(defn wait-closed
+  "Park until every window is closed (an app's script calls this last, so
+  the process lives as long as its windows)."
+  []
+  (let [a (the-app)
+        done (chan)]
+    (add-watch (:windows a) ::wait-closed (fn [_ _ _ ws] (when (empty? ws) (close! done))))
+    (when (empty? @(:windows a)) (close! done))
+    (take! done)
+    (remove-watch (:windows a) ::wait-closed)
+    nil))
+
+(defn theme! "Use theme (docs/ui-protocol.md §5) for every window." [theme]
+  (native/apply! (engine-of (the-app)) [[:theme theme]]))
+
+(defn- ask
+  "Send a request and park for its answer event (at most ms, or for as long
+  as it takes when ms is nil: a person answering a dialog)."
+  ([key op] (ask key op 10000))
+  ([key op ms]
+   (let [a (the-app)
+         ch (chan 1)]
+     (swap! (:pending a) assoc key ch)
+     (op a)
+     (if (identical? (current-fiber) @(:dispatcher a))
+       ;; Asked from an event handler: the answer comes through the event
+       ;; loop this fiber is running, so keep it going until it does.
+       (let [deadline (when ms (+ (quot (norn.core/%now-nanos) 1000000) ms))]
+         (loop []
+           (or (poll! ch)
+               (let [left (when deadline (- deadline (quot (norn.core/%now-nanos) 1000000)))]
+                 (when (or (nil? left) (pos? left))
+                   (when-let [e (if left (first (alts! [(events-of a) (timeout left)])) (take! (events-of a)))]
+                     (handler-case (dispatch a e)
+                       (Error [c] (println "norn.ui: an event handler failed:" (condition-text c)))))
+                   (recur))))))
+       (if ms (first (alts! [ch (timeout ms)])) (take! ch))))))
+
+(def ^:private req-ids (atom 0))
+
+(defn stats
+  "The engine's counters since the last call: {:frames :area :layouts}."
+  []
+  (let [r (swap! req-ids inc)]
+    (ask r (fn [a] (native/apply! (engine-of a) [[:stats r]])))))
+
+(defn simulate!
+  "Scripted input for the headless backend (see crates/host/src/backend.rs), e.g.
+  [:click wid x y]."
+  [input]
+  (native/simulate! (engine-of (the-app)) input))
+
+(defn click!
+  "Headless: click the centre of the element with :id element-id in window
+  wid."
+  [wid element-id]
+  (simulate! [:click-node wid (find-node element-id (get-in @(:windows (the-app)) [wid :tree]))]))
+
+(defn screenshot
+  "Render window wid to a PNG at path (scale, default 1); the answer event."
+  ([wid path] (screenshot wid path 1))
+  ([wid path scale]
+   (ask path (fn [a] (native/simulate! (engine-of a) [:screenshot wid path scale])))))
+
+(defn node-of
+  "The engine node id of the first element in window wid's tree whose
+  props has :id element-id (for tests and tools)."
+  [wid element-id]
+  (find-node element-id (get-in @(:windows (the-app)) [wid :tree])))
+
+(defn test-y
+  "Headless tests: the y of the top of the element with :id element-id in
+  window wid (from the engine's last layout), or nil."
+  [wid element-id]
+  (let [n (find-node element-id (get-in @(:windows (the-app)) [wid :tree]))
+        a (the-app)
+        ch (chan 1)
+        r (swap! req-ids inc)]
+    (when n
+      (swap! (:pending a) assoc r ch)
+      (native/simulate! (engine-of a) [:rect wid n r])
+      (let [e (first (alts! [ch (timeout 5000)]))] (when e (:y e))))))
+
+(defn- round-trip!
+  "Park until the engine and the event loop have handled everything sent
+  before: a request answered through the event loop, after it. True, or
+  false if no answer came in ms."
+  [a ms]
+  (let [ch (chan 1)
+        r (swap! req-ids inc)]
+    (swap! (:pending a) assoc r ch)
+    ;; (a node that doesn't exist: the answer is all that matters)
+    (native/simulate! (engine-of a) [:rect 0 0 r])
+    (boolean (first (alts! [ch (timeout ms)])))))
+
+(defn settle!
+  "Headless tests: park until everything sent so far has had its effect.
+  Scripted input and the events it made are handled, the windows show the
+  state that left, and the engine has laid that out (so node-rect and
+  test-y see it). True, or false if the engine didn't answer within ms
+  (default 5000)."
+  ([] (settle! 5000))
+  ([ms]
+   (let [a (the-app)]
+     (and (round-trip! a ms)
+          ;; (the render loop renders after a state change, on its own
+          ;; fiber; render now, so the tree is the state's)
+          (do (render-all! a) (round-trip! a ms))))))
+
+(defn- find-node [element-id n]
+  (when n
+    (if (= element-id (get-in n [:props :id])) (:id n) (some (fn [c] (find-node element-id c)) (:children n)))))
+
+;; ---- widgets ----------------------------------------------------------------------------------
+;;
+;; Plain functions returning elements: the state they show (which tab, how
+;; wide, what's expanded) belongs to the caller, who passes it in and
+;; updates it from the callbacks. Style them with base-theme (or your own
+;; rules for the same classes).
+
+(def ^:private theme-rules
+  "The widget rules both themes share: they name colours by token."
+  [[[:button :* :*] {:background :accent :color :on-accent :padding [6 14] :border-radius 6 :transition [:background 120]}]
+   [[:button :* :hover] {:background :accent-hover}]
+   [[:button :* :pressed] {:background :accent-pressed}]
+   [[:text-field :* :*] {:background :panel :border [1 :line] :border-radius 6 :padding [5 8]}]
+   [[:text-field :* :focused] {:border [2 :accent]}]
+   [[:box :tab-bar :*] {:border [1 :line] :background :bg}]
+   [[:box :tab :*] {:padding [6 12] :cursor :pointer :transition [:background 120]}]
+   [[:box :tab :hover] {:background :hover}]
+   [[:box :tab :selected] {:background :panel :color :accent}]
+   [[:box :splitter :*] {:background :line}]
+   [[:box :splitter :hover] {:background :accent}]
+   [[:box :tree-row :*] {:padding [3 6] :cursor :pointer :transition [:background 100]}]
+   [[:box :tree-row :hover] {:background :hover}]
+   [[:box :tree-row :selected] {:background :selected}]
+   [[:text :muted :*] {:color :muted}]
+   [[:box :dropdown :*] {:background :panel :border [1 :line] :border-radius 6 :padding [5 8] :cursor :pointer}]
+   [[:box :dropdown :focused] {:border [2 :accent]}]
+   [[:box :dropdown-menu :*] {:background :panel :border [1 :line] :border-radius 6 :padding 4}]
+   [[:box :dropdown-item :*] {:padding [4 8] :border-radius 4 :cursor :pointer}]
+   [[:box :dropdown-item :hover] {:background :hover}]
+   [[:box :dropdown-item :selected] {:background :selected}]
+   [[:box :tooltip :*] {:background :tooltip-bg :color :tooltip-text :padding [4 8] :font-size 12}]
+   [[:box :grid :*] {:border [1 :line] :background :panel}]
+   [[:box :grid :focused] {:border [1 :accent]}]
+   [[:box :grid-header :*] {:background :bg}]
+   [[:box :grid-header-cell :*] {:padding [0 6] :cursor :pointer :font-weight :medium}]
+   [[:box :grid-header-cell :hover] {:background :hover}]
+   [[:box :grid-resize :*] {:background :line}]
+   [[:box :grid-resize :hover] {:background :accent}]
+   [[:box :grid-row :hover] {:background :hover}]
+   [[:box :grid-row :selected] {:background :selected}]
+   [[:box :dock-group :*] {:border [1 :line]}]
+   [[:box :dock-group :selected] {:border [2 :accent]}]
+   [[:text :tab-close :*] {:color :muted :padding [0 2] :border-radius 3 :cursor :pointer}]
+   [[:text :tab-close :hover] {:color :text :background :line}]
+   [[:box :activity-bar :*] {:background :bg :width 48 :flex-shrink 0}]
+   [[:box :activity-item :*] {:cursor :pointer}]
+   [[:box :activity-item :hover] {:background :hover}]
+   [[:box :chip :*] {:background :hover :border-radius 10 :padding [2 8] :font-size 12 :cursor :pointer}]
+   [[:box :top-bar :*] {:background :bg :padding [5 10] :height 34 :flex-shrink 0}]
+   [[:box :status-bar :*] {:background :bg :padding [2 10] :height 24 :font-size 12 :color :muted :flex-shrink 0}]
+   [[:box :palette :*] {:background :panel :border [1 :line] :border-radius 8 :padding 6}]
+   [[:box :palette-list :*] {:max-height 340 :padding [4 0 0 0]}]
+   [[:box :palette-item :*] {:padding [5 8] :border-radius 4 :cursor :pointer}]
+   [[:box :palette-item :hover] {:background :hover}]
+   [[:box :palette-item :selected] {:background :selected}]
+   [[:box :find-bar :*] {:background :bg :padding [4 8] :flex-shrink 0}]
+   [[:button :find-button :*] {:background :hover :color :text :padding [3 8] :border-radius 4}]
+   [[:button :find-button :hover] {:background :line}]
+   [[:box :completion :*] {:background :panel :border [1 :line] :border-radius 6 :padding 3}]
+   [[:box :completion-item :*] {:padding [3 8] :border-radius 4 :cursor :pointer}]
+   [[:box :completion-item :selected] {:background :selected}]
+   [[:box :signature :*] {:background :panel :border [1 :line] :border-radius 6 :padding [3 8] :font-size 12}]
+   ;; a code block's lines don't wrap: it scrolls sideways, rather than
+   ;; making everything around it as wide as its longest line
+   [[:box :md-code :*] {:background :code-bg :padding [8 10] :border-radius 6 :overflow :scroll}]
+   [[:box :md-table :*] {:border [1 :line] :border-radius 4}]
+   [[:box :md-th :*] {:padding [4 8] :background :bg :border [1 :line]}]
+   [[:box :md-td :*] {:padding [4 8] :border [1 :line]}]])
+
+(def light-tokens
+  "The light theme's colours."
+  {:text "#1d1d22" :bg "#f4f4f6" :panel "#ffffff" :line "#d9d9de" :muted "#6b6b74" :hover "#e8e8ee"
+   :accent "#3070e0" :accent-hover "#2058c0" :accent-pressed "#18479e" :on-accent "#ffffff"
+   :selected "#dbe6fb" :tooltip-bg "#2a2a30" :tooltip-text "#ffffff" :toggle-off "#c8c8cc" :knob "#ffffff"
+   :row-alt "#f7f7fa" :code-bg "#eef0f3"
+   :bracket-1 "#2f6fd6" :bracket-2 "#a0529c" :bracket-3 "#2e8b57" :bracket-4 "#c26b14" :bracket-error "#d03030"
+   :bracket-match "#3070e0" :find-match "#e0a800" :find-current "#ff7a00"
+   :comment "#8a8f98" :string "#2e7d32" :keyword "#8e44ad" :number "#c0651a" :special "#1f5fbf"
+   :bracket "#7a7f88" :gutter "#f6f6f8" :current-line "#f1f4fb" :selection "#cfe0ff" :caret "#1d1d22"})
+
+(def dark-tokens
+  "The dark theme's colours."
+  {:text "#e4e4e8" :bg "#1c1d21" :panel "#25262b" :line "#3a3b42" :muted "#9a9aa6" :hover "#30323a"
+   :accent "#4c8dff" :accent-hover "#62a0ff" :accent-pressed "#3a76e0" :on-accent "#ffffff"
+   :selected "#2f4672" :tooltip-bg "#eeeef2" :tooltip-text "#1d1d22" :toggle-off "#4a4b53" :knob "#ffffff"
+   :row-alt "#2a2b31" :code-bg "#2e3037"
+   :bracket-1 "#82aaff" :bracket-2 "#c792ea" :bracket-3 "#8fd18f" :bracket-4 "#f2a35e" :bracket-error "#ff5c5c"
+   :bracket-match "#82aaff" :find-match "#e0b000" :find-current "#ff9a3c"
+   :comment "#7f8794" :string "#8fd18f" :keyword "#c792ea" :number "#f2a35e" :special "#82aaff"
+   :bracket "#9aa0aa" :gutter "#212226" :current-line "#2a2c33" :selection "#33476b" :caret "#e4e4e8"})
+
+(def base-theme
+  "The light theme for the widgets: merge your own rules after these."
+  {:tokens light-tokens :rules theme-rules})
+
+(def dark-theme
+  "The dark theme: the same rules with dark colours. Switch with
+  (ui/theme! ui/dark-theme)."
+  {:tokens dark-tokens :rules theme-rules})
+
+(defn toggle
+  "A switch. Options: :on? (whether it is on), :on-change (called with the
+  new value), :label, :id."
+  [{:keys [on? on-change label id]}]
+  [:row {:id id :gap 8 :align-items :center :cursor :pointer
+         :on-click (fn [_] (when on-change (on-change (not on?))))}
+   [:box {:width 34 :height 20 :border-radius 10 :padding 2 :background (if on? :accent :toggle-off)
+          :justify-content (if on? :end :start)}
+    [:box {:width 16 :height 16 :border-radius 8 :background :knob}]]
+   (when label [:text label])])
+
+(defn checkbox
+  "A check box. Options: :checked?, :on-change (called with the new
+  value), :label, :id."
+  [{:keys [checked? on-change label id]}]
+  [:row {:id id :gap 8 :align-items :center :cursor :pointer
+         :on-click (fn [_] (when on-change (on-change (not checked?))))}
+   [:box {:width 16 :height 16 :border-radius 4 :align-items :center :justify-content :center
+          :background (if checked? :accent :panel) :border [1 (if checked? :accent :line)]}
+    (when checked? [:text {:color :on-accent :font-size 11 :font-weight :bold} "✓"])]
+   (when label [:text label])])
+
+(defn tabs
+  "Tabs over panels. Options: :selected (a tab's key), :on-select (called
+  with a key), :id. tabs is a sequence of [key label content]; content may
+  be a function of no arguments, called only while its tab is selected
+  (so hidden tabs cost nothing to render)."
+  [{:keys [selected on-select id]} tabs]
+  [:column {:id id :flex-grow 1}
+   [:row {:class :tab-bar}
+    (for [[k label] tabs]
+      [:box {:key k :id k :class :tab :selected (= k selected) :on-click (fn [_] (when on-select (on-select k)))}
+       [:text label]])]
+   [:column {:flex-grow 1}
+    (some (fn [[k _ content]] (when (= k selected) (if (fn? content) (content) content))) tabs)]])
+
+(defn split
+  "Two panes, side by side (:direction :row, the default) or stacked
+  (:column), with a bar between them to drag. Options: :size (the first
+  pane's width or height), :on-resize (called with how far the bar moved,
+  in pixels), :id."
+  [{:keys [direction size on-resize id] :or {direction :row}} a b]
+  (let [row? (= direction :row)]
+    [:box {:id id :flex-direction direction :flex-grow 1}
+     [:box {(if row? :width :height) size :flex-shrink 0 :flex-direction :column :overflow :hidden} a]
+     [:box {:class :splitter (if row? :width :height) 5 :flex-shrink 0 :cursor (if row? :col-resize :row-resize)
+            :on-drag (fn [e] (when on-resize (on-resize (if row? (:dx e) (:dy e)))))}]
+     [:box {:flex-grow 1 :flex-direction :column :overflow :hidden} b]]))
+
+(defn- tree-rows
+  "The visible rows of a tree: [node depth] pairs, expanded nodes' children
+  after them."
+  [nodes expanded depth]
+  (vec (mapcat (fn [n]
+                 (cons [n depth]
+                       (when (and (seq (:children n)) (contains? expanded (:id n)))
+                         (tree-rows (:children n) expanded (inc depth)))))
+               nodes)))
+
+(defn tree
+  "A tree of nodes {:id :label :children :icon :color :icon-color :badge
+  :badge-color} (:icon an icon name or a string; :badge a short text at
+  the row's right, such as a Git status letter). Options: :nodes,
+  :expanded (a set of ids), :selected (an id), :on-toggle and :on-select
+  (called with an id)."
+  [{:keys [nodes expanded selected on-toggle on-select id] :or {expanded #{}}}]
+  [:column {:id id}
+   (for [[n depth] (tree-rows nodes expanded 0)]
+     (let [open? (contains? expanded (:id n))
+           parent? (seq (:children n))]
+       [:row {:key (:id n) :id (:id n) :class :tree-row :selected (= (:id n) selected) :gap 4 :align-items :center
+              :padding [3 6 3 (+ 6 (* 14 depth))]
+              :on-click (fn [_] (when on-select (on-select (:id n))))}
+        [:text {:width 12 :class :muted :on-click (when parent? (fn [_] (when on-toggle (on-toggle (:id n)))))}
+         (cond (not parent?) "" open? "▾" :else "▸")]
+        (when-let [i (:icon n)]
+          (if (keyword? i)
+            [:icon {:name i :size 15 :color (or (:icon-color n) (:color n) :muted)}]
+            [:text {:color (or (:icon-color n) (:color n))} i]))
+        [:text {:color (:color n) :flex-grow 1 :flex-shrink 1} (:label n)]
+        (when-let [b (:badge n)]
+          [:text {:color (or (:badge-color n) (:color n) :muted) :font-size 11 :padding [0 4 0 0]} b])]))])
+
+(defn vlist
+  "A virtualized list: only the rows near the visible part exist. Options:
+  :items, :row-height, :height, :scroll-y (where it is scrolled to, as the
+  last :on-scroll said), :on-scroll (called with the new y), :row (a
+  function of an item and its index giving its element), :id."
+  [{:keys [items row-height height scroll-y on-scroll row id] :or {scroll-y 0}}]
+  (let [n (count items)
+        top (max 0 (dec (quot (int scroll-y) row-height)))
+        end (min n (+ top (quot height row-height) 3))]
+    [:scroll {:id id :height height :scroll-y scroll-y :on-scroll (fn [e] (when on-scroll (on-scroll (:y e))))}
+     [:box {:height (* n row-height) :flex-shrink 0}
+      (for [i (range top end)]
+        [:box {:key i :position :absolute :inset [(* i row-height) 0 :auto 0] :height row-height :flex-direction :column}
+         (row (nth items i) i)])]]))
+
+(def ^:private grid-cursors
+  "Per grid id: the selection and scroll it last asked for, and the
+  :selected it was drawn with then. Keys that arrive before the app
+  re-renders build on these, not on the stale props."
+  (atom {}))
+
+(defn grid
+  "A virtualized table: only the rows near the visible part exist.
+  Options: :columns [{:key k :title t :width w} …], :rows (a vector of
+  maps), :row-height (22), :height, :scroll-y and :on-scroll (as vlist),
+  :selected (a row index) and :on-select (called with one), :sort [key
+  :asc|:desc] and :on-sort (called with the clicked column's key),
+  :on-resize-column (called with a key and its new width), :cell (a
+  function of a row and a column giving a string or an element; the
+  default shows the row's value for the column's key), :id. Up, Down,
+  Page Up, Page Down, Home and End move the selection and keep it in
+  view."
+  [{:keys [columns rows row-height height scroll-y on-scroll selected on-select sort on-sort on-resize-column cell id]
+    :or {row-height 22 scroll-y 0 id :grid}}]
+  (let [n (count rows)
+        drawn [selected scroll-y]
+        ;; the latest selection and scroll: ours if no render came since
+        latest (fn [] (let [c (get @grid-cursors id)]
+                        (if (and c (= (:drawn c) drawn)) [(:i c) (:y c)] drawn)))
+        header-h 26
+        body-h (- height header-h 2)
+        top (max 0 (dec (quot (int scroll-y) row-height)))
+        end (min n (+ top (quot body-h row-height) 3))
+        width (reduce + 0 (map :width columns))
+        cell (or cell (fn [row col] (str (get row (:key col) ""))))
+        select! (fn [i]
+                  (when (and (>= i 0) (< i n))
+                    (let [[_ sy] (latest)
+                          y (* i row-height)
+                          sy2 (cond (< y sy) y
+                                    (> (+ y row-height) (+ sy body-h)) (- (+ y row-height) body-h)
+                                    :else sy)]
+                      (swap! grid-cursors assoc id {:drawn drawn :i i :y sy2})
+                      (when on-select (on-select i))
+                      (when (and on-scroll (not= sy sy2)) (on-scroll sy2)))))
+        page (max 1 (quot body-h row-height))]
+    [:column {:id id :class :grid :height height :focusable true
+              :on-key (fn [e]
+                        (let [k (:key e) i (or (first (latest)) -1)]
+                          (cond (= k :arrow-down) (select! (min (dec n) (inc i)))
+                                (= k :arrow-up) (select! (max 0 (dec i)))
+                                (= k :page-down) (select! (min (dec n) (+ (max i 0) page)))
+                                (= k :page-up) (select! (max 0 (- i page)))
+                                (= k :home) (select! 0)
+                                (= k :end) (select! (dec n))
+                                :else nil)))}
+     [:row {:class :grid-header :height header-h :flex-shrink 0}
+      (for [c columns]
+        [:row {:key (:key c) :width (:width c) :flex-shrink 0}
+         [:row {:id (keyword (str "grid-col-" (name (:key c)))) :class :grid-header-cell :flex-grow 1 :align-items :center
+                :on-click (fn [_] (when on-sort (on-sort (:key c))))}
+          [:text (:title c) (when (= (:key c) (first sort)) (if (= :desc (second sort)) " ▼" " ▲"))]]
+         [:box {:id (keyword (str "grid-resize-" (name (:key c)))) :class :grid-resize :width 4 :cursor :col-resize
+                :on-drag (fn [e]
+                           (when on-resize-column
+                             ;; build on the width last asked for if no
+                             ;; render has caught up since (drags come fast)
+                             (let [k [id (:key c)]
+                                   seen (get @grid-cursors k)
+                                   base (if (and seen (= (:drawn seen) (:width c))) (:w seen) (:width c))
+                                   w (max 30 (+ base (:dx e)))]
+                               (swap! grid-cursors assoc k {:drawn (:width c) :w w})
+                               (on-resize-column (:key c) w))))}]])]
+     [:scroll {:height body-h :scroll-y scroll-y :on-scroll (fn [e] (when on-scroll (on-scroll (:y e))))}
+      [:box {:height (* n row-height) :width width :flex-shrink 0}
+       (for [i (range top end)]
+         [:row {:key i :id (keyword (str "grid-row-" i)) :class :grid-row :selected (= i selected)
+                :position :absolute :inset [(* i row-height) 0 :auto 0] :height row-height
+                :on-click (fn [_] (select! i))}
+          (for [c columns]
+            [:row {:key (:key c) :width (:width c) :flex-shrink 0 :padding [0 6] :align-items :center :overflow :hidden}
+             (let [v (cell (nth rows i) c)] (if (string? v) [:text v] v))])])]]]))
+
+;; ---- docks: tab groups whose tabs drag between them ---------------------------------------------
+
+(declare some-props)
+
+(def ^:private dock-drag (atom nil))
+
+(defn- dock-move
+  "layout with tab k moved to group g at index i (among g's tabs, not
+  counting k), active there."
+  [layout k g i]
+  (let [groups (mapv (fn [[gk tabs]] [gk (vec (remove (fn [t] (= t k)) tabs))]) (:groups layout))
+        groups (mapv (fn [[gk tabs]]
+                       (if (= gk g)
+                         [gk (let [i (min i (count tabs))] (vec (concat (take i tabs) [k] (drop i tabs))))]
+                         [gk tabs]))
+                     groups)
+        active (reduce (fn [acc [gk tabs]]
+                         (cond (= gk g) (assoc acc gk k)
+                               (some (fn [t] (= t (get acc gk))) tabs) acc
+                               :else (assoc acc gk (first tabs))))
+                       (or (:active layout) {}) groups)]
+    (assoc layout :groups groups :active active)))
+
+(defn- dock-target
+  "The group and index under window point (x, y), from the rects measured
+  when the drag began."
+  [rects x y]
+  (some (fn [{:keys [group rect tabs]}]
+          (let [rx (:x rect) ry (:y rect) rw (:w rect) rh (:h rect)]
+            (when (and rect (>= x rx) (< x (+ rx rw)) (>= y ry) (< y (+ ry rh)))
+              [group (count (filter (fn [[_ r]] (< (+ (:x r) (/ (:w r) 2)) x)) tabs))])))
+        rects))
+
+(defn dock-dragging?
+  "Is a tab of dock id (any dock, with no id) being dragged now? An app can
+  show its empty groups while one is, as places to drop it."
+  ([] (some? @dock-drag))
+  ([id] (= id (:dock @dock-drag))))
+
+(defn- dock-ids [id]
+  (let [pre (name id)]
+    [(fn [g] (keyword (str pre "-group-" (name g))))
+     (fn [t] (keyword (str pre "-tab-" (name t))))]))
+
+(defn- dock-rects
+  "Where each group of layout, and each tab but t, is in window w now."
+  [w layout id t]
+  (let [[gid tid] (dock-ids id)
+        rect (fn [elem] (when-let [n (node-of w elem)] (let [r (node-rect w n)] (when (seq r) r))))]
+    (vec (for [[g tabs] (:groups layout)]
+           {:group g :rect (rect (gid g))
+            :tabs (vec (keep (fn [t2] (when (not= t2 t) (when-let [r (rect (tid t2))] [t2 r]))) tabs))}))))
+
+(defn dock-group
+  "Group g of a dock's layout, to put anywhere in the window (dock puts
+  them all side by side). Every group of one layout shown in the same
+  window takes tabs dragged from the others. Options as dock's, and :group
+  g, :empty (shown in a group with no tabs), :on-close (when given, tabs
+  have a close button; called with the tab), :tab-menu (a function of a
+  tab giving context-menu items, as for menu!) and :on-tab-command (called
+  with the tab and the command chosen). A panel's content may be a
+  function of no arguments, called only while its tab is active."
+  [{:keys [layout panels on-change on-close tab-menu on-tab-command group empty id] :or {id :dock}}]
+  (let [[gid tid] (dock-ids id)
+        g group
+        tabs (some (fn [[gk ts]] (when (= gk g) ts)) (:groups layout))
+        active (get-in layout [:active g])
+        over (:over @dock-drag)
+        content (second (get panels active))]
+    [:column {:key g :id (gid g) :class :dock-group :selected (and (= id (:dock @dock-drag)) (= g (first over)))
+              :flex-grow 1 :flex-basis 0 :min-width 0}
+     ;; tabs that don't fit scroll sideways (a wheel turns it too); the
+     ;; one chosen comes into view
+     [:row {:class :tab-bar :overflow :scroll :flex-shrink 0}
+      (for [t tabs]
+        [:row (some-props
+               {:key t :id (tid t) :class :tab :selected (= t active) :reveal (= t active)
+                :gap 6 :align-items :center :flex-shrink 0
+                :context-menu (when tab-menu (tab-menu t))
+                :on-command (when on-tab-command (fn [e] (on-tab-command t (:command e))))
+                :on-click (fn [_] (when on-change (on-change (assoc-in layout [:active g] t))))
+                :on-drag-start (fn [_]
+                                 (reset! dock-drag {:tab t :dock id :layout layout :rects nil :at 0})
+                                 (request-render! (the-app)))
+                :on-drag (fn [e]
+                           (when-let [d @dock-drag]
+                             ;; Measure again after a render changes the window
+                             ;; (groups appear as drop targets once the drag
+                             ;; begins), and now and then.
+                             (let [now (quot (norn.core/%now-nanos) 1000000)
+                                   d (if (or (nil? (:rects d)) (> (- now (:at d)) 150))
+                                       (swap! dock-drag assoc :rects (dock-rects (:window e) (:layout d) id (:tab d)) :at now)
+                                       d)
+                                   target (dock-target (:rects d) (:x e) (:y e))]
+                               (when (not= target (:over d))
+                                 (swap! dock-drag assoc :over target)
+                                 (request-render! (the-app))))))
+                :on-drag-end (fn [_]
+                               (let [d @dock-drag]
+                                 (reset! dock-drag nil)
+                                 (request-render! (the-app))
+                                 (when-let [[g2 i] (:over d)]
+                                   (when on-change (on-change (dock-move (:layout d) (:tab d) g2 i))))))})
+         [:text {:white-space :nowrap} (first (get panels t))]
+         (when on-close
+           [:text {:id (keyword (str (name (tid t)) "-close")) :class :tab-close :tooltip "Close"
+                   :on-click (fn [_] (on-close t))}
+            "×"])])]
+     [:column {:flex-grow 1 :overflow :hidden}
+      (cond (empty? tabs) [:column {:flex-grow 1 :align-items :center :justify-content :center}
+                           [:text {:class :muted} (or empty "")]]
+            (fn? content) (content)
+            :else content)]]))
+
+(defn dock
+  "Tab groups side by side, whose tabs drag to other groups (or to another
+  place in their own). Options: :layout {:groups [[group [tab …]] …]
+  :active {group tab}}, :panels {tab [label content]}, :on-change (called
+  with the new layout), :direction (:row or :column), :id, and the tab
+  options of dock-group."
+  [{:keys [layout direction id] :or {direction :row id :dock} :as opts}]
+  [:box {:id id :flex-direction direction :flex-grow 1 :gap 4}
+   (for [[g _] (:groups layout)]
+     (dock-group (assoc opts :group g :id id)))])
+
+;; ---- self-drawing widgets ---------------------------------------------------------------------
+;;
+;;   (defclass Gauge (ui/Widget) ((value :initform 0) (on-change :initform nil)))
+;;   (defmethod ui/measure ((g Gauge)) [120 16])
+;;   (defmethod ui/paint ((g Gauge) size)
+;;     (let [[w h] size]
+;;       [[:rounded-rect [0 0 w h] 4 {:fill :line}]
+;;        [:rounded-rect [0 0 (* w (:value g)) h] 4 {:fill :accent}]]))
+;;   (defmethod ui/widget-events ((g Gauge)) #{:click})
+;;   (defmethod ui/on-event ((g Gauge) e) ((:on-change g) (/ (:x e) 120.0)))
+;;
+;; An instance in a view is drawn by the engine as a canvas (protocol §8).
+
+(defclass Widget ()
+  ())
+
+(defgeneric measure (w) "The [width height] widget w takes.")
+(defmethod measure ((w Widget)) [100 100])
+
+(defgeneric paint (w size)
+  "Drawing commands (docs/ui-protocol.md §8) for widget w at size [width
+  height], in its own coordinates.")
+(defmethod paint ((w Widget) size) [])
+
+(defgeneric widget-events (w)
+  "The event kinds widget w handles with on-event, e.g. #{:click :drag}.")
+(defmethod widget-events ((w Widget)) #{})
+
+(defgeneric on-event (w e)
+  "Handle event e for widget w. A click's :x and :y are in the widget's
+  coordinates.")
+(defmethod on-event ((w Widget) e) nil)
+
+(defn- widget-element [w]
+  (let [size (measure w)
+        handlers (into {} (map (fn [k] [(keyword (str "on-" (name k))) (fn [e] (on-event w e))]) (widget-events w)))]
+    (element :canvas (merge {:width (first size) :height (second size) :commands (paint w size)} handlers) [])))
+
+;; ---- the code editor ---------------------------------------------------------------------------
+;;
+;;   (def doc (ui/editor-model "(defn hello [] :world)"))
+;;   [:editor {:model doc :highlight ui/highlight-norn :height 300}]
+;;
+;; The text is a rope in the model (an atom); the engine shows the lines in
+;; view and asks for more as it scrolls. Edits send only what changed: an
+;; edit within a line re-sends that line (and the lines after it whose
+;; highlighting it changed, as when a string opens).
+;;
+;; A highlighter is (f line state): spans [start end style] for the line,
+;; or {:spans … :state s}, s being what the next line starts from (bracket
+;; depth, being inside a string). The editor keeps each line's start state,
+;; so it highlights a file only as far as it's shown.
+
+(declare popup fuzzy-score focus!)
+
+(def ^:private specials
+  #{"def" "defn" "defn-" "defmacro" "defclass" "defgeneric" "defmethod" "deftest" "fn" "let" "loop" "recur"
+    "if" "when" "when-not" "cond" "do" "ns" "require" "try" "catch" "finally" "and" "or" "for" "doseq"
+    "when-let" "if-let" "binding" "case" "defrecord" "deftype" "spawn" "with-scope"})
+
+(def ^:private opens #{\( \[ \{})
+(def ^:private closes #{\) \] \}})
+(def ^:private partner {\( \) \[ \] \{ \} \) \( \] \[ \} \{})
+
+(defn- bracket-style [depth]
+  (nth [:bracket-1 :bracket-2 :bracket-3 :bracket-4] (mod depth 4)))
+
+(defn highlight-norn
+  "Highlighting for Norn code. With one argument, a line's spans [start
+  end style]. With a state (what the line starts in, nil at the top), also
+  the state the next line starts in: {:spans … :state …}. Styles are theme
+  tokens: :comment :string :keyword :number :special, and brackets
+  :bracket-1 to :bracket-4 by depth (:bracket-error for an unmatched
+  closer)."
+  ([line] (:spans (highlight-norn line nil)))
+  ([line state]
+   (let [cs (vec line)
+         n (count cs)
+         at (fn [i] (when (< i n) (nth cs i)))
+         delim? (fn [c] (or (nil? c) (contains? #{\space \tab \( \) \[ \] \{ \} \" \, \;} c)))
+         word-end (fn [i] (loop [j i] (if (delim? (at j)) j (recur (inc j)))))
+         ;; the index after the closing quote, from inside a string at i
+         string-end (fn [i] (loop [j i] (cond (>= j n) nil (= (at j) \\) (recur (+ j 2)) (= (at j) \") (inc j) :else (recur (inc j)))))]
+     (loop [i 0 out [] depth (or (:depth state) 0) in-string (:string? state)]
+       (cond
+         in-string (if-let [e (string-end i)]
+                     (recur e (if (< i e) (conj out [i e :string]) out) depth false)
+                     {:spans (if (< i n) (conj out [i n :string]) out) :state {:depth depth :string? true}})
+         (>= i n) {:spans out :state {:depth depth :string? false}}
+         :else
+         (let [c (at i)]
+           (cond (= c \;) {:spans (conj out [i n :comment]) :state {:depth depth :string? false}}
+                 (= c \") (if-let [e (string-end (inc i))]
+                            (recur e (conj out [i e :string]) depth false)
+                            {:spans (conj out [i n :string]) :state {:depth depth :string? true}})
+                 ;; a character literal: \( isn't a bracket
+                 (= c \\) (let [j (max (min n (+ i 2)) (word-end (inc i)))] (recur j (conj out [i j :string]) depth false))
+                 (contains? opens c) (recur (inc i) (conj out [i (inc i) (bracket-style depth)]) (inc depth) false)
+                 (contains? closes c) (let [d (dec depth)]
+                                        (recur (inc i) (conj out [i (inc i) (if (neg? d) :bracket-error (bracket-style d))]) (max 0 d) false))
+                 (delim? c) (recur (inc i) out depth false)
+                 :else (let [j (word-end i)
+                             w (subs line i j)
+                             style (cond (= \: (first w)) :keyword
+                                         (some? (parse-double w)) :number
+                                         (contains? specials w) :special
+                                         :else nil)]
+                         (recur j (if style (conj out [i j style]) out) depth false)))))))))
+
+;; A model holds the rope and the carets: [[pos anchor] …], each pos and
+;; anchor a [line col] (anchor nil without a selection), sorted and never
+;; overlapping. The last caret is the primary one (it's kept in view).
+;; Also: each line's highlighting start state (:states, a prefix of the
+;; lines), undo and redo stacks of snapshots, and decoration layers.
+
+(defn editor-model
+  "A new editor model holding text (a string)."
+  [text]
+  (atom {:rope (rope/rope text) :carets [[[0 0] nil]] :states [nil] :undo [] :redo [] :layers {}}))
+
+(defn editor-text "The text of an editor model." [model] (rope/text (:rope @model)))
+
+(defn editor-carets
+  "An editor model's carets: [[line col] anchor] each, anchor nil without a
+  selection; the last is the primary one."
+  [model]
+  (:carets @model))
+
+(defn- index-of-pos [r [line col]]
+  (let [start (or (rope/line-start r line) (rope/length r))]
+    (min (+ start col) (rope/line-end r line))))
+
+(defn- pos-of-index [r i]
+  (let [line (rope/line-of r i)] [line (- i (rope/line-start r line))]))
+
+(defn- sel-range "A caret's selection as sorted indices [from to]." [r [p a]]
+  (let [i (index-of-pos r p) j (index-of-pos r (or a p))] [(min i j) (max i j)]))
+
+(defn- normalize-carets
+  "Sort carets by position and merge any that overlap (the later one's pos
+  wins). The primary caret stays primary where it can."
+  [r carets]
+  (let [primary (last carets)
+        sorted (sort-by (fn [c] (first (sel-range r c))) carets)
+        merged (reduce (fn [out c]
+                         (let [prev (peek out)]
+                           (if (nil? prev)
+                             [c]
+                             (let [[pf pt] (sel-range r prev) [cf ct] (sel-range r c)]
+                               (if (or (< cf pt) (and (= cf pt) (or (= pf pt) (= cf ct))))
+                                 (let [to (max pt ct)]
+                                   (conj (pop out) (if (= pf to) [(pos-of-index r to) nil] [(pos-of-index r to) (pos-of-index r pf)])))
+                                 (conj out c))))))
+                       [] sorted)
+        idx (first (keep identity (map-indexed (fn [i c] (when (= c primary) i)) merged)))]
+    (if (and idx (< idx (dec (count merged))))
+      (conj (vec (concat (subvec* merged 0 idx) (subvec* merged (inc idx) (count merged)))) primary)
+      merged)))
+
+;; ---- highlighting with state ----
+
+(defn- run-highlight
+  "What highlighter f gives for line from state: {:spans :state}."
+  [f line state]
+  (let [r (f line state)] (if (map? r) r {:spans r :state nil})))
+
+(defn- ensure-states!
+  "Compute the start states of m's lines up to line k (as far as needed)."
+  [m k]
+  (let [{:keys [rope highlight states]} @m]
+    (when (and highlight (<= (count states) k))
+      (let [n (rope/line-count rope)
+            ss (loop [ss states]
+                 (if (or (> (count ss) k) (>= (count ss) n))
+                   ss
+                   (let [l (dec (count ss))]
+                     (recur (conj ss (:state (run-highlight highlight (rope/line rope l) (nth ss l))))))))]
+        (swap! m assoc :states ss)))))
+
+(defn- line-data [m k]
+  (let [{:keys [rope highlight]} @m
+        t (rope/line rope k)]
+    (if highlight
+      (do (ensure-states! m k)
+          [t (vec (:spans (run-highlight highlight t (nth (:states @m) k nil))))])
+      [t []])))
+
+(defn- restate!
+  "After single-line edits on lines (same line count): the lines to send.
+  The edited lines, and after them each line whose start state changed,
+  until the states agree with what was shown again."
+  [m lines old-states]
+  (let [lines (sort (distinct lines))
+        first-l (first lines)
+        last-l (last lines)
+        {:keys [rope highlight]} @m
+        n (rope/line-count rope)]
+    (if (or (nil? highlight) (nil? first-l))
+      lines
+      (do (swap! m update :states (fn [ss] (subvec* ss 0 (min (count ss) (inc first-l)))))
+          (loop [k first-l out (set lines)]
+            (ensure-states! m (inc k))
+            (let [k2 (inc k)
+                  new (nth (:states @m) k2 nil)
+                  old (nth old-states k2 ::unknown)]
+              (cond (>= k2 n) (sort out)
+                    (= old ::unknown) (sort out)
+                    (and (>= k last-l) (= new old)) (sort out)
+                    (> (count out) 300) :all
+                    :else (recur k2 (conj out k2)))))))))
+
+;; ---- sending to the engine ----
+
+(defn- runs "Consecutive runs [from to) of a set of line numbers." [lines]
+  (reduce (fn [out l]
+            (let [[a b] (peek out)]
+              (if (and b (= l b)) (conj (pop out) [a (inc l)]) (conj out [l (inc l)]))))
+          [] (sort (distinct lines))))
+
+(defn- bracket-at
+  "[line col ch] of the bracket beside the primary caret (before it first),
+  if it's code (not in a string or comment)."
+  [m]
+  (let [[[l c] _] (last (:carets @m))
+        [t spans] (line-data m l)
+        code? (fn [i] (some (fn [[a b style]] (and (<= a i) (< i b) (contains? #{:bracket-1 :bracket-2 :bracket-3 :bracket-4} style))) spans))]
+    (some (fn [i] (when (and (>= i 0) (< i (count t)) (code? i)) [l i (nth t i)])) [(dec c) c])))
+
+(defn- bracket-match
+  "Decorations for the bracket at the caret and its partner."
+  [m]
+  (when-let [[l c ch] (bracket-at m)]
+    (let [rope (:rope @m)
+          n (rope/line-count rope)
+          fwd (contains? opens ch)
+          brackets (fn [k] (let [[t spans] (line-data m k)]
+                             (keep (fn [[a _ style]] (when (contains? #{:bracket-1 :bracket-2 :bracket-3 :bracket-4 :bracket-error} style) [a (nth t a)])) spans)))
+          found (loop [k l depth 0 seen 0]
+                  (when (and (>= k 0) (< k n) (< seen 500))
+                    (let [bs (brackets k)
+                          bs (if fwd (filter (fn [[a _]] (or (> k l) (> a c))) bs) (reverse (filter (fn [[a _]] (or (< k l) (< a c))) bs)))
+                          hit (reduce (fn [d [a b]]
+                                        (let [d (if (= (contains? opens b) fwd) (inc d) (dec d))]
+                                          (if (neg? d) (reduced [:hit a]) d)))
+                                      depth bs)]
+                      (if (vector? hit) [k (second hit)] (recur (if fwd (inc k) (dec k)) hit (inc seen))))))]
+      (into [{:line l :from c :to (inc c) :kind :highlight :style :bracket-match}]
+            (when found [{:line (first found) :from (second found) :to (inc (second found)) :kind :highlight :style :bracket-match}])))))
+
+(defn- decorations [m]
+  (vec (concat (apply concat (vals (:layers @m))) (bracket-match m))))
+
+(defn- send-editor!
+  "Send ops to the engine for editor model m: the given lines (or :all when
+  the line count changed: invalidate), the carets, the decorations if they
+  changed, and reveal the primary caret."
+  [m lines]
+  (with-render-lock (fn [] (send-editor-now! m lines))))
+
+(defn- send-editor-now! [m lines]
+  (let [node (::node @m)]
+    (when node
+      (let [decs (decorations m)
+            {:keys [rope carets]} @m
+            n (rope/line-count rope)
+            [[pl pc] _] (last carets)
+            ops (vec (concat
+                      (if (= lines :all)
+                        [[:line-count node n] [:invalidate node]]
+                        (for [[from to] (runs (filter (fn [l] (< l n)) lines))]
+                          [:lines node from (mapv (fn [k] (line-data m k)) (range from to))]))
+                      [[:carets node (mapv (fn [[[l c] a]] (if a {:line l :col c :anchor a} {:line l :col c})) carets)]]
+                      (when (not= decs (::sent-decs @m)) [[:decorations node decs]])
+                      [[:reveal node pl pc]]))]
+        (swap! m assoc ::sent-decs decs)
+        (native/apply! (engine-of (the-app)) ops)))))
+
+(defn editor-decorations!
+  "Set decoration layer layer (a keyword: :lint, :find, …) of model m to
+  decs, each {:line :from :to :kind :squiggle|:highlight|:inline :style
+  token :text?}; nil clears it."
+  [m layer decs]
+  (swap! m update :layers (fn [ls] (if (seq decs) (assoc ls layer (vec decs)) (dissoc ls layer))))
+  (send-editor! m [])
+  nil)
+
+(defn editor-inline!
+  "Show text after line (an inline result, as ⌘⏎ shows); the next edit or
+  Escape clears it."
+  [m line text]
+  (editor-decorations! m :inline [{:line line :from 0 :to 0 :kind :inline :style :muted :text (str "  ⇒ " text)}]))
+
+;; ---- undo ----
+
+(defn- now-ms [] (quot (norn.core/%now-nanos) 1000000))
+
+(defn- record-undo!
+  "Remember the text and carets before an edit, unless it continues the
+  typing the last step recorded (typing groups into one step)."
+  [m kind]
+  (let [{:keys [rope carets undo last-edit]} @m
+        same? (and (= kind :type) (= :type (:kind last-edit)) (= carets (:after last-edit)) (< (- (now-ms) (:at last-edit)) 1500))]
+    (swap! m assoc :redo [] :undo (if same? undo (conj (vec (take-last 199 undo)) {:rope rope :carets carets})))))
+
+(defn- restore! [m from to]
+  (let [{:keys [rope carets]} @m
+        stack (get @m from)]
+    (when-let [e (peek stack)]
+      (swap! m assoc from (pop stack) to (conj (get @m to) {:rope rope :carets carets})
+             :rope (:rope e) :carets (:carets e) :states [nil] :last-edit nil)
+      (swap! m update :layers dissoc :inline)
+      (send-editor! m :all))))
+
+(defn editor-undo! "Undo the last edit of model m." [m] (restore! m :undo :redo))
+(defn editor-redo! "Redo what undo undid." [m] (restore! m :redo :undo))
+
+;; ---- editing ----
+
+(declare refresh-find! refresh-completion!)
+
+(defn- edit!
+  "Replace each caret's selection (or nothing, at the caret) with s: one
+  string for every caret, or a vector of strings, one per caret. kind
+  :type marks typing, which undo groups."
+  ([m s] (edit! m s nil))
+  ([m s kind]
+   (record-undo! m kind)
+   (let [{:keys [rope carets states]} @m
+         [r2 ends] (loop [cs carets i 0 delta 0 r rope ends []]
+                     (if (empty? cs)
+                       [r ends]
+                       (let [[x y] (sel-range rope (first cs))
+                             t (if (string? s) s (nth s i ""))
+                             x2 (+ x delta)]
+                         (recur (rest cs) (inc i) (+ delta (- (count t) (- y x)))
+                                (rope/replace r x2 (+ y delta) t) (conj ends (+ x2 (count t)))))))
+         carets2 (normalize-carets r2 (mapv (fn [i] [(pos-of-index r2 i) nil]) ends))
+         same-lines? (= (rope/newlines rope) (rope/newlines r2))
+         first-line (apply min (map (fn [c] (ffirst c)) carets))]
+     (swap! m assoc :rope r2 :carets carets2 :last-edit {:kind kind :after carets2 :at (now-ms)})
+     (swap! m update :layers dissoc :inline)
+     (let [lines (if same-lines?
+                   (restate! m (map ffirst carets2) states)
+                   (do (swap! m update :states (fn [ss] (subvec* ss 0 (min (count ss) (inc first-line))))) :all))]
+       (refresh-find! m)
+       (send-editor! m lines)
+       (refresh-completion! m)))))
+
+(defn- set-carets! [m carets]
+  (swap! m assoc :carets (normalize-carets (:rope @m) carets))
+  (send-editor! m []))
+
+(defn- move!
+  "Move every caret with (f pos): extending its selection with shift, else
+  dropping it."
+  [m f shift?]
+  (set-carets! m (mapv (fn [[p a]] [(f p) (when shift? (or a p))]) (:carets @m))))
+
+(defn- word-char? [c]
+  (and c (not (contains? #{\space \tab \( \) \[ \] \{ \} \" \' \, \; \` \@ \~ \^} c))))
+
+(defn- word-left [s col]
+  (let [col (loop [i col] (if (and (pos? i) (not (word-char? (nth s (dec i))))) (recur (dec i)) i))]
+    (loop [i col] (if (and (pos? i) (word-char? (nth s (dec i)))) (recur (dec i)) i))))
+
+(defn- word-right [s col]
+  (let [n (count s)
+        col (loop [i col] (if (and (< i n) (not (word-char? (nth s i)))) (recur (inc i)) i))]
+    (loop [i col] (if (and (< i n) (word-char? (nth s i))) (recur (inc i)) i))))
+
+(defn- word-at "[from to] of the word at col of line s (empty if none)." [s col]
+  (let [n (count s)]
+    (if (or (word-char? (when (< col n) (nth s col))) (word-char? (when (pos? col) (nth s (dec col)))))
+      [(word-left s (min n (inc col))) (word-right s col)]
+      [col col])))
+
+(defn editor-word-before-caret
+  "The word that ends at model m's primary caret (what completion
+  completes), or \"\"."
+  [m]
+  (let [{:keys [rope carets]} @m
+        [[l c] _] (last carets)
+        t (rope/line rope l)
+        start (loop [i c] (if (and (pos? i) (word-char? (nth t (dec i)))) (recur (dec i)) i))]
+    (subs t start c)))
+
+(defn- selection-text [m]
+  (let [{:keys [rope carets]} @m]
+    (->> carets
+         (keep (fn [c] (let [[x y] (sel-range rope c)] (when (< x y) (rope/slice rope x y)))))
+         (interpose "\n")
+         (apply str))))
+
+(defn- select-lines!
+  "Give carets without a selection their whole line (with its newline), as
+  copy and cut do when nothing is selected."
+  [m]
+  (let [{:keys [rope carets]} @m
+        last-line (dec (rope/line-count rope))]
+    (swap! m assoc :carets
+           (normalize-carets rope
+                             (mapv (fn [[[l c] a]]
+                                     (cond a [[l c] a]
+                                           (< l last-line) [[(inc l) 0] [l 0]]
+                                           :else [[l (count (rope/line rope l))] [l 0]]))
+                                   carets)))))
+
+(defn- copy! [m]
+  (when (every? (fn [[_ a]] (nil? a)) (:carets @m))
+    (let [before (:carets @m)]
+      (select-lines! m)
+      (set-clipboard! (selection-text m))
+      (swap! m assoc :carets before)))
+  (when (some second (:carets @m))
+    (set-clipboard! (selection-text m))))
+
+(defn- cut! [m]
+  (when (every? (fn [[_ a]] (nil? a)) (:carets @m)) (select-lines! m))
+  (set-clipboard! (selection-text m))
+  (edit! m ""))
+
+(defn- paste! [m]
+  (when-let [t (clipboard)]
+    (let [parts (str/split t #"\n")
+          n (count (:carets @m))]
+      (edit! m (if (and (> n 1) (= n (count parts))) (vec parts) t)))))
+
+(defn- add-caret-vertically! [m dir]
+  (let [{:keys [rope carets]} @m
+        [[l c] _] (last carets)
+        l2 (+ l dir)]
+    (when (and (>= l2 0) (< l2 (rope/line-count rope)))
+      (set-carets! m (conj carets [[l2 (min c (count (rope/line rope l2)))] nil])))))
+
+(defn- select-next-occurrence!
+  "Select the word at the primary caret, or add a caret at the next
+  occurrence of the primary selection (wrapping)."
+  [m]
+  (let [{:keys [rope carets]} @m
+        [[l c] a :as primary] (last carets)]
+    (if (nil? a)
+      (let [[x y] (word-at (rope/line rope l) c)]
+        (when (< x y) (set-carets! m (conj (pop carets) [[l y] [l x]]))))
+      (let [[x y] (sel-range rope primary)
+            needle (rope/slice rope x y)
+            text (rope/text rope)
+            hit (or (str/index-of text needle y) (str/index-of text needle))]
+        (when (and hit (not (some (fn [cr] (= hit (first (sel-range rope cr)))) carets)))
+          (set-carets! m (conj carets [(pos-of-index rope (+ hit (count needle))) (pos-of-index rope hit)])))))))
+
+;; ---- find and replace ----
+
+(defn- find-matches
+  "Where query occurs in text: [from to] character ranges (ignoring case
+  unless case? is set)."
+  [text query case?]
+  (if (= "" query)
+    []
+    (let [t (if case? text (str/lower-case text))
+          q (if case? query (str/lower-case query))
+          k (count q)]
+      (loop [from 0 out []]
+        (let [i (str/index-of t q from)]
+          (if (and i (< (count out) 10000)) (recur (+ i (max 1 k)) (conj out [i (+ i k)])) out))))))
+
+(defn- find-decorations [m]
+  (let [{:keys [rope find]} @m]
+    (vec (map-indexed (fn [i [a b]]
+                        (let [[l c] (pos-of-index rope a)]
+                          {:line l :from c :to (+ c (- b a)) :kind :highlight
+                           :style (if (= i (:current find)) :find-current :find-match)}))
+                      (:matches find)))))
+
+(defn- show-match! [m]
+  (let [{:keys [rope find]} @m
+        [a b] (nth (:matches find) (:current find) nil)]
+    (swap! m update :layers assoc :find (find-decorations m))
+    (if a
+      (set-carets! m [[(pos-of-index rope b) (pos-of-index rope a)]])
+      (send-editor! m []))))
+
+(defn editor-find!
+  "Search model m for query (ignoring case unless :case? is set): every
+  match is highlighted and the first after the caret selected. The state
+  is (:find @m): {:query :matches :current :replace :open?}."
+  ([m query] (editor-find! m query {}))
+  ([m query {:keys [case?]}]
+   (let [{:keys [rope carets]} @m
+         at (first (sel-range rope (last carets)))
+         ms (find-matches (rope/text rope) query case?)
+         current (or (first (keep identity (map-indexed (fn [i [a _]] (when (>= a at) i)) ms))) (if (seq ms) 0 nil))]
+     (swap! m update :find merge {:query query :case? case? :matches ms :current current :open? true})
+     (show-match! m)
+     (request-render! (the-app)))))
+
+(defn editor-find-next!
+  "Select the next match (dir 1) or the previous one (dir -1), wrapping."
+  [m dir]
+  (let [{:keys [matches current]} (:find @m)
+        n (count matches)]
+    (when (pos? n)
+      (swap! m assoc-in [:find :current] (mod (+ (or current -1) dir) n))
+      (show-match! m)
+      (request-render! (the-app)))))
+
+(defn- refresh-find! [m]
+  (let [f (:find @m)]
+    (when (:open? f)
+      (let [ms (find-matches (rope/text (:rope @m)) (:query f) (:case? f))]
+        (swap! m update :find assoc :matches ms :current (when (seq ms) (min (or (:current f) 0) (dec (count ms)))))
+        (swap! m update :layers assoc :find (find-decorations m))))))
+
+(defn editor-replace!
+  "Replace the selected match with replacement, then select the next."
+  [m replacement]
+  (let [{:keys [matches current]} (:find @m)]
+    (when (and current (nth matches current nil))
+      (edit! m replacement)
+      (refresh-find! m)
+      (show-match! m))))
+
+(defn editor-replace-all!
+  "Replace every match (one undo step)."
+  [m replacement]
+  (let [{:keys [rope]} @m
+        ms (:matches (:find @m))]
+    (when (seq ms)
+      (record-undo! m nil)
+      (let [r2 (reduce (fn [r [a b]] (rope/replace r a b replacement)) rope (reverse ms))]
+        (swap! m assoc :rope r2 :carets [[(pos-of-index r2 (min (first (first ms)) (rope/length r2))) nil]] :states [nil])
+        (refresh-find! m)
+        (swap! m update :layers assoc :find (find-decorations m))
+        (send-editor! m :all)
+        (request-render! (the-app))))))
+
+(defn editor-find-close!
+  "Close the find bar of model m and clear its highlights."
+  [m]
+  (swap! m update :find assoc :open? false :matches [] :current nil)
+  (editor-decorations! m :find nil)
+  (request-render! (the-app)))
+
+(defn editor-find-open?
+  "Is the find bar of model m open?"
+  [m]
+  (boolean (:open? (:find @m))))
+
+(defn- open-find! [m]
+  (let [{:keys [rope carets]} @m
+        [a b] (sel-range rope (last carets))
+        q (if (and (< a b) (< (- b a) 200)) (rope/slice rope a b) (or (:query (:find @m)) ""))]
+    (swap! m update :find merge {:open? true :query q})
+    (when-let [w (::window @m)]
+      (render-all! (the-app))
+      (focus! w ::find-query))
+    (when (seq q) (editor-find! m q))))
+
+(defn editor-open-find!
+  "Open model m's find bar (as ⌘F does in it): the query is the selection,
+  if it's short, else the last query."
+  [m]
+  (open-find! m))
+
+(defn editor-goto!
+  "Put model m's caret at line and col (0-based, clamped to the text),
+  selecting to col2 on that line if given, and scroll it into view."
+  ([m line col] (editor-goto! m line col nil))
+  ([m line col col2]
+   (let [r (:rope @m)
+         l (max 0 (min line (dec (rope/line-count r))))
+         n (count (rope/line r l))
+         c (max 0 (min col n))]
+     (set-carets! m [(if col2 [[l (max 0 (min col2 n))] [l c]] [[l c] nil])]))))
+
+(defn find-bar
+  "The find and replace bar for editor model m, or nil while it's closed
+  (⌘F opens it). Enter finds the next match, ⇧Enter the previous;
+  Escape closes it."
+  [m]
+  (let [{:keys [open? query matches current replace]} (:find @m)]
+    (when open?
+      [:row {:class :find-bar :gap 6 :align-items :center}
+       [:text-field {:id ::find-query :value (or query "") :placeholder "Find" :width 200
+                     :on-input (fn [e] (editor-find! m (:value e)))
+                     :on-submit (fn [_] (editor-find-next! m 1))
+                     :on-key (fn [e] (when (= :escape (:key e)) (editor-find-close! m)))}]
+       [:text {:class :muted :min-width 64}
+        (cond (empty? query) "" (empty? matches) "No results" :else (str (inc (or current 0)) " of " (count matches)))]
+       [:button {:class :find-button :tooltip "Previous match" :on-click (fn [_] (editor-find-next! m -1))} "↑"]
+       [:button {:class :find-button :tooltip "Next match" :on-click (fn [_] (editor-find-next! m 1))} "↓"]
+       [:text-field {:id ::find-replace :value (or replace "") :placeholder "Replace" :width 160
+                     :on-input (fn [e] (swap! m assoc-in [:find :replace] (:value e)))
+                     :on-submit (fn [_] (editor-replace! m (or (:replace (:find @m)) "")))}]
+       [:button {:class :find-button :on-click (fn [_] (editor-replace! m (or (:replace (:find @m)) "")))} "Replace"]
+       [:button {:class :find-button :on-click (fn [_] (editor-replace-all! m (or (:replace (:find @m)) "")))} "All"]
+       [:spacer]
+       [:button {:class :find-button :tooltip "Close" :on-click (fn [_] (editor-find-close! m))}
+        [:icon {:name :x :size 14 :color :text}]]])))
+
+;; ---- popups at the caret: completion and signatures ----
+
+(defn editor-caret-rect
+  "Where model m's primary caret is: {:x :y :w :h} in its window."
+  [m]
+  (let [r (swap! req-ids inc)]
+    (when-let [w (::window @m)]
+      (select-keys (ask r (fn [a] (native/simulate! (engine-of a) [:caret-rect w (::node @m) r]))) [:x :y :w :h]))))
+
+(defn- close-editor-popup! [m k]
+  (when-let [p (get @m k)]
+    (swap! m dissoc k)
+    (close-window (:popup p))))
+
+(defn editor-close-popups!
+  "Close model m's completion and signature popups."
+  [m]
+  (close-editor-popup! m ::completion)
+  (close-editor-popup! m ::signature))
+
+(defn- completion-view [st]
+  (fn [{:keys [items hi]}]
+    [:column {:class :completion :min-width 220}
+     (map-indexed (fn [i it]
+                    [:row {:key i :id (keyword (str "completion-" i)) :class :completion-item :selected (= i hi) :gap 10
+                           :on-click (fn [_] (swap! st assoc :hi i :accept true))}
+                     [:text {:flex-grow 1 :font-family :code :font-size 13} (:label it)]
+                     (when (:detail it) [:text {:class :muted :font-size 12} (:detail it)])])
+                  (take 12 items))]))
+
+(defn- completion-items [all prefix]
+  (->> all
+       (keep (fn [it] (when-let [[sc _] (fuzzy-score prefix (:label it))] [sc it])))
+       (sort-by (fn [p] (- (first p))))
+       (map second)
+       vec))
+
+(defn- accept-completion! [m]
+  (when-let [p (::completion @m)]
+    (let [{:keys [items hi]} @(:state p)
+          it (nth items hi nil)
+          prefix (editor-word-before-caret m)]
+      (close-editor-popup! m ::completion)
+      (when it
+        (let [{:keys [carets]} @m
+              [[l c] _] (last carets)]
+          (swap! m assoc :carets [[[l c] [l (- c (count prefix))]]])
+          (edit! m (or (:insert it) (:label it))))))))
+
+(defn editor-complete!
+  "Offer completions at model m's primary caret: items are strings or maps
+  {:label :insert :detail}. Typing filters them by the word before the
+  caret; Up and Down move, Enter or Tab inserts, Escape closes."
+  [m items]
+  (close-editor-popup! m ::completion)
+  (let [all (mapv (fn [it] (if (string? it) {:label it} it)) items)
+        shown (completion-items all (editor-word-before-caret m))]
+    (when (and (seq shown) (::window @m))
+      (let [{:keys [x y h]} (editor-caret-rect m)
+            st (atom {:items shown :hi 0})
+            pid (popup (::window @m) {:position [x (+ y h 2)] :on-dismiss (fn [_] (close-editor-popup! m ::completion))}
+                       (completion-view st) st)]
+        (add-watch st ::accept (fn [_ _ _ new] (when (:accept new) (accept-completion! m))))
+        (swap! m assoc ::completion {:popup pid :state st :all all})
+        pid))))
+
+(defn- refresh-completion! [m]
+  (when-let [p (::completion @m)]
+    (let [shown (completion-items (:all p) (editor-word-before-caret m))]
+      (if (and (seq shown) (not= "" (editor-word-before-caret m)))
+        (reset! (:state p) {:items shown :hi 0})
+        (close-editor-popup! m ::completion)))))
+
+(defn editor-signature!
+  "Show element (a signature hint) just above model m's primary caret; nil
+  closes it."
+  [m element]
+  (close-editor-popup! m ::signature)
+  (when (and element (::window @m))
+    (let [{:keys [x y]} (editor-caret-rect m)
+          pid (popup (::window @m) {:position [x (max 0 (- y 30))] :on-dismiss (fn [_] (close-editor-popup! m ::signature))}
+                     (fn [el] [:box {:class :signature} el]) (atom element))]
+      (swap! m assoc ::signature {:popup pid})
+      pid)))
+
+;; ---- keys, clicks and commands ----
+
+(defn- editor-command
+  "Commands the editor takes when it has focus (copy and paste from the
+  menu bar); others go on to the app."
+  [m cmd]
+  (cond (= cmd :copy) (copy! m)
+        (= cmd :cut) (cut! m)
+        (= cmd :paste) (paste! m)
+        (= cmd :undo) (editor-undo! m)
+        (= cmd :redo) (editor-redo! m)
+        (= cmd :find) (open-find! m)
+        (= cmd :select-all) (let [r (:rope @m) last-line (dec (rope/line-count r))]
+                              (set-carets! m [[[last-line (count (rope/line r last-line))] [0 0]]]))
+        :else ::pass))
+
+(defn- completion-key
+  "Keys while completions show: true if the key was theirs."
+  [m k]
+  (when-let [p (::completion @m)]
+    (let [st (:state p)
+          n (min 12 (count (:items @st)))]
+      (cond (= k :arrow-down) (do (swap! st update :hi (fn [i] (min (dec n) (inc i)))) true)
+            (= k :arrow-up) (do (swap! st update :hi (fn [i] (max 0 (dec i)))) true)
+            (or (= k :enter) (= k :tab)) (do (accept-completion! m) true)
+            :else nil))))
+
+(defn- editor-key [m e]
+  (let [{:keys [rope carets]} @m
+        mods (or (:modifiers e) #{})
+        shift? (contains? mods :shift)
+        cmd? (or (contains? mods :cmd) (contains? mods :ctrl))
+        alt? (contains? mods :alt)
+        len (fn [l] (count (rope/line rope l)))
+        last-line (dec (rope/line-count rope))
+        k (:key e)]
+    (cond (and (not cmd?) (completion-key m k)) nil
+          ;; the app's own keys first (see editor-hooks!)
+          (when-let [h (:key-hook @m)] (h e)) nil
+          (and cmd? alt? (= k :arrow-up)) (add-caret-vertically! m -1)
+          (and cmd? alt? (= k :arrow-down)) (add-caret-vertically! m 1)
+          (and cmd? (= k :arrow-left)) (move! m (fn [[l _]] [l 0]) shift?)
+          (and cmd? (= k :arrow-right)) (move! m (fn [[l _]] [l (len l)]) shift?)
+          (and cmd? (= k :arrow-up)) (move! m (fn [_] [0 0]) shift?)
+          (and cmd? (= k :arrow-down)) (move! m (fn [_] [last-line (len last-line)]) shift?)
+          (and alt? (= k :arrow-left)) (move! m (fn [[l c]] (if (pos? c) [l (word-left (rope/line rope l) c)] (if (pos? l) [(dec l) (len (dec l))] [l c]))) shift?)
+          (and alt? (= k :arrow-right)) (move! m (fn [[l c]] (if (< c (len l)) [l (word-right (rope/line rope l) c)] (if (< l last-line) [(inc l) 0] [l c]))) shift?)
+          (= k :arrow-left) (move! m (fn [[l c]] (if (pos? c) [l (dec c)] (if (pos? l) [(dec l) (len (dec l))] [l c]))) shift?)
+          (= k :arrow-right) (move! m (fn [[l c]] (if (< c (len l)) [l (inc c)] (if (< l last-line) [(inc l) 0] [l c]))) shift?)
+          (= k :arrow-up) (move! m (fn [[l c]] (if (pos? l) [(dec l) (min c (len (dec l)))] [0 0])) shift?)
+          (= k :arrow-down) (move! m (fn [[l c]] (if (< l last-line) [(inc l) (min c (len (inc l)))] [l (len l)])) shift?)
+          (= k :home) (move! m (fn [[l _]] [l 0]) shift?)
+          (= k :end) (move! m (fn [[l _]] [l (len l)]) shift?)
+          (= k :escape) (do (swap! m update :layers dissoc :inline)
+                            (set-carets! m [[(first (last carets)) nil]]))
+          (= k :backspace) (do (swap! m assoc :carets
+                                      (mapv (fn [[[l c] a]]
+                                              [[l c] (or a (cond (pos? c) [l (dec c)] (pos? l) [(dec l) (len (dec l))] :else nil))])
+                                            carets))
+                               (edit! m ""))
+          (= k :delete) (do (swap! m assoc :carets
+                                   (mapv (fn [[[l c] a]]
+                                           [[l c] (or a (cond (< c (len l)) [l (inc c)] (< l last-line) [(inc l) 0] :else nil))])
+                                         carets))
+                            (edit! m ""))
+          (= k :enter) (edit! m (mapv (fn [[[l _] _]] (str "\n" (re-find #"^[ \t]*" (rope/line rope l)))) carets))
+          (= k :tab) (edit! m "  ")
+          (and cmd? shift? (= k "z")) (editor-redo! m)
+          (and cmd? (= k "z")) (editor-undo! m)
+          (and cmd? (= k "y")) (editor-redo! m)
+          (and cmd? (= k "f")) (open-find! m)
+          (and cmd? (= k "g")) (editor-find-next! m (if shift? -1 1))
+          (and cmd? (= k "d")) (select-next-occurrence! m)
+          (and cmd? (contains? #{"a" "c" "x" "v"} k))
+          (editor-command m (get {"a" :select-all "c" :copy "x" :cut "v" :paste} k))
+          :else nil)))
+
+(defn- editor-click [m e]
+  (let [{:keys [rope carets]} @m
+        p [(:line e) (:col e)]
+        mods (or (:modifiers e) #{})]
+    (cond (contains? mods :alt) (set-carets! m (conj carets [p nil]))
+          (contains? mods :shift) (set-carets! m [[p (or (second (last carets)) (first (last carets)))]])
+          (= 2 (:count e)) (let [[x y] (word-at (rope/line rope (first p)) (second p))]
+                             (set-carets! m [[[(first p) y] (when (< x y) [(first p) x])]]))
+          :else (set-carets! m [[p nil]]))))
+
+(defn- editor-handlers [m highlight]
+  (when m
+    (when-not (= highlight (:highlight @m))
+      (swap! m assoc :highlight highlight :states [nil]))
+    {:key (fn [e] (editor-key m e))
+     :text (fn [e] (let [t (:text e)]
+                     (when-not (when-let [h (:text-hook @m)] (h t))
+                       (edit! m t (when (and (= 1 (count t)) (not= "\n" t)) :type)))))
+     :click (fn [e] (editor-click m e))
+     :drag-select (fn [e] (set-carets! m [[[(:line e) (:col e)] (:anchor e)]]))
+     :command (fn [e] (editor-command m (:command e)))
+     :need-lines (fn [e] (let [{:keys [rope]} @m
+                               from (:from e)
+                               to (min (max (:to e) (+ from 80)) (rope/line-count rope))]
+                           (native/apply! (engine-of (the-app))
+                                          [[:line-count (:node e) (rope/line-count rope)]
+                                           [:lines (:node e) from (mapv (fn [k] (line-data m k)) (range from to))]])))}))
+
+(defn editor-hooks!
+  "Let the app handle model m's keys and typing first: (key-hook e) gets
+  each key event (after the completion popup's keys), (text-hook text)
+  each piece of typed text; either returns true if it handled it, so the
+  editor doesn't. nil removes a hook."
+  [m {:keys [key-hook text-hook]}]
+  (swap! m assoc :key-hook key-hook :text-hook text-hook)
+  nil)
+
+(defn editor-index "The character index of position [line col] in model m." [m pos]
+  (index-of-pos (:rope @m) pos))
+
+(defn editor-text-range "Model m's text from index from to index to." [m from to]
+  (rope/slice (:rope @m) from to))
+
+(defn editor-pos "The position [line col] of character index i in model m." [m i]
+  (pos-of-index (:rope @m) (max 0 (min i (rope/length (:rope @m))))))
+
+(defn editor-set-carets!
+  "Set model m's carets: [[pos anchor] …], each pos a [line col] and anchor
+  one or nil; the last is the primary one."
+  [m carets]
+  (set-carets! m carets))
+
+(defn editor-insert!
+  "Replace each caret's selection with s (one string, or one per caret),
+  as typing does. kind :type groups it with typing for undo."
+  ([m s] (editor-insert! m s nil))
+  ([m s kind] (edit! m s kind)))
+
+(defn editor-change!
+  "Replace the text from index from to index to with text, as one undo
+  step, and put the caret at index caret (default: just after the new
+  text), selecting back to index anchor if given."
+  ([m from to text] (editor-change! m from to text nil nil))
+  ([m from to text caret] (editor-change! m from to text caret nil))
+  ([m from to text caret anchor]
+   (record-undo! m nil)
+   (let [{:keys [rope states]} @m
+         r2 (rope/replace rope from to text)
+         at (fn [i] (pos-of-index r2 (max 0 (min i (rope/length r2)))))
+         carets [[(at (or caret (+ from (count text)))) (when anchor (at anchor))]]
+         first-line (first (pos-of-index rope from))
+         last-line (first (pos-of-index r2 (+ from (count text))))
+         same-lines? (= (rope/newlines rope) (rope/newlines r2))]
+     (swap! m assoc :rope r2 :carets carets :last-edit {:kind nil :after carets :at (now-ms)})
+     (swap! m update :layers dissoc :inline)
+     (let [lines (if same-lines?
+                   (restate! m (range first-line (inc last-line)) states)
+                   (do (swap! m update :states (fn [ss] (subvec* ss 0 (min (count ss) (inc first-line))))) :all))]
+       (refresh-find! m)
+       (send-editor! m lines)
+       (refresh-completion! m)))))
+
+(defn editor-completing?
+  "Is model m's completion popup open?"
+  [m]
+  (some? (::completion @m)))
+
+(defn editor-set-text!
+  "Replace an editor model's whole text (one caret, at the start; undo
+  history cleared). f, if given, is applied to the model in the same
+  change (to keep, say, an app's own key in step with the new text)."
+  ([m text] (editor-set-text! m text identity))
+  ([m text f]
+   (swap! m (fn [s] (f (assoc s :rope (rope/rope text) :carets [[[0 0] nil]] :states [nil] :undo [] :redo [] :layers {}))))
+   (send-editor! m :all)))
+
+;; ---- the platform: menus, commands, dialogs, the clipboard ---------------------------------
+
+(defn menu!
+  "Set the app's menu bar. items are [label command shortcut?] for an item
+  (command a keyword; shortcut like \"cmd+s\", cmd meaning ctrl off macOS),
+  [label [items…]] for a submenu, or :separator. On macOS the first submenu
+  is the application menu. Choosing an item runs its on-command! handler;
+  :quit and :hide are the system's own, and :copy :cut :paste :select-all
+  also act on the focused text field.
+
+    (ui/menu! [[\"App\" [[\"Quit\" :quit \"cmd+q\"]]]
+               [\"File\" [[\"Open…\" :open \"cmd+o\"] :separator [\"Save\" :save \"cmd+s\"]]]])"
+  [items]
+  (let [a (the-app)]
+    (reset! (:menu a) items)
+    (native/apply! (engine-of a) [[:menu items]])
+    nil))
+
+(defn on-command!
+  "Run (f event) when menu command cmd is chosen; nil f removes it."
+  [cmd f]
+  (swap! (:commands (the-app)) (fn [cs] (if f (assoc cs cmd f) (dissoc cs cmd))))
+  nil)
+
+(defn- dialog [spec]
+  (let [r (swap! req-ids inc)]
+    (:paths (ask r (fn [a] (native/apply! (engine-of a) [[:dialog r spec]])) nil))))
+
+(defn choose-file
+  "Ask for a file to open; its path, or nil if cancelled. opts: :title,
+  :directory, :filters [[\"Norn\" [\"norn\"]] …], :multiple (then a vector
+  of paths), :folder (choose a directory)."
+  ([] (choose-file {}))
+  ([opts]
+   (let [kind (cond (:folder opts) :folder (:multiple opts) :open-files :else :open-file)
+         paths (dialog (assoc (select-keys opts [:title :directory :filters]) :kind kind))]
+     (if (:multiple opts) paths (first paths)))))
+
+(defn save-file
+  "Ask where to save; the path, or nil if cancelled. opts as choose-file."
+  ([] (save-file {}))
+  ([opts] (first (dialog (assoc (select-keys opts [:title :directory :filters]) :kind :save-file)))))
+
+(defn clipboard "The clipboard's text, or nil." []
+  (let [r (swap! req-ids inc)]
+    (:text (ask r (fn [a] (native/apply! (engine-of a) [[:clipboard-get r]]))))))
+
+(defn set-clipboard! "Put text on the clipboard." [text]
+  (native/apply! (engine-of (the-app)) [[:clipboard-set text]])
+  nil)
+
+;; ---- popups, tooltips, context menus, dropdowns ---------------------------------------------
+
+(defn popup
+  "Open a popup over window owner: a borderless window at :position [x y]
+  (in owner's coordinates) that can reach past owner's edges. It sizes to
+  its content unless given :size. A press in owner (except on the node
+  :anchor, an engine node id) or Escape dismisses it: :on-dismiss runs,
+  or it closes. Closing owner closes it. Returns its window id."
+  [owner opts view state]
+  (window (merge {:owner owner :fit-content (nil? (:size opts))} opts) view state))
+
+(defn popups-of "The open popups window wid owns, by id." [wid]
+  (vec (sort (keep (fn [[pid p]] (when (= wid (get-in p [:props :owner])) pid)) @(:windows (the-app))))))
+
+(def ^:private tooltip-window (atom nil))
+
+(defn- show-tooltip!
+  "The engine says to show a tooltip ({:node n :text t :x :y}), or to hide
+  it (:node nil)."
+  [e]
+  (when-let [t @tooltip-window]
+    (reset! tooltip-window nil)
+    (close-window t))
+  (when (:node e)
+    (reset! tooltip-window
+            (popup (:window e) {:position [(+ (:x e) 10) (+ (:y e) 18)]}
+                   (fn [text] [:box {:class :tooltip} [:text text]])
+                   (atom (:text e))))))
+
+(defn context-menu
+  "Show a context menu at [x y] in window wid (items as for menu!); the
+  command chosen, or nil if it was dismissed."
+  [wid items x y]
+  (let [r (swap! req-ids inc)
+        e (ask r (fn [a] (native/apply! (engine-of a) [[:context-menu r items wid x y]])) nil)]
+    (when (= :command (:event e)) (:command e))))
+
+(defn- app-command [e]
+  (when-let [h (get @(:commands (the-app)) (:command e))] (h e)))
+
+(defn- context-menu-handler [items on-command]
+  (fn [e]
+    (when-let [c (context-menu (:window e) items (:x e) (:y e))]
+      (let [ev {:event :command :command c :window (:window e) :node (:node e)}]
+        (if on-command
+          (when (= ::pass (on-command ev)) (app-command ev))
+          (app-command ev))))))
+
+(defn node-rect
+  "The rectangle {:x :y :w :h} of engine node n in window wid, from the
+  last layout."
+  [wid n]
+  (let [r (swap! req-ids inc)]
+    (select-keys (ask r (fn [a] (native/simulate! (engine-of a) [:rect wid n r]))) [:x :y :w :h])))
+
+(def ^:private open-dropdown (atom nil))
+
+(defn- close-dropdown! []
+  (when-let [d @open-dropdown]
+    (reset! open-dropdown nil)
+    (close-window (:popup d))))
+
+(defn- open-dropdown! [wid node options value on-change]
+  (let [{:keys [x y w h]} (node-rect wid node)
+        current (first (keep identity (map-indexed (fn [i [v _]] (when (= v value) i)) options)))
+        st (atom {:hi (or current 0)})
+        choose (fn [i] (close-dropdown!) (when on-change (on-change (first (nth options i)))))
+        pid (popup wid {:position [x (+ y h 2)] :anchor node :on-dismiss (fn [_] (close-dropdown!))}
+                   (fn [{:keys [hi]}]
+                     [:column {:class :dropdown-menu :min-width w}
+                      (for [[i [_ label]] (map-indexed vector options)]
+                        [:box {:key i :id (keyword (str "option-" i)) :class :dropdown-item :selected (= i hi)
+                               :on-click (fn [_] (choose i))}
+                         [:text label]])])
+                   st)]
+    (reset! open-dropdown {:popup pid :node node :state st :choose choose :n (count options)})))
+
+(defn dropdown
+  "A drop-down choice. Options: :options [[value label] …], :value,
+  :on-change (called with the chosen value), :placeholder, :width, :id.
+  Click or Down opens the list; Up and Down move in it, Enter chooses,
+  Escape or a click elsewhere closes it."
+  [{:keys [options value on-change placeholder width id]}]
+  (let [label (or (some (fn [[v l]] (when (= v value) l)) options) placeholder "")
+        toggle (fn [e]
+                 (if (= (:node e) (:node @open-dropdown))
+                   (close-dropdown!)
+                   (do (close-dropdown!) (open-dropdown! (:window e) (:node e) options value on-change))))]
+    [:row {:id id :class :dropdown :focusable true :width width :align-items :center :gap 6
+           :on-click toggle
+           :on-key (fn [e]
+                     (let [d (when (= (:node e) (:node @open-dropdown)) @open-dropdown)
+                           k (:key e)]
+                       (cond (and d (= k :arrow-down)) (swap! (:state d) update :hi (fn [i] (min (dec (:n d)) (inc i))))
+                             (and d (= k :arrow-up)) (swap! (:state d) update :hi (fn [i] (max 0 (dec i))))
+                             (and d (contains? #{:enter :space " "} k)) ((:choose d) (:hi @(:state d)))
+                             (contains? #{:arrow-down :enter :space " "} k) (toggle e)
+                             :else nil)))}
+     [:text {:flex-grow 1} label]
+     [:text {:class :muted} "▾"]]))
+
+;; ---- remembered state: window places, layouts, settings -----------------------------------
+;;
+;; Each app keeps a small EDN file of whatever it wants back next time
+;; (window sizes, dock layouts, the open sidebar): in Application Support
+;; on macOS, else in $XDG_CONFIG_HOME (or ~/.config). Saving waits for
+;; changes to settle, so dragging a window doesn't write on every move.
+
+(def ^:private stores (atom {}))
+(def ^:private state-root (atom nil))
+
+(defn set-state-dir!
+  "Keep remembered state under dir instead of the usual place (tests do)."
+  [dir]
+  (reset! state-root dir)
+  (reset! stores {})
+  nil)
+
+(defn state-file
+  "The file app's remembered state lives in."
+  [app]
+  (io/path (or @state-root
+               (if (= :macos (sys/os))
+                 (io/path (sys/home-dir) "Library" "Application Support")
+                 (or (sys/getenv "XDG_CONFIG_HOME") (io/path (sys/home-dir) ".config"))))
+           app "state.edn"))
+
+(defn- store [app]
+  (or (get @stores app)
+      (let [f (state-file app)
+            data (or (try (when (io/exists? f) (edn/read-string (io/read-text f))) (catch Error _ nil)) {})]
+        (get (swap! stores (fn [ss] (if (contains? ss app) ss (assoc ss app {:data data :pending false})))) app))))
+
+(defn recall
+  "What app remembered under key k (anything EDN can hold), or default."
+  ([app k] (recall app k nil))
+  ([app k default] (get (:data (store app)) k default)))
+
+(defn- save! [app]
+  (let [f (state-file app)
+        tmp (str f ".tmp")]
+    (io/mkdirs! (io/parent f))
+    (io/write-text tmp (pr-str (:data (get @stores app))))
+    (io/rename! tmp f)))
+
+(defn remember!
+  "Remember v under key k for app (saved to its state file shortly
+  after changes stop)."
+  [app k v]
+  (store app)
+  (let [first? (atom false)]
+    (swap! stores update app (fn [s] (when-not (:pending s) (reset! first? true)) (-> s (assoc-in [:data k] v) (assoc :pending true))))
+    (when @first?
+      (spawn-detached
+        (sleep 400)
+        (swap! stores update app assoc :pending false)
+        (handler-case (save! app)
+          (Error [c] (println "norn.ui: couldn't save state for" app ":" (condition-text c)))))))
+  nil)
+
+;; ---- the workbench shell: activity bar, chips, status bar, command palette ---------------------
+
+(defn focus!
+  "Give keyboard focus to the element with :id element-id in window wid."
+  [wid element-id]
+  ;; Not while the window renders: the node found in the tree as last
+  ;; rendered may be gone from the engine by the time the op arrives.
+  (with-render-lock
+    (fn []
+      (when-let [n (node-of wid element-id)]
+        (native/apply! (engine-of (the-app)) [[:focus n]]))))
+  nil)
+
+(defn- some-props "m without its nil values." [m]
+  (into {} (remove (fn [kv] (nil? (second kv)))) m))
+
+(defn activity-bar
+  "A vertical bar of icon buttons, as on the left of VS Code. Options:
+  :items [[key icon tooltip] …], :selected (a key, or nil), :on-select
+  (called with the clicked key; clicking the selected one usually
+  collapses the sidebar), :id."
+  [{:keys [items selected on-select id]}]
+  [:column {:id id :class :activity-bar}
+   (for [[k icon tip] items]
+     [:row {:key k :id k :class :activity-item :selected (= k selected) :tooltip tip
+            :on-click (fn [_] (when on-select (on-select k)))}
+      [:box {:width 2 :background (when (= k selected) :accent)}]
+      [:box {:flex-grow 1 :align-items :center :justify-content :center :padding [11 0]}
+       [:icon {:name icon :size 22 :color (if (= k selected) :text :muted)}]]])])
+
+(defn chip
+  "A small rounded label for a top or status bar. Options: :label, :icon,
+  :dot (a colour: a status dot), :tooltip, :on-click, :context-menu (with
+  :on-command), :id."
+  [{:keys [label icon dot tooltip on-click context-menu on-command id]}]
+  [:row (some-props {:id id :class :chip :gap 5 :align-items :center :tooltip tooltip
+                     :on-click (when on-click (fn [e] (on-click e)))
+                     :context-menu context-menu :on-command on-command})
+   (when dot [:box {:width 7 :height 7 :border-radius 4 :background dot}])
+   (when icon [:icon {:name icon :size 13 :color :muted}])
+   [:text label]])
+
+(defn top-bar
+  "A bar across the top of a window: its children, left to right (put a
+  [:spacer] between groups)."
+  [& children]
+  (into [:row {:class :top-bar :gap 8 :align-items :center}] children))
+
+(defn status-bar
+  "A bar across the bottom of a window. Options: :left and :right, each a
+  vector of elements (chips, text)."
+  [{:keys [left right id]}]
+  [:row {:id id :class :status-bar :align-items :center}
+   (into [:row {:gap 12 :flex-grow 1 :align-items :center}] left)
+   (into [:row {:gap 12 :align-items :center}] right)])
+
+(defn fuzzy-score
+  "How well query matches text as a fuzzy subsequence, ignoring case:
+  nil when it doesn't, else [score positions] (higher is better;
+  consecutive letters and word starts score more)."
+  [query text]
+  (let [q (str/lower-case query)
+        t (str/lower-case text)
+        qs (vec q) ts (vec t) nq (count qs) nt (count ts)]
+    (if (zero? nq)
+      [0 []]
+      (loop [i 0 j 0 score 0 prev -2 pos []]
+        (cond (= i nq) [(- score (* 0.01 nt)) pos]
+              (= j nt) nil
+              (= (nth qs i) (nth ts j))
+              (let [start? (or (= j 0) (contains? #{\space \- \_ \/ \. \:} (nth ts (dec j))))
+                    bonus (+ 1 (if (= j (inc prev)) 3 0) (if start? 2 0))]
+                (recur (inc i) (inc j) (+ score bonus) j (conj pos j)))
+              :else (recur i (inc j) score prev pos))))))
+
+(def ^:private palette (atom nil))
+
+(defn- palette-matches [commands q]
+  (->> commands
+       (keep (fn [c] (when-let [[sc pos] (fuzzy-score q (:title c))] [sc pos c])))
+       (sort-by (fn [m] (- (first m))))
+       (take 50)
+       vec))
+
+(defn- highlighted
+  "Rich text for title with the characters at positions in bold."
+  [title positions]
+  (let [ps (set positions)]
+    (into [:rich-text {:flex-grow 1}]
+          (map-indexed (fn [i ch] (if (contains? ps i) [:b (str ch)] (str ch))) title))))
+
+(defn close-palette! "Close the command palette, if it's open." []
+  (when-let [p @palette]
+    (reset! palette nil)
+    (close-window (:popup p))))
+
+(defn command-palette!
+  "Open the command palette over window wid. commands are maps {:title t
+  :run f} (with :shortcut and :detail if you like). Typing filters them
+  (fuzzily); Up and Down move, Enter runs the highlighted one, Escape or a
+  click elsewhere closes it. Options: :placeholder, :width."
+  ([wid commands] (command-palette! wid commands {}))
+  ([wid commands {:keys [placeholder width] :or {placeholder "Type a command" width 520}}]
+   (close-palette!)
+   (let [[ww _] (or (get-in @(:windows (the-app)) [wid :props :size]) [800 600])
+         st (atom {:q "" :hi 0})
+         run! (fn [c] (close-palette!) (when c ((:run c))))
+         pid (popup wid {:position [(max 0 (quot (- ww width) 2)) 48] :on-dismiss (fn [_] (close-palette!))}
+                    (fn [{:keys [q hi]}]
+                      (let [ms (palette-matches commands q)
+                            hi (min hi (max 0 (dec (count ms))))]
+                        [:column {:class :palette :width width}
+                         [:text-field {:id :palette-input :value q :placeholder placeholder
+                                       :on-input (fn [e] (swap! st assoc :q (:value e) :hi 0))
+                                       :on-key (fn [e]
+                                                 (let [k (:key e)]
+                                                   (cond (= k :arrow-down) (swap! st update :hi (fn [i] (min (dec (count ms)) (inc i))))
+                                                         (= k :arrow-up) (swap! st update :hi (fn [i] (max 0 (dec i))))
+                                                         :else nil)))
+                                       :on-submit (fn [_] (run! (nth (nth ms hi nil) 2 nil)))}]
+                         [:column {:class :palette-list}
+                          (if (empty? ms)
+                            [:text {:class :muted :padding [6 8]} "No matching commands"]
+                            (map-indexed (fn [i [_ pos c]]
+                                           [:row {:key (:title c) :id (keyword (str "palette-" i)) :class :palette-item
+                                                  :selected (= i hi) :gap 8 :on-click (fn [_] (run! c))}
+                                            (highlighted (:title c) pos)
+                                            (when (:shortcut c) [:text {:class :muted} (:shortcut c)])])
+                                         ms))]]))
+                    st)]
+     (reset! palette {:popup pid :state st :owner wid})
+     (focus! pid :palette-input)
+     pid)))
+
+;; ---- Markdown ------------------------------------------------------------------------------
+
+(defn- md-inline
+  "norn.markdown inlines as rich-text inline elements."
+  [x]
+  (if (string? x)
+    x
+    (let [[tag a & more] x
+          attrs (if (map? a) a {})
+          kids (map md-inline (if (map? a) more (if (nil? a) more (cons a more))))]
+      (cond (= tag :em) (into [:i] kids)
+            (= tag :strong) (into [:b] kids)
+            (= tag :strike) (into [:s] kids)
+            (= tag :code) [:code (str "\u2009" a "\u2009")]
+            (= tag :link) (into [:a {:href (:href attrs)}] kids)
+            (= tag :image) [:i (str "[" (or (:alt attrs) "image") "]")]
+            (= tag :break) [:br]
+            :else (vec (cons :span kids))))))
+
+(declare md-block)
+
+(defn- md-blocks [bs opts] (keep (fn [b] (md-block b opts)) bs))
+
+(defn- md-rich [inlines opts extra]
+  (into [:rich-text (merge {:on-link (:on-link opts)} extra)] (map md-inline inlines)))
+
+(defn- md-item [attrs i item opts]
+  (let [iattrs (second item)
+        marker (cond (contains? iattrs :checked) (if (:checked iattrs) "\u2611" "\u2610")
+                     (:ordered attrs) (str (+ (or (:start attrs) 1) i) ".")
+                     :else "\u2022")]
+    [:row {:key i :gap 6}
+     [:text {:min-width 14 :color :muted} marker]
+     (into [:column {:gap 4 :flex-grow 1 :flex-shrink 1}] (md-blocks (drop 2 item) opts))]))
+
+(defn- md-row [i row opts]
+  (let [head (:head (second row))]
+    [:row {:key i}
+     (map-indexed (fn [j cell]
+                    [:box {:key j :class (if head :md-th :md-td) :flex-grow 1 :flex-basis 0}
+                     (md-rich (rest cell) opts (if head {:font-weight :bold} {}))])
+                  (drop 2 row))]))
+
+(defn- md-block [b opts]
+  (let [tag (first b)
+        a (second b)
+        attrs (if (map? a) a {})
+        kids (if (map? a) (drop 2 b) (rest b))]
+    (cond
+      (= tag :heading) (md-rich kids opts {:font-size (get {1 24 2 20 3 17 4 15} (:level attrs) 14) :font-weight :bold})
+      (or (= tag :paragraph) (= tag :plain)) (md-rich kids opts {})
+      (= tag :code-block) [:box {:class :md-code} [:text {:font-family :code :font-size 12.5 :white-space :pre} (first kids)]]
+      (= tag :block-quote) [:row {:gap 10}
+                            [:box {:width 3 :background :line :border-radius 2}]
+                            (into [:column {:gap 8 :flex-grow 1 :flex-shrink 1 :color :muted}] (md-blocks kids opts))]
+      (= tag :list) [:column {:gap 4} (map-indexed (fn [i item] (md-item attrs i item opts)) kids)]
+      (= tag :table) [:column {:class :md-table} (map-indexed (fn [i row] (md-row i row opts)) kids)]
+      (= tag :thematic-break) [:box {:height 1 :background :line}]
+      :else nil)))
+
+(defn markdown
+  "An element showing Markdown: text, or what norn.markdown/parse gives.
+  Options: :on-link (called with a link's href when it's clicked);
+  :block-id, a function of a top-level block's index giving it an :id
+  (to find, measure or scroll to it)."
+  ([md] (markdown md {}))
+  ([md opts]
+   (let [doc (if (string? md) (mdlib/parse md) md)
+         bid (:block-id opts)]
+     (into [:column {:class :markdown :gap 10}]
+           (if bid
+             (keep-indexed (fn [i b] (when-let [el (md-block b opts)] [:column {:key i :id (bid i)} el])) (rest doc))
+             (md-blocks (rest doc) opts))))))
+
+;; ---- images -----------------------------------------------------------------------------------
+
+(defmethod on-image-restore ((a UiApp))
+  ;; The engine of the saved process is gone: connect a new one and replay
+  ;; every window from scratch.
+  (connect! a)
+  (reset! (:handlers a) {})
+  ;; Popups, tooltips and open drop-downs don't outlive the process.
+  (reset! tooltip-window nil)
+  (reset! open-dropdown nil)
+  (swap! (:windows a) (fn [ws] (into {} (comp (remove (fn [[_ w]] (get-in w [:props :owner])))
+                                              (map (fn [[k w]] [k (assoc w :tree nil)])))
+                                     ws)))
+  (start-loops! a)
+  (when-let [m @(:menu a)] (native/apply! (engine-of a) [[:menu m]]))
+  (render-all! a)
+  true)

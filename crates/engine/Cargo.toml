@@ -1,0 +1,10 @@
+[package]
+name = "norn-ui-engine"
+description = "The norn-ui engine: retained node tree, layout, styles, hit-testing, damage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+taffy.workspace = true
+parley.workspace = true

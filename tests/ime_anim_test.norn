@@ -1,0 +1,62 @@
+;;;; IME composition and style transitions (headless).
+
+(ns ime-anim-test
+  (:refer-core :exclude [settle])
+  (:require [norn.test :refer [is deftest]] [norn.ui :as ui]))
+
+(ui/theme! ui/base-theme)
+(defn settle [] (sleep 100))
+
+(deftest composing-in-a-text-field
+  (let [st (atom {:v "ab"})
+        w (ui/window {:size [240 60]}
+                     (fn [{:keys [v]}]
+                       [:column {:padding 10}
+                        [:text-field {:id :f :value v :width 200 :on-input (fn [e] (swap! st assoc :v (:value e)))}]])
+                     st)]
+    (settle)
+    (ui/click! w :f)
+    (ui/simulate! [:preedit w "にほ"])
+    (settle)
+    (ui/screenshot w "/tmp/norn-ui-ime-field.png" 2)
+    (is (= "ab" (:v @st)) "a composition isn't input")
+    (ui/simulate! [:preedit w ""])
+    (ui/simulate! [:type w "日本"])
+    (settle)
+    (is (= "ab日本" (:v @st)))
+    (ui/close-window w)))
+
+(deftest composing-in-the-editor
+  (let [doc (ui/editor-model "(def x 1)")
+        w (ui/window {:size [240 60]} (fn [_] [:column {:flex-grow 1} [:editor {:id :ed :model doc}]]) (atom nil))]
+    (settle)
+    (ui/click! w :ed)
+    (ui/simulate! [:key w :home #{}])
+    (ui/simulate! [:preedit w "かな"])
+    (settle)
+    (ui/screenshot w "/tmp/norn-ui-ime-editor.png" 2)
+    (is (= "(def x 1)" (ui/editor-text doc)))
+    (ui/simulate! [:preedit w ""])
+    (ui/simulate! [:type w "仮名"])
+    (settle)
+    (is (= "仮名(def x 1)" (ui/editor-text doc)))
+    (ui/close-window w)))
+
+(deftest transitions-animate-then-stop
+  (let [st (atom {:on? false})
+        w (ui/window {:size [200 80]}
+                     (fn [{:keys [on?]}]
+                       [:column {:padding 10}
+                        [:box {:id :b :height 40 :transition 200 :background (if on? "#3070e0" "#ffffff")}]])
+                     st)]
+    (settle)
+    (ui/stats)
+    (swap! st assoc :on? true)
+    (sleep 400)
+    (let [s (ui/stats)]
+      (is (< 3 (:frames s)) "frames while it animates")
+      (is (= 0 (:layouts s)) "colour doesn't lay out"))
+    (sleep 300)
+    (is (= 0 (:frames (ui/stats))) "and none once it's done")
+    (ui/screenshot w "/tmp/norn-ui-transition-end.png" 1)
+    (ui/close-window w)))
