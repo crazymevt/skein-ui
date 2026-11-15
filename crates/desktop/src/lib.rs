@@ -877,7 +877,11 @@ fn show_context_menu(menu: &muda::Menu, window: &Window, x: f32, y: f32) -> bool
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let Ok(h) = window.window_handle() else { return false };
     let RawWindowHandle::AppKit(h) = h.as_raw() else { return false };
-    let at = muda::dpi::Position::Logical(muda::dpi::LogicalPosition::new(x as f64, y as f64));
+    // muda measures y from the view's bottom (`height - y`), as for an
+    // unflipped NSView, but winit's view is flipped (y from the top): so
+    // give it y from the bottom, and the two flips land where the click was.
+    let height = window.inner_size().to_logical::<f64>(window.scale_factor()).height;
+    let at = muda::dpi::Position::Logical(muda::dpi::LogicalPosition::new(x as f64, height - y as f64));
     // SAFETY: the view belongs to a live window on this (the main) thread.
     unsafe { menu.show_context_menu_for_nsview(h.ns_view.as_ptr() as *const _, Some(at)) }
 }
