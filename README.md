@@ -130,6 +130,10 @@ Cargo target directory or restoring an image whose original toolkit
 directory has moved. Apps share the installation and launch their own
 renderer process when they first use the UI.
 
+`norn package` bundles the renderer with an app that uses this package:
+`norn.edn` declares it under `:helpers`, and the packaged app points
+`NORN_UI_HOST` at its own copy.
+
 ## Architecture
 
 `lib/norn/ui.norn` owns views, state, patch generation and event handlers.

@@ -1,3 +1,6 @@
 {:name norn-ui
  :version "0.1.0"
- :paths ["lib"]}
+ :paths ["lib"]
+ ;; norn package bundles the renderer with an app that uses norn-ui (the
+ ;; first of these that's built)
+ :helpers {"norn-ui-host" ["target/release/norn-ui-host" "bin/{os}-{arch}/norn-ui-host"]}}
