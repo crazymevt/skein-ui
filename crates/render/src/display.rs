@@ -4,6 +4,23 @@
 
 use norn_ui_engine::text::{GlyphRun, Rgba, TextStyle, color};
 use norn_ui_engine::{Data, Engine, NodeId, Rect, Text, WindowId};
+use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixelSampling {
+    Nearest,
+    Linear,
+}
+
+impl PixelSampling {
+    pub(crate) fn from_prop(value: Option<&Data>, default: Self) -> Self {
+        match value.and_then(Data::as_key) {
+            Some("nearest") => Self::Nearest,
+            Some("linear") => Self::Linear,
+            _ => default,
+        }
+    }
+}
 
 pub enum Item {
     Box { rect: Rect, color: Rgba, radius: f32, border: Option<(f32, Rgba)>, clip: Rect },
@@ -11,6 +28,7 @@ pub enum Item {
     /// Triangles (a canvas's lines and paths), three points each, in
     /// window coordinates.
     Tris { verts: Vec<[f32; 2]>, color: Rgba, clip: Rect },
+    Pixels { rect: Rect, size: [u32; 2], rgba: Arc<Vec<u8>>, sampling: PixelSampling, clip: Rect },
     /// An icon: SVG path data in a view-by-view box, stroked (width in view
     /// units) or filled, drawn into rect in color.
     Icon { rect: Rect, path: String, view: f32, stroke: Option<f32>, color: Rgba, clip: Rect },
@@ -19,7 +37,7 @@ pub enum Item {
 impl Item {
     pub fn clip(&self) -> Rect {
         match self {
-            Item::Box { clip, .. } | Item::Text { clip, .. } | Item::Tris { clip, .. } | Item::Icon { clip, .. } => *clip,
+            Item::Box { clip, .. } | Item::Text { clip, .. } | Item::Tris { clip, .. } | Item::Icon { clip, .. } | Item::Pixels { clip, .. } => *clip,
         }
     }
 }
@@ -89,6 +107,13 @@ fn walk(
             }
         } else if node.kind == "rich-text" {
             rich(engine, id, *r, style, clip, text, lookup, out);
+        } else if node.kind == "image" {
+            if let Some(image) = &node.raster {
+                let fit = node.prop("fit").and_then(Data::as_key);
+                let rect = image_rect(*r, image.size, fit);
+                let sampling = PixelSampling::from_prop(node.prop("sampling"), PixelSampling::Linear);
+                out.push(Item::Pixels { rect, size: image.size, rgba: image.rgba.clone(), sampling, clip: clip.intersect(r) });
+            }
         } else if node.kind == "canvas" {
             let cmds = node.prop("commands").and_then(Data::as_list).unwrap_or(&[]);
             crate::canvas::canvas(cmds, *r, clip, text, lookup, out);
@@ -111,6 +136,17 @@ fn walk(
             out.push(Item::Box { rect: t, color: thumb, radius: 3.0, border: None, clip });
         }
     }
+}
+
+fn image_rect(r: Rect, [width, height]: [u32; 2], fit: Option<&str>) -> Rect {
+    if fit == Some("fill") {
+        return r;
+    }
+    let (w, h) = (width as f32, height as f32);
+    let (sx, sy) = (r.w / w, r.h / h);
+    let scale = if fit == Some("cover") { sx.max(sy) } else { sx.min(sy) };
+    let (w, h) = (w * scale, h * scale);
+    Rect { x: r.x + (r.w - w) / 2.0, y: r.y + (r.h - h) / 2.0, w, h }
 }
 
 /// A text field: its value (or placeholder) scrolled to the caret, the

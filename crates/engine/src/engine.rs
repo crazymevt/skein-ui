@@ -6,6 +6,7 @@
 //! rectangles to repaint, and nodes carry their resolved styles.
 
 use crate::data::{Data, Event, NodeId, Op, Props, Rect, WindowId};
+use crate::raster::{DecodeRequest, RasterImage};
 use crate::style::{self, Theme};
 use std::collections::{HashMap, HashSet};
 use taffy::prelude::*;
@@ -28,6 +29,7 @@ pub struct Node {
     layout: taffy::NodeId,
     /// The resolved style as of the last restyle (what is painted).
     pub resolved: Props,
+    pub raster: Option<RasterImage>,
 }
 
 impl Node {
@@ -202,6 +204,10 @@ pub struct Engine {
     /// one of these back is an echo, not a request (it would undo a fast
     /// wheel).
     reported_scroll: HashMap<NodeId, std::collections::VecDeque<(f32, f32)>>,
+    /// Decode images off the engine's thread (`take_decode_requests`)
+    /// instead of while applying a batch.
+    async_decode: bool,
+    decodes: Vec<DecodeRequest>,
 }
 
 impl Default for Engine {
@@ -242,6 +248,62 @@ impl Engine {
             pending_reveal: HashSet::new(),
             reported_scroll: HashMap::new(),
             drag: None,
+            async_decode: false,
+            decodes: Vec::new(),
+        }
+    }
+
+    /// With on, image decoding waits in `take_decode_requests` for the
+    /// backend to run elsewhere, and its results come back through
+    /// `decoded`. Otherwise (the default, and the headless backend) images
+    /// decode while the batch that needs them is applied.
+    pub fn set_async_decode(&mut self, on: bool) {
+        self.async_decode = on;
+    }
+
+    /// The images waiting to be decoded, for a backend decoding them off
+    /// this thread.
+    pub fn take_decode_requests(&mut self) -> Vec<DecodeRequest> {
+        std::mem::take(&mut self.decodes)
+    }
+
+    fn request_decode(&mut self, request: DecodeRequest) {
+        if self.async_decode {
+            self.decodes.push(request);
+        } else {
+            let result = request.decode();
+            self.decoded(request, result);
+        }
+    }
+
+    /// A decode's result. An image node takes it only if its `:src` is
+    /// still the one decoded (a later one may have replaced it meanwhile).
+    pub fn decoded(&mut self, request: DecodeRequest, result: Result<RasterImage, String>) {
+        match request {
+            DecodeRequest::Node { id, src } => {
+                let Some(n) = self.nodes.get_mut(&id) else { return };
+                // (a nil :src is no prop at all once merged)
+                if n.kind != "image" || n.prop("src").unwrap_or(&Data::Nil) != &src {
+                    return;
+                }
+                let old_size = n.raster.as_ref().map(|image| image.size);
+                n.raster = result.ok();
+                if old_size != n.raster.as_ref().map(|image| image.size) {
+                    self.dirty_layout(id);
+                }
+                self.repaint.insert(id);
+            }
+            DecodeRequest::Event { req, .. } => {
+                let mut fields = vec![("req", Data::Num(req as f64))];
+                match result {
+                    Ok(image) => {
+                        fields.push(("size", Data::List(image.size.into_iter().map(|n| Data::Num(n.into())).collect())));
+                        fields.push(("rgba", Data::Bytes(image.rgba)));
+                    }
+                    Err(error) => fields.push(("error", Data::Str(error))),
+                }
+                self.events.push(Event::new("image-decoded", fields));
+            }
         }
     }
 
@@ -412,7 +474,7 @@ impl Engine {
                         return fail(format!("no node {id}"));
                     }
                 }
-                Op::Hello(_) | Op::CloseWindow(_) | Op::Stats(_) | Op::Platform { .. } => {}
+                Op::Hello(_) | Op::CloseWindow(_) | Op::Stats(_) | Op::DecodeImage { .. } | Op::Platform { .. } => {}
             }
         }
         Ok(())
@@ -465,8 +527,12 @@ impl Engine {
                     let v = props.iter().find(|(k, _)| k == "value").and_then(|(_, v)| v.as_str()).unwrap_or("").to_owned();
                     self.fields.insert(id, crate::field::Field::new(v));
                 }
-                self.nodes.insert(id, Node { kind, props, style: Vec::new(), children: Vec::new(), parent: None, layout, resolved: Vec::new() });
+                let image_src = if kind == "image" { props.iter().find(|(name, _)| name == "src").map(|(_, src)| src.clone()) } else { None };
+                self.nodes.insert(id, Node { kind, props, style: Vec::new(), children: Vec::new(), parent: None, layout, resolved: Vec::new(), raster: None });
                 let _ = self.restyle(id);
+                if let Some(src) = image_src {
+                    self.request_decode(DecodeRequest::Node { id, src });
+                }
             }
             Op::Set { id, props } => {
                 // Norn setting a field's value replaces what was typed.
@@ -484,8 +550,19 @@ impl Engine {
                 // so restyle — which repaints only what really changed.
                 // (rich text's content is its :spans; an icon's size is its :size)
                 let relayout = props.iter().any(|(k, _)| matches!(k.as_str(), "text" | "spans" | "hidden" | "value" | "size"));
+                let mut new_src = None;
                 if let Some(n) = self.nodes.get_mut(&id) {
+                    if n.kind == "image"
+                        && let Some((_, src)) = props.iter().find(|(k, _)| k == "src")
+                        && n.prop("src") != Some(src)
+                    {
+                        new_src = Some(src.clone());
+                    }
                     style::merge(&mut n.props, &props);
+                }
+                // (the node shows its old image until the new one is ready)
+                if let Some(src) = new_src {
+                    self.request_decode(DecodeRequest::Node { id, src });
                 }
                 self.restyle_down(id);
                 if relayout {
@@ -562,6 +639,7 @@ impl Engine {
             Op::Focus(id) => self.set_focus(id),
             Op::Editor { id, op, args } => self.editor_op(id, &op, &args),
             Op::Platform { op, args } => self.platform.push((op, args)),
+            Op::DecodeImage { req, src, size } => self.request_decode(DecodeRequest::Event { req, src, size }),
             Op::Stats(req) => {
                 let s = std::mem::take(&mut self.stats);
                 self.events.push(Event::new(
@@ -871,6 +949,14 @@ impl Engine {
             if !n.children.is_empty() {
                 return Size::ZERO;
             }
+            if n.kind == "image" {
+                let [width, height] = n.raster.as_ref().map_or([0.0; 2], |image| image.size.map(|n| n as f32));
+                return match (known.width, known.height) {
+                    (Some(w), None) if width > 0.0 => Size { width: w, height: w * height / width },
+                    (None, Some(h)) if height > 0.0 => Size { width: h * width / height, height: h },
+                    (w, h) => Size { width: w.unwrap_or(width), height: h.unwrap_or(height) },
+                };
+            }
             // Min-content is the text wrapped at every chance (its longest
             // word); max-content is the text unwrapped.
             let max_w = known.width.or(match avail.width {
@@ -978,23 +1064,93 @@ impl Engine {
         ((right - (r.x + r.w)).max(0.0), (bottom - (r.y + r.h)).max(0.0))
     }
 
-    /// The pointer wheel at (x, y): scroll the nearest scroll container
-    /// under it that can move that way. Only its visible area repaints.
+    /// Deliver the wheel to a :wheel handler, if one takes it: true if so.
+    /// Going up from the node under the pointer, the first of an enabled
+    /// handler and a scroll view or editor that can still move that way
+    /// takes the wheel. An inner scroll view keeps scrolling inside an
+    /// outer handler, which hears the wheel once the view can't move.
+    pub fn dispatch_wheel(&mut self, w: WindowId, x: f32, y: f32, dx: f32, dy: f32, modifiers: &[&str]) -> bool {
+        let mut at = self.hit(w, x, y);
+        let id = loop {
+            let Some(id) = at else { return false };
+            let Some(n) = self.nodes.get(&id) else { return false };
+            if n.wants("wheel") && !n.prop("disabled").is_some_and(Data::truthy) {
+                break id;
+            }
+            let parent = n.parent;
+            if (self.is_editor(id) && self.editor_scroll_target(id, dx, dy).is_some())
+                || (self.user_scrolls(id) && self.container_scroll_target(w, id, dx, dy).is_some())
+            {
+                return false;
+            }
+            at = parent;
+        };
+        let Some(r) = self.windows.get(&w).and_then(|win| win.rects.get(&id)).copied() else { return false };
+        let modifiers = Data::Set(modifiers.iter().map(|m| Data::key(m)).collect());
+        // A wheel event still waiting for Norn, for the same node and
+        // modifiers, takes this one's movement: a fast trackpad scroll
+        // reaches Norn as a few events, not one per OS event.
+        if let Some(last) = self.events.last_mut()
+            && last.kind == "wheel"
+            && last.get("window") == Some(&Data::Num(w as f64))
+            && last.get("node") == Some(&Data::Num(id as f64))
+            && last.get("modifiers") == Some(&modifiers)
+        {
+            for (key, value) in last.fields.iter_mut() {
+                match (*key, value) {
+                    ("x", v) => *v = Data::Num((x - r.x) as f64),
+                    ("y", v) => *v = Data::Num((y - r.y) as f64),
+                    ("dx", Data::Num(n)) => *n += dx as f64,
+                    ("dy", Data::Num(n)) => *n += dy as f64,
+                    _ => {}
+                }
+            }
+            return true;
+        }
+        self.events.push(Event::new(
+            "wheel",
+            vec![
+                ("window", Data::Num(w as f64)),
+                ("node", Data::Num(id as f64)),
+                ("x", Data::Num((x - r.x) as f64)),
+                ("y", Data::Num((y - r.y) as f64)),
+                ("dx", Data::Num(dx as f64)),
+                ("dy", Data::Num(dy as f64)),
+                ("modifiers", modifiers),
+            ],
+        ));
+        true
+    }
+
+    /// Where scroll container id would move for a wheel of (dx, dy), if
+    /// it moves. A box that scrolls only sideways (a strip of tabs) takes a
+    /// plain wheel's turn as sideways.
+    fn container_scroll_target(&self, w: WindowId, id: NodeId, dx: f32, dy: f32) -> Option<(f32, f32)> {
+        let (sx, sy) = self.scroll.get(&id).copied().unwrap_or((0.0, 0.0));
+        let (mx, my) = self.scroll_range(w, id);
+        let (dx, dy) = if my == 0.0 && mx > 0.0 && dx == 0.0 { (dy, 0.0) } else { (dx, dy) };
+        let (nx, ny) = ((sx + dx).clamp(0.0, mx), (sy + dy).clamp(0.0, my));
+        ((nx, ny) != (sx, sy)).then_some((sx + dx, sy + dy))
+    }
+
     pub fn wheel(&mut self, w: WindowId, x: f32, y: f32, dx: f32, dy: f32, m: &mut dyn Measure) {
+        if !self.dispatch_wheel(w, x, y, dx, dy, &[]) {
+            self.scroll_wheel(w, x, y, dx, dy, m);
+        }
+    }
+
+    /// Scroll the nearest scroll container that can move in this direction.
+    pub fn scroll_wheel(&mut self, w: WindowId, x: f32, y: f32, dx: f32, dy: f32, m: &mut dyn Measure) {
         let mut at = self.hit(w, x, y);
         while let Some(id) = at {
             if self.is_editor(id) && self.editor_wheel(id, dx, dy, m) {
                 return;
             }
-            if self.user_scrolls(id) {
-                let (sx, sy) = self.scroll.get(&id).copied().unwrap_or((0.0, 0.0));
-                // A box that scrolls only sideways (a strip of tabs) takes
-                // a plain wheel's turn as sideways.
-                let (mx, my) = self.scroll_range(w, id);
-                let (dx, dy) = if my == 0.0 && mx > 0.0 && dx == 0.0 { (dy, 0.0) } else { (dx, dy) };
-                if self.set_scroll(w, id, sx + dx, sy + dy) {
-                    return;
-                }
+            if self.user_scrolls(id)
+                && let Some((nx, ny)) = self.container_scroll_target(w, id, dx, dy)
+                && self.set_scroll(w, id, nx, ny)
+            {
+                return;
             }
             at = self.nodes.get(&id).and_then(|n| n.parent);
         }
@@ -1471,7 +1627,6 @@ impl Engine {
         self.events.push(Event::new("key", fields));
     }
 
-    /// The window changed size: lay it out again and tell Norn.
     /// The OS moved window w to (x, y) on screen (logical): tell Norn
     /// (coalesced), so apps can remember where their windows were.
     pub fn moved(&mut self, w: WindowId, x: f32, y: f32) {
@@ -1480,12 +1635,12 @@ impl Engine {
         self.events.push(Event::new("moved", vec![("window", me), ("position", Data::List(vec![Data::Num(x as f64), Data::Num(y as f64)]))]));
     }
 
+    /// The window changed size: lay it out again and tell Norn.
     pub fn resized(&mut self, w: WindowId, width: f32, height: f32, scale: f32) {
-        if let Some(win) = self.windows.get_mut(&w) {
-            win.size = (width, height);
-            win.layout_dirty = true;
-            win.damage.push(Rect { x: 0.0, y: 0.0, w: width, h: height });
-        }
+        let Some(win) = self.windows.get_mut(&w) else { return };
+        win.size = (width, height);
+        win.layout_dirty = true;
+        win.damage.push(Rect { x: 0.0, y: 0.0, w: width, h: height });
         self.events.retain(|e| !(e.kind == "resize" && e.get("window") == Some(&Data::Num(w as f64))));
         self.events.push(Event::new(
             "resize",

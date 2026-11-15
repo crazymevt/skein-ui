@@ -11,6 +11,7 @@ pub mod editor;
 pub mod field;
 pub mod ime;
 pub mod popup;
+pub mod raster;
 pub mod rich;
 pub mod style;
 pub mod text;

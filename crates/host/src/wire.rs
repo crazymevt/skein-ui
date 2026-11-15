@@ -224,7 +224,7 @@ impl<'a> Decoder<'a> {
                     .collect::<io::Result<_>>()?;
                 Data::Map(pairs)
             }
-            BYTES => Data::Bytes(self.blob()?.to_vec()),
+            BYTES => Data::Bytes(self.blob()?.to_vec().into()),
             _ => return Err(invalid("unsupported type in UI message")),
         })
     }

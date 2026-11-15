@@ -178,8 +178,17 @@ pub(crate) fn input(
                 ],
             ))
         }
-        Some("wheel") => e.wheel(w, num(xs, 2), num(xs, 3), num(xs, 4), num(xs, 5), text),
-        Some("resize") => e.resized(w, num(xs, 2), num(xs, 3), 1.0),
+        // [:wheel w x y dx dy modifiers?]
+        Some("wheel") => {
+            let (x, y, dx, dy) = (num(xs, 2), num(xs, 3), num(xs, 4), num(xs, 5));
+            let mods = modifiers(xs.get(6));
+            let mods: Vec<&str> = mods.iter().map(String::as_str).collect();
+            if !e.dispatch_wheel(w, x, y, dx, dy, &mods) {
+                e.scroll_wheel(w, x, y, dx, dy, text);
+            }
+        }
+        // [:resize w width height scale?]
+        Some("resize") => e.resized(w, num(xs, 2), num(xs, 3), xs.get(4).and_then(Data::as_num).unwrap_or(1.0) as f32),
         // The window moved on screen: [:move-window w x y].
         Some("move-window") => e.moved(w, num(xs, 2), num(xs, 3)),
         // A menu command, as if chosen from the menu bar: [:command :save].

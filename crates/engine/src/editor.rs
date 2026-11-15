@@ -246,16 +246,20 @@ impl Engine {
 
     /// The wheel over an editor scrolls it (no layout, no Norn): true if
     /// it moved.
-    pub(crate) fn editor_wheel(&mut self, id: NodeId, dx: f32, dy: f32, m: &mut dyn Measure) -> bool {
+    /// Where editor id would scroll to for a wheel of (dx, dy), if it moves.
+    pub(crate) fn editor_scroll_target(&self, id: NodeId, dx: f32, dy: f32) -> Option<(f32, f32)> {
         let h = self.rect(id).map_or(0.0, |r| r.h);
         let max_x = self.editor_max_x(id);
-        let e = self.editors.get_mut(&id).unwrap();
+        let e = self.editors.get(&id)?;
         let max = (e.line_count as f32 * e.line_h - h + e.line_h * 2.0).max(0.0);
         let y = (e.scroll_y + dy).clamp(0.0, max);
         let x = (e.scroll_x + dx).clamp(0.0, max_x.max(e.scroll_x));
-        if y == e.scroll_y && x == e.scroll_x {
-            return false;
-        }
+        (y != e.scroll_y || x != e.scroll_x).then_some((x, y))
+    }
+
+    pub(crate) fn editor_wheel(&mut self, id: NodeId, dx: f32, dy: f32, m: &mut dyn Measure) -> bool {
+        let Some((x, y)) = self.editor_scroll_target(id, dx, dy) else { return false };
+        let e = self.editors.get_mut(&id).unwrap();
         e.scroll_y = y;
         e.scroll_x = x;
         self.damage_editor(id);

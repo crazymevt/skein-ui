@@ -1,7 +1,6 @@
 //! The norn-ui painter (plan 2.4): draws a window's node tree with wgpu.
 //!
-//! - **Two pipelines:** boxes (filled, rounded, bordered: an SDF in the
-//!   fragment shader) and glyphs (an alpha atlas filled by swash).
+//! - **Paint pipelines:** boxes, glyphs, triangles and RGBA pixel buffers.
 //! - **Damage-only:** each window has a persistent canvas texture; a frame
 //!   repaints only inside the engine's damage rectangles (scissored), and
 //!   backends copy the canvas to the screen. An idle window costs nothing.
@@ -15,9 +14,10 @@ mod canvas;
 mod display;
 
 use atlas::{Atlas, GlyphKey};
-pub use display::{Item, display_list};
+pub use display::{Item, PixelSampling, display_list};
 use norn_ui_engine::{Engine, Rect, Text, WindowId};
 use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 
 const SHADER: &str = r#"
 struct Globals { size: vec2<f32>, _pad: vec2<f32> };
@@ -124,6 +124,39 @@ struct TriOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32>
 @fragment fn tri_fs(o: TriOut) -> @location(0) vec4<f32> {
     return vec4<f32>(o.color.rgb * o.color.a, o.color.a);
 }
+
+// The pixel pipeline binds an RGBA texture at the same slot as the glyph atlas.
+struct PixelOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex fn pixels_vs(@builtin(vertex_index) vi: u32, @location(0) rect: vec4<f32>) -> PixelOut {
+    let uv = corner(vi);
+    return PixelOut(to_clip(rect.xy + uv * rect.zw), uv);
+}
+
+fn premultiply(c: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(c.rgb * c.a, c.a);
+}
+
+@fragment fn pixels_fs(o: PixelOut) -> @location(0) vec4<f32> {
+    return premultiply(textureSample(atlas, atlas_sampler, o.uv));
+}
+
+// Weight each texel by alpha before interpolation so transparent pixels
+// cannot tint their neighbors. The shared texture holds straight RGBA8.
+fn load_pixel(at: vec2<i32>, last: vec2<i32>) -> vec4<f32> {
+    return premultiply(textureLoad(atlas, clamp(at, vec2<i32>(0), last), 0));
+}
+
+@fragment fn linear_pixels_fs(o: PixelOut) -> @location(0) vec4<f32> {
+    let size = vec2<i32>(textureDimensions(atlas));
+    let p = o.uv * vec2<f32>(size) - vec2<f32>(0.5);
+    let at = vec2<i32>(floor(p));
+    let f = fract(p);
+    let last = size - vec2<i32>(1);
+    let top = mix(load_pixel(at, last), load_pixel(at + vec2<i32>(1, 0), last), f.x);
+    let bottom = mix(load_pixel(at + vec2<i32>(0, 1), last), load_pixel(at + vec2<i32>(1, 1), last), f.x);
+    return mix(top, bottom, f.y);
+}
 "#;
 
 #[repr(C)]
@@ -139,6 +172,7 @@ enum Kind {
     Boxes,
     Glyphs,
     Tris,
+    Pixels(PixelSampling),
 }
 
 #[repr(C)]
@@ -190,12 +224,25 @@ struct Canvas {
     height: u32,
 }
 
+type PixelKey = (usize, [u32; 2]);
+
+struct PixelTexture {
+    // Keeps the cache key unique without retaining a discarded pixel buffer.
+    source: Weak<Vec<u8>>,
+    bind_group: wgpu::BindGroup,
+}
+
 pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     box_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
     tri_pipeline: wgpu::RenderPipeline,
+    pixel_pipeline: wgpu::RenderPipeline,
+    linear_pixel_pipeline: wgpu::RenderPipeline,
+    pixel_sampler: wgpu::Sampler,
+    pixel_textures: HashMap<PixelKey, PixelTexture>,
+    paint_layout: wgpu::BindGroupLayout,
     globals: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     atlas: Atlas,
@@ -337,12 +384,25 @@ impl Renderer {
             std::mem::size_of::<TriVertex>(),
             wgpu::VertexStepMode::Vertex,
         );
+        let pixel_pipeline = pipeline("pixels_vs", "pixels_fs", &wgpu::vertex_attr_array![0 => Float32x4], 16, wgpu::VertexStepMode::Instance);
+        let linear_pixel_pipeline = pipeline("pixels_vs", "linear_pixels_fs", &wgpu::vertex_attr_array![0 => Float32x4], 16, wgpu::VertexStepMode::Instance);
+        let pixel_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("canvas pixel sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
         Ok(Renderer {
             device,
             queue,
             box_pipeline,
             glyph_pipeline,
             tri_pipeline,
+            pixel_pipeline,
+            linear_pixel_pipeline,
+            pixel_sampler,
+            pixel_textures: HashMap::new(),
+            paint_layout: layout,
             globals,
             bind_group,
             atlas,
@@ -351,6 +411,46 @@ impl Renderer {
             blits: HashMap::new(),
             blit_sampler: None,
         })
+    }
+
+    fn upload_pixels(&mut self, size: [u32; 2], rgba: &Arc<Vec<u8>>) -> Option<PixelKey> {
+        let [width, height] = size;
+        let max = self.device.limits().max_texture_dimension_2d;
+        if width > max || height > max {
+            return None;
+        }
+        let key = (Arc::as_ptr(rgba) as usize, size);
+        self.pixel_textures.entry(key).or_insert_with(|| {
+            let extent = wgpu::Extent3d { width, height, depth_or_array_layers: 1 };
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("canvas pixels"),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                texture.as_image_copy(),
+                rgba,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * width), rows_per_image: Some(height) },
+                extent,
+            );
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("canvas pixels"),
+                layout: &self.paint_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.globals.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.pixel_sampler) },
+                ],
+            });
+            PixelTexture { source: Arc::downgrade(rgba), bind_group }
+        });
+        Some(key)
     }
 
     fn ensure_canvas(&mut self, w: WindowId, width: u32, height: u32) -> bool {
@@ -394,15 +494,18 @@ impl Renderer {
         let mut boxes: Vec<BoxInstance> = Vec::new();
         let mut glyphs: Vec<GlyphInstance> = Vec::new();
         let mut tris: Vec<TriVertex> = Vec::new();
+        let mut pixel_rects: Vec<[f32; 4]> = Vec::new();
+        let mut pixel_keys = Vec::new();
+        self.pixel_textures.retain(|_, tex| tex.source.strong_count() > 0);
         // Runs of one kind and clip, in paint order: (kind, start, end, clip).
         let mut segments: Vec<(Kind, u32, u32, Rect)> = Vec::new();
-        fn push_seg(segments: &mut Vec<(Kind, u32, u32, Rect)>, glyph: Kind, start: usize, end: usize, clip: Rect) {
+        fn push_seg(segments: &mut Vec<(Kind, u32, u32, Rect)>, kind: Kind, start: usize, end: usize, clip: Rect) {
             if start == end {
                 return;
             }
             match segments.last_mut() {
-                Some(s) if s.0 == glyph && s.2 as usize == start && s.3 == clip => s.2 = end as u32,
-                _ => segments.push((glyph, start as u32, end as u32, clip)),
+                Some(s) if s.0 == kind && s.2 as usize == start && s.3 == clip => s.2 = end as u32,
+                _ => segments.push((kind, start as u32, end as u32, clip)),
             }
         }
         for item in &items {
@@ -456,6 +559,13 @@ impl Renderer {
                     tris.extend(verts.iter().map(|v| TriVertex { pos: [v[0] * scale, v[1] * scale], color: c }));
                     push_seg(&mut segments, Kind::Tris, start, tris.len(), *clip);
                 }
+                Item::Pixels { rect, size, rgba, sampling, clip } => {
+                    let Some(key) = self.upload_pixels(*size, rgba) else { continue };
+                    let start = pixel_rects.len();
+                    pixel_rects.push([rect.x * scale, rect.y * scale, rect.w * scale, rect.h * scale]);
+                    pixel_keys.push(key);
+                    push_seg(&mut segments, Kind::Pixels(*sampling), start, pixel_rects.len(), *clip);
+                }
             }
         }
 
@@ -471,6 +581,7 @@ impl Renderer {
         let box_buf = make(bytemuck::cast_slice(&boxes), "boxes");
         let glyph_buf = make(bytemuck::cast_slice(&glyphs), "glyphs");
         let tri_buf = make(bytemuck::cast_slice(&tris), "triangles");
+        let pixel_buf = (!pixel_rects.is_empty()).then(|| make(bytemuck::cast_slice(&pixel_rects), "pixel rectangles"));
         let canvas = &self.canvases[&w];
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         {
@@ -514,6 +625,18 @@ impl Renderer {
                             pass.set_pipeline(&self.tri_pipeline);
                             pass.set_vertex_buffer(0, tri_buf.slice(..));
                             pass.draw(start..end, 0..1);
+                        }
+                        Kind::Pixels(sampling) => {
+                            pass.set_pipeline(match sampling {
+                                PixelSampling::Nearest => &self.pixel_pipeline,
+                                PixelSampling::Linear => &self.linear_pixel_pipeline,
+                            });
+                            pass.set_vertex_buffer(0, pixel_buf.as_ref().unwrap().slice(..));
+                            for i in start..end {
+                                pass.set_bind_group(0, &self.pixel_textures[&pixel_keys[i as usize]].bind_group, &[]);
+                                pass.draw(0..6, i..i + 1);
+                            }
+                            pass.set_bind_group(0, &self.bind_group, &[]);
                         }
                     }
                 }

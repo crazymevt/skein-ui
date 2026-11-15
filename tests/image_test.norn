@@ -1,0 +1,47 @@
+(ns image-test
+  (:require [norn.test :refer [is deftest]] [norn.ui :as ui]))
+
+(defn- ppm [width height]
+  (bytes-concat (bytes (str "P6\n" width " " height "\n255\n"))
+                (bytes (take (* 3 width height) (cycle [40 100 170])))))
+
+(deftest decode-pixels-from-a-path-and-byte-string
+  (let [{:keys [size rgba]} (ui/decode-image "crates/render/tests/golden/scene@2x.png")]
+    (is (= [480 240] size))
+    (is (bytes? rgba))
+    (is (= (* 480 240 4) (count rgba))))
+  (is (= {:size [2 1] :rgba (bytes [40 100 170 255 40 100 170 255])}
+         (ui/decode-image (ppm 2 1))))
+  (is (try (ui/decode-image (bytes "not an image"))
+           false
+           (catch Error _ true))))
+
+(deftest image-layout-follows-source
+  (let [state (atom (ppm 3 2))
+        win (ui/window {:size [100 100]}
+                       (fn [src]
+                         [:column {:align-items :start}
+                          [:image {:id :natural :src src}]
+                          [:image {:id :scaled :src src :width 12}]])
+                       state)
+        size (fn [id] (let [{:keys [w h]} (ui/node-rect win (ui/node-of win id))] [w h]))]
+    (try
+      (is (= [3 2] (size :natural)))
+      (is (= [12 8] (size :scaled)))
+      (reset! state (ppm 2 4))
+      (ui/refresh!)
+      (is (= [2 4] (size :natural)))
+      (is (= [12 24] (size :scaled)))
+      (reset! state nil)
+      (ui/refresh!)
+      (is (= [0 0] (size :natural)))
+      (finally (ui/close-window win)))))
+
+(deftest decode-at-requested-size
+  (let [src (bytes-concat (bytes "P6\n2 1\n255\n") (bytes [255 0 0 0 0 255]))]
+    (is (= {:size [3 1] :rgba (bytes [255 0 0 255 128 0 128 255 0 0 255 255])}
+           (ui/decode-image src {:size [3 1]})))
+    (doseq [size [[0 1] [2 1.5] [8193 1] [8192 8192] [2]]]
+      (is (try (ui/decode-image src {:size size})
+               false
+               (catch Error _ true))))))

@@ -1,0 +1,46 @@
+(ns canvas-test
+  (:require [norn.test :refer [is deftest]] [norn.ui :as ui]))
+
+(deftest wheel-target-and-default-scroll
+  (let [wheel (atom [])
+        scroll (atom nil)
+        w (ui/window {:size [200 100]}
+                     (fn [_]
+                       [:scroll {:on-scroll (fn [e] (reset! scroll (:y e)))}
+                        [:canvas {:id :plot :margin [0 0 0 20] :height 40 :flex-shrink 0
+                                  :commands [[:pixels [0 0 40 40] [1 1] (bytes [0 127 255 255])]]
+                                  :on-wheel (fn [e] (swap! wheel conj e))}]
+                        [:box {:height 200 :flex-shrink 0}]])
+                     (atom nil))]
+    (try
+      (ui/simulate! [:wheel w 35 22 3 -48 #{:shift}])
+      (ui/simulate! [:wheel w 36 23 0 20])
+      (ui/stats)
+      (is (= 2 (count @wheel)))
+      (is (= {:event :wheel :window w :node (ui/node-of w :plot)
+              :x 15 :y 22 :dx 3 :dy -48 :modifiers #{:shift}}
+             (first @wheel)))
+      (is (nil? @scroll))
+      (ui/simulate! [:wheel w 35 60 0 24])
+      (ui/stats)
+      (is (= 24 @scroll))
+      (is (= 2 (count @wheel)))
+      (finally (ui/close-window w)))))
+
+(deftest window-resize-updates-size-before-callback
+  (let [received (atom nil)
+        state (atom [200 100])
+        w (ui/window {:size @state
+                      :on-resize (fn [{:keys [window size] :as event}]
+                                   (reset! received [event (ui/window-size window)])
+                                   (reset! state size))}
+                     (fn [[width height]] [:box [:canvas {:id :plot :width width :height height}]])
+                     state)]
+    (try
+      (ui/simulate! [:resize w 340 220 2])
+      (ui/stats)
+      (is (= [{:event :resize :window w :size [340 220] :scale 2} [340 220]] @received))
+      (ui/refresh!)
+      (let [{:keys [w h]} (ui/node-rect w (ui/node-of w :plot))]
+        (is (= [340 220] [w h])))
+      (finally (ui/close-window w)))))

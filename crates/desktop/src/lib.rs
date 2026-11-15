@@ -622,7 +622,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> ApplicationHandler
         // The batch of events is in: scroll by what the wheel summed to,
         // then draw once.
         for (w, (x, y, dx, dy)) in std::mem::take(&mut self.wheel) {
-            self.engine.wheel(w, x, y, dx, dy, &mut self.text);
+            self.engine.scroll_wheel(w, x, y, dx, dy, &mut self.text);
         }
         // Gliding: each frame takes a share of what is left, more the
         // longer since the last (an ease-out over about 150 ms).
@@ -637,7 +637,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> ApplicationHandler
             g.dx -= sx;
             g.dy -= sy;
             g.at = now;
-            self.engine.wheel(*w, g.x, g.y, sx, sy, &mut self.text);
+            self.engine.scroll_wheel(*w, g.x, g.y, sx, sy, &mut self.text);
             self.needs_step = true;
         }
         self.glide.retain(|_, g| g.dx != 0.0 || g.dy != 0.0);
@@ -779,6 +779,13 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
                     winit::event::MouseScrollDelta::LineDelta(lx, ly) => (-lx * 48.0, -ly * 48.0, true),
                     winit::event::MouseScrollDelta::PixelDelta(p) => (-p.x as f32 / scale, -p.y as f32 / scale, false),
                 };
+                // Deliver application input at its original pointer position,
+                // before the smoothing used for default scrolling.
+                let mods = self.mods();
+                if self.engine.dispatch_wheel(w, x, y, dx, dy, &mods) {
+                    self.needs_step = true;
+                    return;
+                }
                 // A big step (a wheel's click, a line) glides there rather
                 // than jumping; a trackpad's small ones are already smooth.
                 if line || dx.abs().max(dy.abs()) > GLIDE_OVER {

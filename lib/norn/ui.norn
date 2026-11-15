@@ -152,6 +152,8 @@
         text? (= kind :text)
         rich? (= kind :rich-text)
         split (if (= kind :icon) (update split :props icon-props) split)
+        src (get-in split [:props :src])
+        split (if (and (= kind :image) (string? src)) (assoc-in split [:props :src] (io/absolute src)) split)
         ;; an editor's model and highlighter stay in Norn; its events are
         ;; wired to them
         ed (when (= kind :editor) (select-keys (:props split) [:model :highlight]))
@@ -475,10 +477,12 @@
           ;; (only for a window still open: a popup can hear its size
           ;; after it closed, and that mustn't bring back half an entry)
           (= kind :resize) (do (swap! (:windows a) update-open (:window e) assoc-in [:props :size] (:size e))
-                               (remember-window! w (:window e)))
+                               (when-let [open (get @(:windows a) (:window e))]
+                                 (remember-window! open (:window e))
+                                 (when-let [on-resize (:on-resize open)] (on-resize e))))
           (= kind :moved) (do (swap! (:windows a) update-open (:window e) assoc-in [:props :position] (:position e))
                               (remember-window! w (:window e)))
-          (contains? #{:stats :screenshot :dialog :clipboard :rect} kind)
+          (contains? #{:stats :screenshot :dialog :clipboard :rect :image-decoded} kind)
           (when-let [ch (get @(:pending a) (or (:req e) (:path e)))]
             (swap! (:pending a) dissoc (or (:req e) (:path e)))
             (put! ch e))
@@ -501,8 +505,10 @@
 (defn window
   "Open a window showing (view @state): props are :title, :size [w h],
   :position [x y] (on screen), :min-size, :resizable, plus :on-close,
-  :on-key and :on-drop handlers (:on-drop gets files dropped where no
-  element's :on-drop takes them). :remember [app key] restores the size
+  :on-key, :on-resize and :on-drop handlers. :on-resize receives an event
+  with :window, :size [w h] in logical pixels, and :scale, after
+  window-size has been updated. :on-drop gets files dropped where no
+  element's :on-drop takes them. :remember [app key] restores the size
   and position the window last had (see remember!) and saves them as
   they change. view is a function or a var (redefining a var's function
   re-renders). The window re-renders whenever state changes. Returns the
@@ -510,7 +516,7 @@
   [props view state]
   (let [a (the-app)
         wid (swap! window-ids inc)
-        handlers (select-keys props [:on-close :on-key :on-drop :on-dismiss :remember])
+        handlers (select-keys props [:on-close :on-key :on-resize :on-drop :on-dismiss :remember])
         props (apply dissoc props (keys handlers))
         props (if-let [[app k] (:remember handlers)] (merge props (recall app [:window k] {})) props)]
     (swap! (:windows a) assoc wid (merge handlers {:props props :view view :state state :tree nil}))
@@ -592,6 +598,22 @@
   []
   (let [r (swap! req-ids inc)]
     (ask r (fn [a] (native/apply! (engine-of a) [[:stats r]])))))
+
+(defn decode-image
+  "Decode a local path or encoded bytes to {:size [width height] :rgba bytes}.
+  The pixels are tightly packed, top to bottom, with straight alpha (RGBA8).
+  Pass {:size [width height]} to resample smoothly to those exact dimensions.
+  Supports PNG, JPEG, BMP, TIFF, ICO and Netpbm. Raises an error if decoding fails."
+  ([source] (decode-image source {}))
+  ([source {:keys [size]}]
+   (when-not (or (string? source) (bytes? source))
+     (error "Expected a path or encoded image bytes"))
+   (let [r (swap! req-ids inc)
+         src (if (string? source) (io/absolute source) source)
+         answer (ask r (fn [a] (native/apply! (engine-of a) [[:decode-image r src size]])))]
+     (cond (nil? answer) (error "Image decode timed out")
+           (:error answer) (error "Could not decode image:" (:error answer))
+           :else (select-keys answer [:size :rgba])))))
 
 (defn simulate!
   "Scripted input for the headless backend (see crates/host/src/backend.rs), e.g.
@@ -1086,12 +1108,12 @@
 (defmethod paint ((w Widget) size) [])
 
 (defgeneric widget-events (w)
-  "The event kinds widget w handles with on-event, e.g. #{:click :drag}.")
+  "The event kinds widget w handles with on-event, e.g. #{:click :drag :wheel}.")
 (defmethod widget-events ((w Widget)) #{})
 
 (defgeneric on-event (w e)
-  "Handle event e for widget w. A click's :x and :y are in the widget's
-  coordinates.")
+  "Handle event e for widget w. Click and wheel :x and :y are in the
+  widget's coordinates.")
 (defmethod on-event ((w Widget) e) nil)
 
 (defn- widget-element [w]

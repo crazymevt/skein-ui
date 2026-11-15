@@ -3,6 +3,8 @@
 //! a carrier, so the engine itself never touches the Norn heap and can run
 //! on any thread (the main thread, for the macOS event loop).
 
+use std::sync::Arc;
+
 /// A Norn value, as far as the protocol needs one.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Data {
@@ -16,7 +18,8 @@ pub enum Data {
     /// A map, in the order given (keys are usually keywords).
     Map(Vec<(Data, Data)>),
     Set(Vec<Data>),
-    Bytes(Vec<u8>),
+    /// Immutable bytes shared by the node tree and paint items.
+    Bytes(Arc<Vec<u8>>),
 }
 
 impl Data {
@@ -81,6 +84,7 @@ pub enum Op {
     Theme(Data),
     Focus(NodeId),
     Stats(u64),
+    DecodeImage { req: u64, src: Data, size: Option<Data> },
     /// Editor-surface ops (protocol §6): line-count, lines, carets,
     /// decorations, reveal, invalidate.
     Editor { id: NodeId, op: String, args: Vec<Data> },

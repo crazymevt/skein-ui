@@ -2,8 +2,8 @@
 //! Set UPDATE_GOLDEN=1 to rewrite tests/golden/*.png after a deliberate
 //! change; review the new images before committing them.
 
-use norn_ui_engine::{Data, Engine, Op, Props, Text};
-use norn_ui_render::{Renderer, read_png, write_png};
+use norn_ui_engine::{Data, Engine, Op, Props, Rect, Text};
+use norn_ui_render::{Item, PixelSampling, Renderer, display_list, read_png, write_png};
 
 fn p(kvs: &[(&str, Data)]) -> Props {
     kvs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
@@ -59,6 +59,117 @@ fn px(img: &(u32, u32, Vec<u8>), x: u32, y: u32) -> [u8; 4] {
 
 fn near(a: [u8; 4], b: [u8; 4]) -> bool {
     a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 2)
+}
+
+#[test]
+fn canvas_pixels_scale_clip_blend_and_update() {
+    let rect = |x, y, w, h| Data::List(vec![n(x), n(y), n(w), n(h)]);
+    let pixels = |rgba: Vec<u8>| {
+        Data::List(vec![k("pixels"), rect(0.0, 0.0, 8.0, 8.0), Data::List(vec![n(2.0), n(2.0)]), Data::Bytes(rgba.into())])
+    };
+    let commands = |rgba| {
+        let translated = Data::List(vec![k("translate"), Data::List(vec![n(2.0), n(2.0)]), Data::List(vec![pixels(rgba)])]);
+        Data::List(vec![
+            Data::List(vec![k("clip"), rect(3.0, 2.0, 6.0, 8.0), Data::List(vec![translated])]),
+            // A malformed upload is ignored and later drawing stays on top.
+            pixels(vec![0, 0, 0, 255]),
+            Data::List(vec![k("rect"), rect(4.0, 3.0, 2.0, 2.0), Data::Map(vec![(k("fill"), s("#000000"))])]),
+        ])
+    };
+    let source = [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 128, 0, 0, 0, 0];
+    let mut e = Engine::new();
+    assert!(e.apply(vec![
+        Op::Create { id: 1, kind: "canvas".into(), props: p(&[("commands", commands(source.to_vec()))]) },
+        Op::Window { id: 1, props: p(&[("root", n(1.0)), ("size", Data::List(vec![n(12.0), n(12.0)])), ("background", s("#ffffff"))]) },
+    ]));
+    let mut t = Text::new();
+    let damage = e.frame(1, &mut t);
+    let items = display_list(&e, 1, &mut t, &damage);
+    let [Item::Box { .. }, Item::Pixels { rect, size, rgba, sampling, clip }, Item::Box { .. }] = items.as_slice() else {
+        panic!("expected one valid pixel upload between the two boxes");
+    };
+    assert_eq!(*rect, Rect { x: 2.0, y: 2.0, w: 8.0, h: 8.0 });
+    assert_eq!(*clip, Rect { x: 3.0, y: 2.0, w: 6.0, h: 8.0 });
+    assert_eq!(*size, [2, 2]);
+    assert_eq!(rgba.as_slice(), source);
+    assert_eq!(*sampling, PixelSampling::Nearest);
+
+    let Ok(mut r) = Renderer::headless() else {
+        eprintln!("no GPU adapter: skipping pixel readback");
+        return;
+    };
+    r.render(&e, 1, &mut t, &damage, 2.0);
+    let img = r.pixels(1).unwrap();
+    assert_eq!(px(&img, 2, 2), [255, 255, 255, 255]);
+    assert_eq!(px(&img, 5, 5), [255, 255, 255, 255]);
+    assert_eq!(px(&img, 6, 5), [255, 0, 0, 255]);
+    assert_eq!(px(&img, 9, 8), [0, 0, 0, 255]);
+    assert_eq!(px(&img, 12, 5), [0, 255, 0, 255]);
+    assert_eq!(px(&img, 18, 5), [255, 255, 255, 255]);
+    assert!(near(px(&img, 7, 15), [127, 127, 255, 255]));
+    assert_eq!(px(&img, 14, 15), [255, 255, 255, 255]);
+
+    assert!(e.apply(vec![Op::Set { id: 1, props: p(&[("commands", commands([255, 255, 0, 255].repeat(4)))]) }]));
+    let damage = e.frame(1, &mut t);
+    r.render(&e, 1, &mut t, &damage, 2.0);
+    assert_eq!(px(&r.pixels(1).unwrap(), 7, 5), [255, 255, 0, 255]);
+}
+
+#[test]
+fn image_fit_places_and_clips_the_decoded_pixels() {
+    let mut e = Engine::new();
+    let src = Data::Bytes(b"P6\n2 1\n255\n\xff\x00\x00\x00\x00\xff".to_vec().into());
+    assert!(e.apply(vec![
+        Op::Create { id: 1, kind: "image".into(), props: p(&[("src", src)]) },
+        Op::Window { id: 1, props: p(&[("root", n(1.0)), ("size", Data::List(vec![n(20.0), n(20.0)]))]) },
+    ]));
+    let box_rect = Rect { x: 0.0, y: 0.0, w: 20.0, h: 20.0 };
+    let mut t = Text::new();
+    for (fit, expected) in [
+        ("contain", Rect { y: 5.0, h: 10.0, ..box_rect }),
+        ("cover", Rect { x: -10.0, w: 40.0, ..box_rect }),
+        ("fill", box_rect),
+    ] {
+        assert!(e.apply(vec![Op::Set { id: 1, props: p(&[("fit", k(fit))]) }]));
+        let damage = e.frame(1, &mut t);
+        let items = display_list(&e, 1, &mut t, &damage);
+        let [Item::Box { .. }, Item::Pixels { rect, size, rgba, sampling, clip }] = items.as_slice() else {
+            panic!("expected one image above the background");
+        };
+        assert_eq!(*rect, expected);
+        assert_eq!(*clip, box_rect);
+        assert_eq!(*size, [2, 1]);
+        assert_eq!(rgba.as_slice(), [255, 0, 0, 255, 0, 0, 255, 255]);
+        assert_eq!(*sampling, PixelSampling::Linear);
+    }
+}
+
+#[test]
+fn image_sampling_blends_without_transparent_color_bleed() {
+    let mut e = Engine::new();
+    let src = b"P7\nWIDTH 2\nHEIGHT 1\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n\xff\x00\x00\xff\x00\x00\xff\x00";
+    assert!(e.apply(vec![
+        Op::Create { id: 1, kind: "image".into(), props: p(&[("src", Data::Bytes(src.to_vec().into())), ("fit", k("fill"))]) },
+        Op::Window { id: 1, props: p(&[("root", n(1.0)), ("size", Data::List(vec![n(15.0), n(3.0)])), ("background", s("#ffffff"))]) },
+    ]));
+    let mut t = Text::new();
+    let damage = e.frame(1, &mut t);
+    assert_eq!(e.nodes[&1].raster.as_ref().unwrap().rgba.as_slice(), [255, 0, 0, 255, 0, 0, 255, 0]);
+
+    let Ok(mut r) = Renderer::headless() else {
+        eprintln!("no GPU adapter: skipping pixel readback");
+        return;
+    };
+    r.render(&e, 1, &mut t, &damage, 1.0);
+    let smooth = r.pixels(1).unwrap();
+    assert_eq!(px(&smooth, 0, 1), [255, 0, 0, 255]);
+    assert!(near(px(&smooth, 7, 1), [255, 128, 128, 255]));
+    assert_eq!(px(&smooth, 14, 1), [255, 255, 255, 255]);
+
+    assert!(e.apply(vec![Op::Set { id: 1, props: p(&[("sampling", k("nearest"))]) }]));
+    let damage = e.frame(1, &mut t);
+    r.render(&e, 1, &mut t, &damage, 1.0);
+    assert_eq!(px(&r.pixels(1).unwrap(), 6, 1), [255, 0, 0, 255]);
 }
 
 #[test]

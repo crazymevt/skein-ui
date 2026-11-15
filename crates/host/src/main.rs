@@ -6,17 +6,20 @@ mod backend;
 mod patch;
 mod wire;
 
+use norn_ui_engine::raster::{DecodeRequest, RasterImage};
 use norn_ui_engine::{Data, Engine, Event, Op, Text};
 use norn_ui_render::Renderer;
 use std::collections::VecDeque;
 use std::io::{self, BufReader};
-use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
+use std::sync::{Condvar, LazyLock, Mutex, OnceLock, mpsc};
 use std::thread;
 
 enum Cmd {
     Batch(Vec<Op>),
     Input(Vec<Data>),
     Invalid(String),
+    /// An image decoded on the decode pool.
+    Decoded(DecodeRequest, Result<RasterImage, String>),
 }
 
 struct Shared {
@@ -40,6 +43,45 @@ fn execute(cmd: Cmd, engine: &mut Engine, text: &mut Text, painter: &mut Option<
         Cmd::Invalid(message) => {
             engine.push_event(Event::new("error", vec![("message", Data::Str(message))]))
         }
+        Cmd::Decoded(request, result) => engine.decoded(request, result),
+    }
+}
+
+fn push_command(cmd: Cmd) {
+    SHARED.queue.lock().unwrap().push_back(cmd);
+    SHARED.wake.notify_one();
+    if let Some(wake) = WAKER.get() {
+        wake();
+    }
+}
+
+/// The desktop backend decodes images on a few threads of their own, so a
+/// large image doesn't stall the window's event loop. Results come back as
+/// commands, applied like any other.
+fn decode_off_thread(requests: Vec<DecodeRequest>) {
+    static POOL: OnceLock<Mutex<mpsc::Sender<DecodeRequest>>> = OnceLock::new();
+    if requests.is_empty() {
+        return;
+    }
+    let pool = POOL.get_or_init(|| {
+        let (send, receive) = mpsc::channel::<DecodeRequest>();
+        let receive = std::sync::Arc::new(Mutex::new(receive));
+        let threads = thread::available_parallelism().map_or(2, |n| n.get().clamp(1, 4));
+        for i in 0..threads {
+            let receive = receive.clone();
+            let _ = thread::Builder::new().name(format!("norn-ui-decode-{i}")).spawn(move || {
+                loop {
+                    let Ok(request) = receive.lock().unwrap().recv() else { return };
+                    let result = request.decode();
+                    push_command(Cmd::Decoded(request, result));
+                }
+            });
+        }
+        Mutex::new(send)
+    });
+    let send = pool.lock().unwrap();
+    for request in requests {
+        let _ = send.send(request);
     }
 }
 
@@ -97,11 +139,7 @@ fn read_requests() {
                     .map_err(|e| e.to_string())
                     .and_then(parse)
                     .unwrap_or_else(Cmd::Invalid);
-                SHARED.queue.lock().unwrap().push_back(cmd);
-                SHARED.wake.notify_one();
-                if let Some(wake) = WAKER.get() {
-                    wake();
-                }
+                push_command(cmd);
             }
             // The app exited and closed its pipe. This also works during
             // a dialog, when the main event loop may be in a modal call.
@@ -138,11 +176,13 @@ fn main() {
             ready();
         },
         |engine, text| {
+            engine.set_async_decode(true);
             let commands: Vec<Cmd> = SHARED.queue.lock().unwrap().drain(..).collect();
             let mut no_painter = None;
             for cmd in commands {
                 execute(cmd, engine, text, &mut no_painter);
             }
+            decode_off_thread(engine.take_decode_requests());
         },
         deliver,
         || send(&Data::List(vec![Data::key("quit")])),

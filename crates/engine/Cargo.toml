@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 taffy.workspace = true
 parley.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["bmp", "ico", "jpeg", "png", "pnm", "tiff"] }

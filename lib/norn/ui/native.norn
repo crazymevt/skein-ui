@@ -22,12 +22,12 @@
              package-root "or set NORN_UI_HOST.")))
 
 (defn- read-exact [stream size]
-  (loop [b (bytes [])]
-    (if (= size (count b))
-      b
-      (if-let [part (io/read stream (- size (count b)))]
-        (recur (bytes-concat b part))
-        (when (pos? (count b)) (error "norn-ui: truncated renderer message"))))))
+  (loop [remaining size parts (transient [])]
+    (if (zero? remaining)
+      (apply bytes-concat (persistent! parts))
+      (if-let [part (io/read stream (min remaining 65536))]
+        (recur (- remaining (count part)) (conj! parts part))
+        (when (< remaining size) (error "norn-ui: truncated renderer message"))))))
 
 (defn- receive [stream]
   (when-let [header (read-exact stream 4)]

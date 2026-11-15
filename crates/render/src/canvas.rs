@@ -8,10 +8,12 @@
 //!   [:polyline [[x y] …] stroke]  [:path "M0 0 L10 10 Z" paint]
 //!   [:text [x y] "…" style]       [:clip [x y w h] [cmds…]]
 //!   [:translate [dx dy] [cmds…]]
+//!   [:pixels [x y w h] [pixel-width pixel-height] rgba8-bytes {:sampling :linear}]
 //!
 //! A paint is `{:fill color :stroke color :width n}` (either or both).
+//! The pixels options map is optional.
 
-use crate::display::Item;
+use crate::display::{Item, PixelSampling};
 use lyon::math::point;
 use lyon::path::Path;
 use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, StrokeOptions, StrokeTessellator, StrokeVertex, VertexBuffers};
@@ -36,6 +38,25 @@ fn pt(d: Option<&Data>) -> (f32, f32) {
 fn rect4(d: Option<&Data>) -> Rect {
     let xs = d.and_then(Data::as_list).unwrap_or(&[]);
     Rect { x: n(xs.first()), y: n(xs.get(1)), w: n(xs.get(2)), h: n(xs.get(3)) }
+}
+
+fn pixel_dim(d: &Data) -> Option<u32> {
+    let v = d.as_num()?;
+    (v > 0.0 && v <= f64::from(u32::MAX) && v.fract() == 0.0).then_some(v as u32)
+}
+
+fn pixels(xs: &[Data], rect: Rect, clip: Rect) -> Option<Item> {
+    if ![rect.x, rect.y, rect.w, rect.h].iter().all(|n| n.is_finite()) || rect.intersect(&clip).is_empty() {
+        return None;
+    }
+    let [w, h] = xs.get(2)?.as_list()? else { return None };
+    let (w, h) = (pixel_dim(w)?, pixel_dim(h)?);
+    let Data::Bytes(rgba) = xs.get(3)? else { return None };
+    if (w as usize).checked_mul(h as usize)?.checked_mul(4)? != rgba.len() {
+        return None;
+    }
+    let sampling = PixelSampling::from_prop(xs.get(4).and_then(|opts| opts.get("sampling")), PixelSampling::Nearest);
+    Some(Item::Pixels { rect, size: [w, h], rgba: rgba.clone(), sampling, clip })
 }
 
 impl Ctx<'_> {
@@ -83,6 +104,7 @@ impl Ctx<'_> {
             let at = |r: Rect| Rect { x: r.x + dx, y: r.y + dy, ..r };
             match op {
                 "rect" => self.boxed(at(rect4(xs.get(1))), 0.0, xs.get(2), clip),
+                "pixels" => self.out.extend(pixels(xs, at(rect4(xs.get(1))), clip)),
                 "rounded-rect" => self.boxed(at(rect4(xs.get(1))), n(xs.get(2)), xs.get(3), clip),
                 "circle" => {
                     let ((cx, cy), r) = (pt(xs.get(1)), n(xs.get(2)));

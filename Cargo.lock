@@ -1489,6 +1489,8 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1929,6 +1931,7 @@ dependencies = [
 name = "norn-ui-engine"
 version = "0.2.0"
 dependencies = [
+ "image",
  "parley",
  "taffy",
 ]

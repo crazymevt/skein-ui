@@ -1,6 +1,6 @@
 # norn-ui
 
-This checkout, `norn-ui2`, provides the `norn-ui` Norn package and the
+This checkout provides the `norn-ui` Norn package and the
 `norn.ui` API from the original toolkit. Applications run on the stock
 `norn` executable. The toolkit provides the native renderer for every app
 that uses this checkout.
@@ -10,7 +10,7 @@ that uses this checkout.
 Point the existing dependency name at this checkout in the app's `norn.edn`.
 
 ```clojure
-:deps {norn-ui {:path "../norn-ui2"}}
+:deps {norn-ui {:path "../norn-ui"}}
 ```
 
 Keep using `(require '[norn.ui :as ui])` and the same window, widget and
@@ -20,10 +20,72 @@ event APIs. Run the app script with the current Norn release.
 ../norn-lang/target/release/norn app.norn
 ```
 
-For Mandelbrot, change the dependency path in `madelbrot/norn.edn` and use
+For Mandelbrot, change the dependency path in `mandelbrot/norn.edn` and use
 `../norn-lang/target/release/norn mandelbrot.norn` from the app directory.
 Its viewer already calls `ui/wait-closed` to keep the app alive until its
 windows close.
+
+## Images
+
+```clojure
+[:image {:src "photo.jpg" :width 320 :height 240 :fit :cover}]
+```
+
+`:src` accepts a local path or the encoded contents of an image as Norn
+bytes. PNG, JPEG, BMP, TIFF, ICO, and Netpbm (PBM, PGM, PPM, PAM) are
+supported. Images use their intrinsic size when no dimensions are set.
+With a specified box, `:contain` (the default) fits the whole image,
+`:cover` fills the box with a centered crop, and `:fill` stretches to fit.
+Images use smooth bilinear sampling by default. Set `:sampling :nearest`
+to preserve hard pixel edges.
+An invalid source draws an empty image. On the desktop, images decode on
+background threads, so a large image doesn't stall the window. An image takes
+its size once its pixels are ready, and a changed `:src` keeps showing the old
+image until then.
+
+Use `ui/decode-image` to work with the pixels directly. It accepts the
+same inputs, reports decode errors, and works in headless mode without a
+GPU. Encoded input and RGBA8 output are each capped at 64 MiB, with a
+maximum of 8192 pixels per axis. JPEG EXIF orientation is applied.
+Pass `{:size [width height]}` as a second argument to resample the
+decoded pixels to those exact dimensions, with the same output limits.
+
+```clojure
+(let [{:keys [size rgba]} (ui/decode-image "photo.jpg")]
+  [:canvas {:width 320 :height 240
+            :commands [[:pixels [0 0 320 240] size rgba {:sampling :linear}]]}])
+
+(ui/decode-image "photo.jpg" {:size [320 240]})
+```
+
+## Canvas pixels and input
+
+```clojure
+[:canvas {:width 120 :height 60
+          :commands [[:pixels [0 0 120 60] [2 1] (bytes [255 0 0 255 0 0 255 255])]]
+          :on-wheel (fn [{:keys [x y dx dy modifiers]}] …)}]
+```
+
+`:pixels` draws a buffer into `[x y width height]` in canvas coordinates.
+The source size is in pixels. Supply a Norn byte string with four bytes per
+pixel in RGBA order, tightly packed in rows from top to bottom. Colors use
+straight alpha. The command uses nearest-neighbor scaling by default.
+Pass `{:sampling :linear}` as the final argument for smooth bilinear scaling.
+The command respects canvas clipping, translation and paint order.
+Invalid buffers and dimensions above the GPU texture limit are skipped.
+
+`:on-wheel` receives the cursor position relative to the element, scroll
+deltas in logical pixels, and a modifier set. Positive deltas are right and
+down. Going up from the element under the pointer, the first of an enabled
+handler and a scroll container or editor that can still move that way takes
+the wheel. A scroll view inside an element with `:on-wheel` keeps scrolling,
+and the handler hears the wheel once the view reaches its end. Wheel events
+still waiting for Norn combine, so a fast trackpad scroll arrives as a few
+events with the summed deltas.
+
+Pass `:on-resize (fn [{:keys [window size scale]}] …)` in `ui/window` options.
+`size` is `[width height]` in logical pixels. `ui/window-size` already
+contains the new size when the callback runs.
 
 ## Renderer installation
 

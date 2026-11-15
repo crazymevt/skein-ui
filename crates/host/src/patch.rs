@@ -79,6 +79,11 @@ pub fn parse_op(d: &Data) -> Result<Op> {
         "theme" => Op::Theme(arg(1)?.clone()),
         "focus" => Op::Focus(id(arg(1)?, "a node")?),
         "stats" => Op::Stats(index(arg(1)?)? as u64),
+        "decode-image" => Op::DecodeImage {
+            req: id(arg(1)?, "a request")?,
+            src: arg(2)?.clone(),
+            size: xs.get(3).cloned(),
+        },
         "menu" | "context-menu" | "dialog" | "clipboard-set" | "clipboard-get" => Op::Platform {
             op: name.to_owned(),
             args: xs[1..].to_vec(),
