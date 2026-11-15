@@ -291,6 +291,8 @@ fn editor(
     let selection = named_color("selection", lookup).unwrap_or([200, 220, 255, 255]);
     let caret_color = named_color("caret", lookup).unwrap_or(ts.color);
     let focused = engine.focused == Some(id);
+    // :current-line false: no band behind the caret's line (a terminal)
+    let current_line = !style.iter().any(|(k, v)| k == "current-line" && matches!(v, Data::Bool(false)));
     let (first, last) = e.visible(r.h);
     // The text scrolls sideways under its own clip; the gutter stays.
     let text_x = r.x + e.gutter_w + 4.0 - e.scroll_x;
@@ -303,7 +305,7 @@ fn editor(
         if !touches(&row.intersect(&gclip), damage) {
             continue;
         }
-        if focused && e.carets.iter().any(|c| c.line == line && c.anchor.is_none()) {
+        if focused && current_line && e.carets.iter().any(|c| c.line == line && c.anchor.is_none()) {
             out.push(Item::Box { rect: Rect { x: r.x + e.gutter_w, y, w: r.w - e.gutter_w, h: e.line_h }, color: current, radius: 0.0, border: None, clip });
         }
         let Some(l) = e.lines.get(&line) else { continue };
@@ -334,8 +336,18 @@ fn editor(
             let nx = r.x + e.gutter_w - e.col_w - num_text.len() as f32 * e.col_w;
             out.push(Item::Text { x: nx, y: y + pad, runs: Text::glyph_runs(&nl), clip: gclip });
         }
+        // A span's style: a colour (a theme token or #rrggbb), then, after
+        // semicolons, bg=<colour>, u (underlined) and s (struck through).
+        let styles: Vec<(usize, usize, SpanStyle)> = l.spans.iter().map(|(a, b, k)| (*a, *b, span_style(k, lookup))).collect();
+        for (a, b, st) in &styles {
+            if let Some(bg) = st.bg {
+                let (xa, xb) = (col_x(text, &ts, e.col_w, &l.text, (*a).min(len)), col_x(text, &ts, e.col_w, &l.text, (*b).min(len)));
+                let xb = if *b > len { xb + (*b - len) as f32 * e.col_w } else { xb };
+                out.push(Item::Box { rect: Rect { x: text_x + xa, y, w: (xb - xa).max(0.0), h: e.line_h }, color: bg, radius: 0.0, border: None, clip });
+            }
+        }
         let mut spans: Vec<(usize, usize, norn_ui_engine::text::Rgba)> =
-            l.spans.iter().filter_map(|(a, b, k)| named_color(k, lookup).map(|c| (*a, *b, c))).collect();
+            styles.iter().filter_map(|(a, b, st)| st.fg.map(|c| (*a, *b, c))).collect();
         // An input method composing at the primary caret: its text goes in
         // the line, underlined, pushing the rest along.
         let primary = e.carets.last().filter(|c| c.line == line);
@@ -368,6 +380,17 @@ fn editor(
         };
         let layout = text.layout_spans(&line_text, &ts, &spans);
         out.push(Item::Text { x: text_x, y: y + pad, runs: Text::glyph_runs(&layout), clip });
+        for (a, b, st) in &styles {
+            if st.underline || st.strike {
+                let (xa, xb) = (col_x(text, &ts, e.col_w, &l.text, (*a).min(len)), col_x(text, &ts, e.col_w, &l.text, (*b).min(len)));
+                let color = st.fg.unwrap_or(ts.color);
+                for (on, dy) in [(st.underline, e.line_h - pad - 2.0), (st.strike, e.line_h / 2.0)] {
+                    if on {
+                        out.push(Item::Box { rect: Rect { x: text_x + xa, y: y + dy, w: (xb - xa).max(0.0), h: 1.0 }, color, radius: 0.0, border: None, clip });
+                    }
+                }
+            }
+        }
         for d in e.decorations.iter().filter(|d| d.line == line) {
             let c = named_color(&d.style, lookup).unwrap_or(match d.style.as_str() {
                 "warning" => [210, 150, 30, 255],
@@ -430,6 +453,33 @@ fn editor(
             out.push(Item::Box { rect: thumb, color: c, radius: 3.0, border: None, clip: gclip });
         }
     }
+}
+
+/// A span's style in an editor line.
+struct SpanStyle {
+    fg: Option<norn_ui_engine::text::Rgba>,
+    bg: Option<norn_ui_engine::text::Rgba>,
+    underline: bool,
+    strike: bool,
+}
+
+/// "keyword", "#ff8800", or "#ff8800;bg=#202020;u;s".
+fn span_style(k: &str, lookup: &dyn Fn(&Data) -> Data) -> SpanStyle {
+    let mut parts = k.split(';');
+    let fg = parts.next().filter(|p| !p.is_empty()).and_then(|p| named_color(p, lookup));
+    let mut st = SpanStyle { fg, bg: None, underline: false, strike: false };
+    for p in parts {
+        match p {
+            "u" => st.underline = true,
+            "s" => st.strike = true,
+            _ => {
+                if let Some(c) = p.strip_prefix("bg=") {
+                    st.bg = named_color(c, lookup);
+                }
+            }
+        }
+    }
+    st
 }
 
 /// The x of column c in one line of editor text: c cells for ASCII, else

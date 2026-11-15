@@ -87,6 +87,31 @@ Pass `:on-resize (fn [{:keys [window size scale]}] …)` in `ui/window` options.
 `size` is `[width height]` in logical pixels. `ui/window-size` already
 contains the new size when the callback runs.
 
+## Grids and editors that show what they're given
+
+`ui/grid` without `:height` fills its parent. It draws the rows that fit
+in `:viewport` pixels (1000 by default). When its columns are wider than
+the grid, the body scrolls sideways. Pass `:scroll-x` and `:on-scroll-x`,
+and the header follows the body.
+
+An editor can show text that isn't edited, such as a terminal's screen.
+`ui/editor-show!` sets a model's text (a rope), each line's spans, and the
+carets. It leaves the undo history alone and sends only the lines given,
+or every line. A span's style is a theme token or `"#rrggbb"`. Add
+`;bg=<colour>` for a background, `;u` for an underline and `;s` for a
+strike. `ui/editor-hooks!` takes these hooks:
+
+- `:key-hook` and `:text-hook` see keys and typed text first.
+- `:command-hook` sees menu commands such as `:copy` and `:paste` first.
+- `:cells-hook` receives the columns and rows of text that fit, whenever
+  that changes. The element needs `:report-cells true` for this.
+
+`:gutter false` and `:current-line false` turn off the line numbers and the
+band behind the caret's line.
+
+The bundled icons include `:database`, `:table`, `:globe`, `:send`, `:lock`,
+`:copy`, `:download` and `:key`.
+
 ## Renderer installation
 
 The Apple Silicon distribution includes `bin/macos-aarch64/norn-ui-host`.

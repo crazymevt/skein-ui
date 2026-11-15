@@ -60,6 +60,32 @@
     (ui/screenshot w "/tmp/norn-ui-grid.png" 1)
     (ui/close-window w)))
 
+(def fstate (atom {:scroll-y 0 :scroll-x 0}))
+
+(defn fview [{:keys [scroll-y scroll-x]}]
+  [:column {:flex-grow 1}
+   (ui/grid {:id :fg :rows rows :scroll-y scroll-y :scroll-x scroll-x
+             :columns [{:key :n :title "#" :width 200} {:key :name :title "Name" :width 300} {:key :size :title "Size" :width 200}]
+             :on-scroll (fn [y] (swap! fstate assoc :scroll-y y))
+             :on-scroll-x (fn [x] (swap! fstate assoc :scroll-x x))})])
+
+(deftest a-grid-that-fills-its-parent
+  (let [w (ui/window {:size [320 220]} #'fview fstate)]
+    (settle)
+    (testing "it takes its parent's height, and draws the rows that fit"
+      (let [{:keys [h]} (ui/node-rect w (ui/node-of w :fg))]
+        (is (> h 200)))
+      (is (some? (ui/node-of w :grid-row-0)))
+      (is (nil? (ui/node-of w :grid-row-200))))
+    (testing "wider than the window: it scrolls sideways, the header with it"
+      (let [{:keys [x y h]} (ui/node-rect w (ui/node-of w :grid-row-1))]
+        (ui/simulate! [:wheel w (+ x 20) (+ y (quot h 2)) 250 0]))
+      (settle)
+      (is (pos? (:scroll-x @fstate)))
+      (let [col (ui/node-rect w (ui/node-of w :grid-col-name))]
+        (is (= (- 200 (:scroll-x @fstate)) (:x col)) "the header moved as far")))
+    (ui/close-window w)))
+
 (def dstate (atom {:groups [[:left [:files :search]] [:right [:editor :repl]]]
                    :active {:left :files :right :editor}}))
 

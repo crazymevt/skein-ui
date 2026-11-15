@@ -92,7 +92,15 @@
    :alert "M12 3l10 18H2z M12 10v4 M12 17.5v.5"
    :info "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18z M12 11v6 M12 7.5v.5"
    :eye "M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z M12 9a3 3 0 1 0 0 6a3 3 0 1 0 0-6z"
-   :sparkles "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"})
+   :sparkles "M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"
+   :database "M4 6c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6 M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"
+   :table "M4 4h16v16H4z M4 10h16 M4 15h16 M10 4v16"
+   :globe "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18z M3 12h18 M12 3c2.5 2.5 3.8 5.5 3.8 9s-1.3 6.5-3.8 9c-2.5-2.5-3.8-5.5-3.8-9S9.5 5.5 12 3z"
+   :send "M21 3L10 14 M21 3l-7 18-4-7-7-4z"
+   :lock "M6 11h12v10H6z M8 11V7a4 4 0 0 1 8 0v4"
+   :copy "M9 9h11v11H9z M5 15H4V4h11v1"
+   :download "M12 4v12 M7 11l5 5 5-5 M5 20h14"
+   :key "M14.5 4a5.5 5.5 0 1 0 0 11a5.5 5.5 0 1 0 0-11z M10.6 13.4L4 20 M6 18l2 2 M8 16l2 2"})
 
 (defn- icon-props
   "An :icon element's props, with :name looked up in icons."
@@ -889,7 +897,10 @@
 (defn grid
   "A virtualized table: only the rows near the visible part exist.
   Options: :columns [{:key k :title t :width w} …], :rows (a vector of
-  maps), :row-height (22), :height, :scroll-y and :on-scroll (as vlist),
+  maps), :row-height (22), :height (without one, the grid fills its
+  parent, drawing the rows that fit in :viewport, 1000, pixels),
+  :scroll-y and :on-scroll (as vlist), :scroll-x and :on-scroll-x (called
+  with the new x: the header follows a body wider than the grid),
   :selected (a row index) and :on-select (called with one), :sort [key
   :asc|:desc] and :on-sort (called with the clicked column's key),
   :on-resize-column (called with a key and its new width), :cell (a
@@ -897,15 +908,17 @@
   default shows the row's value for the column's key), :id. Up, Down,
   Page Up, Page Down, Home and End move the selection and keep it in
   view."
-  [{:keys [columns rows row-height height scroll-y on-scroll selected on-select sort on-sort on-resize-column cell id]
-    :or {row-height 22 scroll-y 0 id :grid}}]
+  [{:keys [columns rows row-height height viewport scroll-y on-scroll scroll-x on-scroll-x selected on-select sort on-sort
+           on-resize-column cell id]
+    :or {row-height 22 scroll-y 0 scroll-x 0 id :grid}}]
   (let [n (count rows)
+        fill? (nil? height)
         drawn [selected scroll-y]
         ;; the latest selection and scroll: ours if no render came since
         latest (fn [] (let [c (get @grid-cursors id)]
                         (if (and c (= (:drawn c) drawn)) [(:i c) (:y c)] drawn)))
         header-h 26
-        body-h (- height header-h 2)
+        body-h (if fill? (or viewport 1000) (- height header-h 2))
         top (max 0 (dec (quot (int scroll-y) row-height)))
         end (min n (+ top (quot body-h row-height) 3))
         width (reduce + 0 (map :width columns))
@@ -921,7 +934,8 @@
                       (when on-select (on-select i))
                       (when (and on-scroll (not= sy sy2)) (on-scroll sy2)))))
         page (max 1 (quot body-h row-height))]
-    [:column {:id id :class :grid :height height :focusable true
+    [:column {:id id :class :grid (if fill? :flex-grow :height) (if fill? 1 height) :min-height 0 :min-width 0
+              :overflow :hidden :focusable true
               :on-key (fn [e]
                         (let [k (:key e) i (or (first (latest)) -1)]
                           (cond (= k :arrow-down) (select! (min (dec n) (inc i)))
@@ -931,24 +945,29 @@
                                 (= k :home) (select! 0)
                                 (= k :end) (select! (dec n))
                                 :else nil)))}
-     [:row {:class :grid-header :height header-h :flex-shrink 0}
-      (for [c columns]
-        [:row {:key (:key c) :width (:width c) :flex-shrink 0}
-         [:row {:id (keyword (str "grid-col-" (name (:key c)))) :class :grid-header-cell :flex-grow 1 :align-items :center
-                :on-click (fn [_] (when on-sort (on-sort (:key c))))}
-          [:text (:title c) (when (= (:key c) (first sort)) (if (= :desc (second sort)) " ▼" " ▲"))]]
-         [:box {:id (keyword (str "grid-resize-" (name (:key c)))) :class :grid-resize :width 4 :cursor :col-resize
-                :on-drag (fn [e]
-                           (when on-resize-column
-                             ;; build on the width last asked for if no
-                             ;; render has caught up since (drags come fast)
-                             (let [k [id (:key c)]
-                                   seen (get @grid-cursors k)
-                                   base (if (and seen (= (:drawn seen) (:width c))) (:w seen) (:width c))
-                                   w (max 30 (+ base (:dx e)))]
-                               (swap! grid-cursors assoc k {:drawn (:width c) :w w})
-                               (on-resize-column (:key c) w))))}]])]
-     [:scroll {:height body-h :scroll-y scroll-y :on-scroll (fn [e] (when on-scroll (on-scroll (:y e))))}
+     [:row {:class :grid-header :height header-h :flex-shrink 0 :overflow :hidden}
+      [:row {:flex-shrink 0 :margin [0 0 0 (- scroll-x)]}
+       (for [c columns]
+         [:row {:key (:key c) :width (:width c) :flex-shrink 0}
+          [:row {:id (keyword (str "grid-col-" (name (:key c)))) :class :grid-header-cell :flex-grow 1 :align-items :center
+                 :on-click (fn [_] (when on-sort (on-sort (:key c))))}
+           [:text (:title c) (when (= (:key c) (first sort)) (if (= :desc (second sort)) " ▼" " ▲"))]]
+          [:box {:id (keyword (str "grid-resize-" (name (:key c)))) :class :grid-resize :width 4 :cursor :col-resize
+                 :on-drag (fn [e]
+                            (when on-resize-column
+                              ;; build on the width last asked for if no
+                              ;; render has caught up since (drags come fast)
+                              (let [k [id (:key c)]
+                                    seen (get @grid-cursors k)
+                                    base (if (and seen (= (:drawn seen) (:width c))) (:w seen) (:width c))
+                                    w (max 30 (+ base (:dx e)))]
+                                (swap! grid-cursors assoc k {:drawn (:width c) :w w})
+                                (on-resize-column (:key c) w))))}]])]]
+     [:scroll (merge (if fill? {:flex-grow 1 :min-height 0} {:height body-h})
+                     {:scroll-y scroll-y :scroll-x scroll-x
+                      :on-scroll (fn [e]
+                                   (when (and on-scroll (not= (:y e) scroll-y)) (on-scroll (:y e)))
+                                   (when (and on-scroll-x (:x e) (not= (:x e) scroll-x)) (on-scroll-x (:x e))))})
       [:box {:height (* n row-height) :width width :flex-shrink 0}
        (for [i (range top end)]
          [:row {:key i :id (keyword (str "grid-row-" i)) :class :grid-row :selected (= i selected)
@@ -1263,12 +1282,15 @@
         (swap! m assoc :states ss)))))
 
 (defn- line-data [m k]
-  (let [{:keys [rope highlight]} @m
+  (let [{:keys [rope highlight line-spans]} @m
         t (rope/line rope k)]
-    (if highlight
+    (cond
+      ;; a model that knows each line's spans itself (a terminal's screen)
+      line-spans [t (vec (line-spans k))]
+      highlight
       (do (ensure-states! m k)
           [t (vec (:spans (run-highlight highlight t (nth (:states @m) k nil))))])
-      [t []])))
+      :else [t []])))
 
 (defn- restate!
   "After single-line edits on lines (same line count): the lines to send.
@@ -1356,7 +1378,7 @@
                           [:lines node from (mapv (fn [k] (line-data m k)) (range from to))]))
                       [[:carets node (mapv (fn [[[l c] a]] (if a {:line l :col c :anchor a} {:line l :col c})) carets)]]
                       (when (not= decs (::sent-decs @m)) [[:decorations node decs]])
-                      [[:reveal node pl pc]]))]
+                      (when-not (::no-reveal @m) [[:reveal node pl pc]])))]
         (swap! m assoc ::sent-decs decs)
         (native/apply! (engine-of (the-app)) ops)))))
 
@@ -1864,7 +1886,10 @@
                        (edit! m t (when (and (= 1 (count t)) (not= "\n" t)) :type)))))
      :click (fn [e] (editor-click m e))
      :drag-select (fn [e] (set-carets! m [[[(:line e) (:col e)] (:anchor e)]]))
-     :command (fn [e] (editor-command m (:command e)))
+     :command (fn [e] (if-let [h (:command-hook @m)]
+                        (if (h (:command e)) nil (editor-command m (:command e)))
+                        (editor-command m (:command e))))
+     :cells (fn [e] (when-let [f (:on-cells @m)] (f (:cols e) (:rows e))))
      :need-lines (fn [e] (let [{:keys [rope]} @m
                                from (:from e)
                                to (min (max (:to e) (+ from 80)) (rope/line-count rope))]
@@ -1875,11 +1900,28 @@
 (defn editor-hooks!
   "Let the app handle model m's keys and typing first: (key-hook e) gets
   each key event (after the completion popup's keys), (text-hook text)
-  each piece of typed text; either returns true if it handled it, so the
-  editor doesn't. nil removes a hook."
-  [m {:keys [key-hook text-hook]}]
-  (swap! m assoc :key-hook key-hook :text-hook text-hook)
+  each piece of typed text, (command-hook command) each menu command it
+  would take (:copy, :paste…); each returns true if it handled it, so the
+  editor doesn't. (cells-hook cols rows) hears how many columns and rows
+  of text the view holds, when that changes (the element needs
+  :report-cells true). nil removes a hook."
+  [m {:keys [key-hook text-hook command-hook cells-hook]}]
+  (swap! m assoc :key-hook key-hook :text-hook text-hook :command-hook command-hook :on-cells cells-hook)
   nil)
+
+(defn editor-show!
+  "Show text that isn't edited in model m (a terminal's screen, say): its
+  text becomes rope r, each line's spans come from (line-spans k) (as
+  :highlight's spans: [start end style], a style a theme token or
+  \"#rrggbb\", with ;bg=<colour>, ;u, ;s), and its carets carets. Undo
+  history is left alone. Sends lines (indexes), or every line when lines
+  is :all or the line count changed; reveal? brings the primary caret into
+  view."
+  [m r line-spans carets lines reveal?]
+  (let [old-n (rope/line-count (:rope @m))]
+    (swap! m assoc :rope r :line-spans line-spans :carets carets ::no-reveal (not reveal?))
+    (send-editor! m (if (or (= lines :all) (not= old-n (rope/line-count r))) :all lines))
+    nil))
 
 (defn editor-index "The character index of position [line col] in model m." [m pos]
   (index-of-pos (:rope @m) pos))

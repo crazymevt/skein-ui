@@ -56,6 +56,9 @@ pub struct Editor {
     pub gutter_w: f32,
     /// A reveal asked for before the editor had a size: done after layout.
     pub pending_reveal: Option<(usize, Option<usize>)>,
+    /// The (columns, rows) of text the view holds, as last reported
+    /// (`:report-cells true`: a terminal sizes itself by them).
+    pub cells: (usize, usize),
 }
 
 fn num(d: Option<&Data>) -> usize {
@@ -221,6 +224,20 @@ impl Engine {
         // :gutter false: no line numbers (a REPL's input)
         let gutter = !self.nodes[&id].props.iter().any(|(k, v)| k == "gutter" && matches!(v, Data::Bool(false)));
         e.gutter_w = if gutter { (digits * e.col_w + 2.0 * e.col_w).ceil() } else { 0.0 };
+        // :report-cells true: tell Norn how many columns and rows fit, when
+        // that changes
+        if r.w > 0.0 && r.h > 0.0 && self.nodes[&id].props.iter().any(|(k, v)| k == "report-cells" && v.truthy()) {
+            let cols = ((r.w - e.gutter_w - 4.0) / e.col_w).floor().max(1.0) as usize;
+            let rows = (r.h / e.line_h).floor().max(1.0) as usize;
+            if e.cells != (cols, rows) {
+                e.cells = (cols, rows);
+                self.events.push(Event::new(
+                    "cells",
+                    vec![("node", Data::Num(id as f64)), ("cols", Data::Num(cols as f64)), ("rows", Data::Num(rows as f64))],
+                ));
+            }
+        }
+        let e = self.editors.get_mut(&id).unwrap();
         if r.h > 0.0
             && let Some((line, col)) = e.pending_reveal.take()
         {
