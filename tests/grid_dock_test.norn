@@ -86,6 +86,22 @@
         (is (= (- 200 (:scroll-x @fstate)) (:x col)) "the header moved as far")))
     (ui/close-window w)))
 
+(deftest the-header-moves-with-the-rows-in-the-engine
+  ;; (this app doesn't follow the sideways scroll at all: the engine moves
+  ;; the header itself, in the same frame as the rows)
+  (let [w (ui/window {:size [320 220]}
+                     (fn [_] [:column {:flex-grow 1}
+                              (ui/grid {:id :eg :rows rows
+                                        :columns [{:key :n :title "#" :width 200} {:key :name :title "Name" :width 300}]})])
+                     (atom nil))]
+    (settle)
+    (let [{:keys [x y h]} (ui/node-rect w (ui/node-of w :grid-row-1))]
+      (ui/simulate! [:wheel w (+ x 20) (+ y (quot h 2)) 120 0]))
+    (settle)
+    (is (= -120 (:x (ui/node-rect w (ui/node-of w :grid-row-1)))) "the rows moved")
+    (is (= 80 (:x (ui/node-rect w (ui/node-of w :grid-col-name)))) "and the header as far")
+    (ui/close-window w)))
+
 (def dstate (atom {:groups [[:left [:files :search]] [:right [:editor :repl]]]
                    :active {:left :files :right :editor}}))
 

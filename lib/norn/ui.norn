@@ -900,7 +900,8 @@
   maps), :row-height (22), :height (without one, the grid fills its
   parent, drawing the rows that fit in :viewport, 1000, pixels),
   :scroll-y and :on-scroll (as vlist), :scroll-x and :on-scroll-x (called
-  with the new x: the header follows a body wider than the grid),
+  with the new x, for remembering it; a body wider than the grid scrolls
+  sideways, its header moving with it),
   :selected (a row index) and :on-select (called with one), :sort [key
   :asc|:desc] and :on-sort (called with the clicked column's key),
   :on-resize-column (called with a key and its new width), :cell (a
@@ -945,8 +946,9 @@
                                 (= k :home) (select! 0)
                                 (= k :end) (select! (dec n))
                                 :else nil)))}
-     [:row {:class :grid-header :height header-h :flex-shrink 0 :overflow :hidden}
-      [:row {:flex-shrink 0 :margin [0 0 0 (- scroll-x)]}
+     ;; (the engine moves the header sideways with the rows, in the same frame)
+     [:row {:class :grid-header :height header-h :flex-shrink 0 :min-width width :follow-scroll-x true}
+      [:row {:flex-shrink 0}
        (for [c columns]
          [:row {:key (:key c) :width (:width c) :flex-shrink 0}
           [:row {:id (keyword (str "grid-col-" (name (:key c)))) :class :grid-header-cell :flex-grow 1 :align-items :center

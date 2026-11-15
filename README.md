@@ -91,8 +91,10 @@ contains the new size when the callback runs.
 
 `ui/grid` without `:height` fills its parent. It draws the rows that fit
 in `:viewport` pixels (1000 by default). When its columns are wider than
-the grid, the body scrolls sideways. Pass `:scroll-x` and `:on-scroll-x`,
-and the header follows the body.
+the grid, the body scrolls sideways and the engine moves the header with it
+in the same frame. Any element with `:follow-scroll-x true` moves sideways
+with its sibling scroll container this way. `:scroll-x` and `:on-scroll-x`
+let an app remember the position.
 
 An editor can show text that isn't edited, such as a terminal's screen.
 `ui/editor-show!` sets a model's text (a rope), each line's spans, and the

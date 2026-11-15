@@ -1018,8 +1018,33 @@ impl Engine {
         clips.insert(id, clip);
         let (child_clip, (sx, sy)) =
             if self.scrolls(id) { (clip.intersect(&r), self.scroll.get(&id).copied().unwrap_or((0.0, 0.0))) } else { (clip, (0.0, 0.0)) };
+        // A child with :follow-scroll-x moves sideways with its sibling scroll
+        // container, in the same frame (a grid's header over its rows).
+        let follow = n.children.iter().find(|c| self.user_scrolls(**c)).and_then(|c| self.scroll.get(c)).map_or(0.0, |s| s.0);
         for c in &n.children {
-            self.collect_rects(*c, r.x - sx, r.y - sy, child_clip, out, clips);
+            let dx = if follow != 0.0 && self.follows_scroll_x(*c) { follow } else { 0.0 };
+            self.collect_rects(*c, r.x - sx - dx, r.y - sy, child_clip, out, clips);
+        }
+    }
+
+    fn follows_scroll_x(&self, id: NodeId) -> bool {
+        self.nodes[&id].props.iter().any(|(k, v)| k == "follow-scroll-x" && v.truthy())
+    }
+
+    /// Repaint what scroll container id's scrolling moved: its view, and the
+    /// band of any sibling that follows it sideways.
+    fn scroll_damage(&mut self, w: WindowId, id: NodeId) {
+        let followers: Vec<NodeId> = match self.nodes[&id].parent {
+            Some(p) => self.nodes[&p].children.iter().copied().filter(|c| *c != id && self.follows_scroll_x(*c)).collect(),
+            None => Vec::new(),
+        };
+        let win = self.windows.get_mut(&w).unwrap();
+        let visible = win.rects[&id].intersect(&win.clips[&id]);
+        win.damage.push(visible);
+        for c in followers {
+            if let (Some(r), Some(clip)) = (win.rects.get(&c), win.clips.get(&c)) {
+                win.damage.push(Rect { x: clip.x, y: r.y, w: clip.w, h: r.h }.intersect(clip));
+            }
         }
     }
 
@@ -1168,9 +1193,7 @@ impl Engine {
         }
         self.scroll.insert(id, (nx, ny));
         self.recollect(w);
-        let win = self.windows.get_mut(&w).unwrap();
-        let visible = win.rects[&id].intersect(&win.clips[&id]);
-        win.damage.push(visible);
+        self.scroll_damage(w, id);
         if self.nodes[&id].wants("scroll") {
             let r = self.reported_scroll.entry(id).or_default();
             r.push_back((nx, ny));
@@ -1272,10 +1295,8 @@ impl Engine {
         }
         if !moved.is_empty() {
             self.recollect(w);
-            let win = self.windows.get_mut(&w).unwrap();
             for id in moved {
-                let visible = win.rects[&id].intersect(&win.clips[&id]);
-                win.damage.push(visible);
+                self.scroll_damage(w, id);
             }
         }
     }
