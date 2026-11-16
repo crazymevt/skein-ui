@@ -133,6 +133,40 @@
       (is (not (contains? (:layers @doc) :inline))))
     (ui/close-window w)))
 
+(deftest stale-completions
+  ;; Completions are found on another fiber; they may arrive after the
+  ;; typing has gone past the word they were for (norn-studio's Enter
+  ;; once inserted "defn" after "(defn g [y]").
+  (testing "items for a word typed past aren't shown"
+    (let [[doc w] (open "(ma")]
+      (keys! w [:arrow-down #{:cmd}])
+      (ui/simulate! [:type w "p x"])
+      (settle)
+      (ui/editor-complete! doc ["map" "mapv" "max"] {:prefix "ma"})
+      (settle)
+      (is (empty? (ui/popups-of w)))
+      (keys! w :enter)
+      (is (= "(map x\n" (ui/editor-text doc)))
+      (ui/close-window w)))
+  (testing "a popup whose word the caret left lets Enter through"
+    (let [[doc w] (open "(ma")]
+      (keys! w [:arrow-down #{:cmd}])
+      (ui/editor-complete! doc ["map" "mapv" "max"] {:prefix "ma"})
+      (settle)
+      (is (= 1 (count (ui/popups-of w))))
+      (keys! w :arrow-left :enter)
+      (is (= "(m\na" (ui/editor-text doc)) "a new line, no item inserted")
+      (is (empty? (ui/popups-of w)))
+      (ui/close-window w)))
+  (testing "without :prefix, as before"
+    (let [[doc w] (open "(ma")]
+      (keys! w [:arrow-down #{:cmd}])
+      (ui/editor-complete! doc ["map" "mapv" "max"])
+      (settle)
+      (keys! w :enter)
+      (is (= "(map" (ui/editor-text doc)))
+      (ui/close-window w))))
+
 (deftest models-that-leave-the-window
   ;; Two models taking turns in one place, as tabs do.
   (let [a (ui/editor-model "(a)") b (ui/editor-model "(b)")

@@ -1755,27 +1755,40 @@
           (swap! m assoc :carets [[[l c] [l (- c (count prefix))]]])
           (edit! m (or (:insert it) (:label it))))))))
 
+(defn- completion-stale?
+  "Whether completions computed for the word prefix no longer fit model m:
+  the word before its caret doesn't start with prefix (typing went past
+  it, or the caret moved)."
+  [m prefix]
+  (and prefix (not (str/starts-with? (editor-word-before-caret m) prefix))))
+
 (defn editor-complete!
   "Offer completions at model m's primary caret: items are strings or maps
   {:label :insert :detail}. Typing filters them by the word before the
-  caret; Up and Down move, Enter or Tab inserts, Escape closes."
-  [m items]
-  (close-editor-popup! m ::completion)
-  (let [all (mapv (fn [it] (if (string? it) {:label it} it)) items)
-        shown (completion-items all (editor-word-before-caret m))]
-    (when (and (seq shown) (::window @m))
-      (let [{:keys [x y h]} (editor-caret-rect m)
-            st (atom {:items shown :hi 0})
-            pid (popup (::window @m) {:position [x (+ y h 2)] :on-dismiss (fn [_] (close-editor-popup! m ::completion))}
-                       (completion-view st) st)]
-        (add-watch st ::accept (fn [_ _ _ new] (when (:accept new) (accept-completion! m))))
-        (swap! m assoc ::completion {:popup pid :state st :all all})
-        pid))))
+  caret; Up and Down move, Enter or Tab inserts, Escape closes.
+
+  opts :prefix is the word the items were computed for. Items found
+  meanwhile (on another fiber) may arrive after the typing has gone past
+  that word: then they aren't shown, and a popup that went stale lets
+  Enter and Tab through instead of inserting an item."
+  ([m items] (editor-complete! m items {}))
+  ([m items {:keys [prefix]}]
+   (close-editor-popup! m ::completion)
+   (let [all (mapv (fn [it] (if (string? it) {:label it} it)) items)
+         shown (completion-items all (editor-word-before-caret m))]
+     (when (and (seq shown) (::window @m) (not (completion-stale? m prefix)))
+       (let [{:keys [x y h]} (editor-caret-rect m)
+             st (atom {:items shown :hi 0})
+             pid (popup (::window @m) {:position [x (+ y h 2)] :on-dismiss (fn [_] (close-editor-popup! m ::completion))}
+                        (completion-view st) st)]
+         (add-watch st ::accept (fn [_ _ _ new] (when (:accept new) (accept-completion! m))))
+         (swap! m assoc ::completion {:popup pid :state st :all all :prefix prefix})
+         pid)))))
 
 (defn- refresh-completion! [m]
   (when-let [p (::completion @m)]
     (let [shown (completion-items (:all p) (editor-word-before-caret m))]
-      (if (and (seq shown) (not= "" (editor-word-before-caret m)))
+      (if (and (seq shown) (not= "" (editor-word-before-caret m)) (not (completion-stale? m (:prefix p))))
         (reset! (:state p) {:items shown :hi 0})
         (close-editor-popup! m ::completion)))))
 
@@ -1808,15 +1821,18 @@
         :else ::pass))
 
 (defn- completion-key
-  "Keys while completions show: true if the key was theirs."
+  "Keys while completions show: true if the key was theirs. A popup gone
+  stale (editor-complete!'s :prefix) closes, and the key goes on."
   [m k]
   (when-let [p (::completion @m)]
-    (let [st (:state p)
-          n (min 12 (count (:items @st)))]
-      (cond (= k :arrow-down) (do (swap! st update :hi (fn [i] (min (dec n) (inc i)))) true)
-            (= k :arrow-up) (do (swap! st update :hi (fn [i] (max 0 (dec i)))) true)
-            (or (= k :enter) (= k :tab)) (do (accept-completion! m) true)
-            :else nil))))
+    (if (completion-stale? m (:prefix p))
+      (do (close-editor-popup! m ::completion) nil)
+      (let [st (:state p)
+            n (min 12 (count (:items @st)))]
+        (cond (= k :arrow-down) (do (swap! st update :hi (fn [i] (min (dec n) (inc i)))) true)
+              (= k :arrow-up) (do (swap! st update :hi (fn [i] (max 0 (dec i)))) true)
+              (or (= k :enter) (= k :tab)) (do (accept-completion! m) true)
+              :else nil)))))
 
 (defn- editor-key [m e]
   (let [{:keys [rope carets]} @m
