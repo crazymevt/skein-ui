@@ -111,6 +111,12 @@
     (settle)
     (testing "it says how many columns and rows fit"
       (is (let [[c r] @cells] (and (> c 20) (> r 3))) (pr-str @cells)))
+    (testing "to a hook installed after it said so too"
+      (let [late (atom nil)]
+        (ui/editor-hooks! m {:cells-hook (fn [c r] (reset! late [c r]))})
+        (is (= @cells @late))
+        (ui/editor-hooks! m {:cells-hook (fn [c r] (reset! cells [c r]))
+                             :command-hook (fn [c] (when (= c :paste) (reset! pasted true) true))})))
     (testing "text and spans it doesn't edit, undo left alone"
       (ui/editor-show! m (rope/rope "red text\nplain") (fn [k] (if (zero? k) [[0 3 "#ff0000;bg=#000000;u"]] []))
                        [[[1 5] nil]] :all true)

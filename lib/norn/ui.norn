@@ -1907,7 +1907,10 @@
      :command (fn [e] (if-let [h (:command-hook @m)]
                         (if (h (:command e)) nil (editor-command m (:command e)))
                         (editor-command m (:command e))))
-     :cells (fn [e] (when-let [f (:on-cells @m)] (f (:cols e) (:rows e))))
+     ;; (kept, for a cells-hook installed later: editor-hooks!)
+     :cells (fn [e]
+              (swap! m assoc ::cells [(:cols e) (:rows e)])
+              (when-let [f (:on-cells @m)] (f (:cols e) (:rows e))))
      :need-lines (fn [e] (let [{:keys [rope]} @m
                                from (:from e)
                                to (min (max (:to e) (+ from 80)) (rope/line-count rope))]
@@ -1922,9 +1925,13 @@
   would take (:copy, :paste…); each returns true if it handled it, so the
   editor doesn't. (cells-hook cols rows) hears how many columns and rows
   of text the view holds, when that changes (the element needs
-  :report-cells true). nil removes a hook."
+  :report-cells true), and at once if the view has said already (it says
+  so once it's laid out, which may be before the hooks are installed).
+  nil removes a hook."
   [m {:keys [key-hook text-hook command-hook cells-hook]}]
   (swap! m assoc :key-hook key-hook :text-hook text-hook :command-hook command-hook :on-cells cells-hook)
+  (when-let [[c r] (and cells-hook (::cells @m))]
+    (cells-hook c r))
   nil)
 
 (defn editor-show!
