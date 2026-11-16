@@ -48,9 +48,11 @@
       nil)))
 
 (defn- close-process! [p]
+  ;; (closing its input tells the renderer to quit, and closing its output
+  ;; keeps it from blocking on a write nobody reads; once it has, the rest)
   (io/close (:in p))
   (io/close (:out p))
-  (try (process/wait p) (finally (io/close (:process p)))))
+  (try (process/wait p) (finally (process/close p))))
 
 (defn- stop-app! [p stopped? message]
   ;; An image restores with a new renderer. A reader saved in the old
