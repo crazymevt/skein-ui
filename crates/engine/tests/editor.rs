@@ -1,7 +1,7 @@
 //! The editor surface: line requests, line-exact repaints, scrolling,
 //! clicks to line and column.
 
-use norn_ui_engine::{Data, Engine, Op, Props, RoughMeasure};
+use skein_ui_engine::{Data, Engine, Op, Props, RoughMeasure};
 
 fn p(kvs: &[(&str, Data)]) -> Props {
     kvs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()

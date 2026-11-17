@@ -1,8 +1,8 @@
 //! Wheel handlers next to built-in scrolling, and image decoding off the
 //! engine's thread.
 
-use norn_ui_engine::raster::DecodeRequest;
-use norn_ui_engine::{Data, Engine, Op, Props, RoughMeasure};
+use skein_ui_engine::raster::DecodeRequest;
+use skein_ui_engine::{Data, Engine, Op, Props, RoughMeasure};
 
 fn k(s: &str) -> Data {
     Data::key(s)

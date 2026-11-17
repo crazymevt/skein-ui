@@ -3,12 +3,12 @@
 
 (ns code-editor-test
   (:refer-core :exclude [settle])
-  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+  (:require [skein.test :refer [is deftest testing]] [skein.ui :as ui]))
 
 (ui/theme! ui/base-theme)
 (defn settle [] (sleep 120))
 
-(defn styles [line] (mapv (fn [[a b s]] [(subs line a b) s]) (ui/highlight-norn line)))
+(defn styles [line] (mapv (fn [[a b s]] [(subs line a b) s]) (ui/highlight-skein line)))
 
 (deftest highlighting
   (testing "brackets by depth, and an unmatched closer"
@@ -18,15 +18,15 @@
     (is (= [["(" :bracket-1] ["\\(" :string] [")" :bracket-1]]
            (filterv (fn [[_ s]] (not= s nil)) (styles "(\\()")))))
   (testing "state carries depth and an open string to the next line"
-    (let [{:keys [state]} (ui/highlight-norn "(defn f [x] \"a" nil)]
+    (let [{:keys [state]} (ui/highlight-skein "(defn f [x] \"a" nil)]
       (is (= {:depth 1 :string? true} state))
-      (is (= [[0 4 :string] [5 6 :bracket-1]] (:spans (ui/highlight-norn "b c\" )" state)))))))
+      (is (= [[0 4 :string] [5 6 :bracket-1]] (:spans (ui/highlight-skein "b c\" )" state)))))))
 
 (defn open [text]
   (let [doc (ui/editor-model text)
         st (atom nil)
         w (ui/window {:size [480 200]}
-                     (fn [_] [:column {:flex-grow 1} (ui/find-bar doc) [:editor {:id :ed :model doc :highlight ui/highlight-norn :flex-grow 1}]])
+                     (fn [_] [:column {:flex-grow 1} (ui/find-bar doc) [:editor {:id :ed :model doc :highlight ui/highlight-skein :flex-grow 1}]])
                      st)]
     (settle)
     (ui/click! w :ed)
@@ -71,10 +71,10 @@
   (let [[doc w] (open "(defn f [x]\n  (inc x))")]
     (keys! w [:arrow-up #{:cmd}] [:arrow-left #{:cmd}] :arrow-right)
     ;; the caret is after "(": its partner is the last ")" of line 2
-    (is (some? (:norn.ui/sent-decs @doc)))
+    (is (some? (:skein.ui/sent-decs @doc)))
     (is (= [{:line 0 :from 0 :to 1 :kind :highlight :style :bracket-match}
             {:line 1 :from 9 :to 10 :kind :highlight :style :bracket-match}]
-           (:norn.ui/sent-decs @doc)))
+           (:skein.ui/sent-decs @doc)))
     (ui/close-window w)))
 
 (deftest find-and-replace
@@ -88,7 +88,7 @@
     (ui/editor-find-next! doc 1)
     (settle)
     (is (= 1 (:current (:find @doc))))
-    (ui/screenshot w "/tmp/norn-ui-find.png" 2)
+    (ui/screenshot w "/tmp/skein-ui-find.png" 2)
     (ui/editor-replace! doc "qux")
     (settle)
     (is (= "foo bar\nqux baz foo" (ui/editor-text doc)))
@@ -120,7 +120,7 @@
       (ui/editor-signature! doc [:rich-text "(mapv " [:b "f"] " coll)"])
       (settle)
       (is (= 1 (count (ui/popups-of w))))
-      (ui/screenshot (first (ui/popups-of w)) "/tmp/norn-ui-signature.png" 2)
+      (ui/screenshot (first (ui/popups-of w)) "/tmp/skein-ui-signature.png" 2)
       (ui/editor-close-popups! doc)
       (settle)
       (is (empty? (ui/popups-of w))))
@@ -135,7 +135,7 @@
 
 (deftest stale-completions
   ;; Completions are found on another fiber; they may arrive after the
-  ;; typing has gone past the word they were for (norn-studio's Enter
+  ;; typing has gone past the word they were for (skein-studio's Enter
   ;; once inserted "defn" after "(defn g [y]").
   (testing "items for a word typed past aren't shown"
     (let [[doc w] (open "(ma")]
@@ -173,14 +173,14 @@
         st (atom a)
         w (ui/window {:size [300 120]} (fn [m] [:column {:flex-grow 1} [:editor {:key (if (= m a) :a :b) :model m :flex-grow 1}]]) st)]
     (settle)
-    (is (some? (:norn.ui/node @a)))
+    (is (some? (:skein.ui/node @a)))
     (reset! st b)
     (settle)
-    (is (nil? (:norn.ui/node @a)) "a hidden model has no node, so its edits send nothing")
-    (is (some? (:norn.ui/node @b)))
+    (is (nil? (:skein.ui/node @a)) "a hidden model has no node, so its edits send nothing")
+    (is (some? (:skein.ui/node @b)))
     (ui/editor-decorations! a :lint [{:line 0 :from 1 :to 2 :kind :squiggle :style :find-current}])
     (reset! st a)
     (settle)
-    (is (= [{:line 0 :from 1 :to 2 :kind :squiggle :style :find-current}] (:norn.ui/sent-decs @a))
+    (is (= [{:line 0 :from 1 :to 2 :kind :squiggle :style :find-current}] (:skein.ui/sent-decs @a))
         "shown again, it gets its decorations")
     (ui/close-window w)))

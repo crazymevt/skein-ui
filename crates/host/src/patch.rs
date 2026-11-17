@@ -1,6 +1,6 @@
 //! Translate UI protocol patch vectors into engine operations.
 
-use norn_ui_engine::{Data, Op, Props};
+use skein_ui_engine::{Data, Op, Props};
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -19,7 +19,7 @@ fn index(d: &Data) -> Result<usize> {
 }
 
 fn props(d: &Data) -> Result<Props> {
-    norn_ui_engine::style::props_of(d)
+    skein_ui_engine::style::props_of(d)
 }
 
 /// One op from its vector form, e.g. `[:create 3 :button {:on #{:click}}]`.

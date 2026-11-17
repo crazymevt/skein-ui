@@ -1915,20 +1915,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "norn-ui-desktop"
+name = "skein-ui-desktop"
 version = "0.2.0"
 dependencies = [
  "arboard",
  "muda",
- "norn-ui-engine",
- "norn-ui-render",
+ "skein-ui-engine",
+ "skein-ui-render",
  "rfd",
  "wgpu",
  "winit",
 ]
 
 [[package]]
-name = "norn-ui-engine"
+name = "skein-ui-engine"
 version = "0.2.0"
 dependencies = [
  "image",
@@ -1937,24 +1937,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "norn-ui-host"
+name = "skein-ui-host"
 version = "0.2.0"
 dependencies = [
- "norn-ui-desktop",
- "norn-ui-engine",
- "norn-ui-render",
+ "skein-ui-desktop",
+ "skein-ui-engine",
+ "skein-ui-render",
  "num-bigint",
  "num-rational",
  "num-traits",
 ]
 
 [[package]]
-name = "norn-ui-render"
+name = "skein-ui-render"
 version = "0.2.0"
 dependencies = [
  "bytemuck",
  "lyon",
- "norn-ui-engine",
+ "skein-ui-engine",
  "parley",
  "png 0.18.1",
  "pollster 1.0.1",

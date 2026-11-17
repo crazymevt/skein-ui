@@ -1,9 +1,9 @@
-//! The code-editor surface (docs/ui-protocol.md §6). The text lives in Norn;
+//! The code-editor surface (docs/ui-protocol.md §6). The text lives in Skein;
 //! the engine shows a viewport onto it:
 //!
 //! - it caches the lines it has been sent, and asks for the ones scrolling
 //!   brings into view (`:need-lines`), once per gap;
-//! - it scrolls itself (no Norn on the frame path), draws the gutter, the
+//! - it scrolls itself (no Skein on the frame path), draws the gutter, the
 //!   lines with their colored spans, selections, decorations and carets;
 //! - `[:lines id from [...]]` repaints exactly those lines, so a keystroke
 //!   repaints one line.
@@ -224,7 +224,7 @@ impl Engine {
         // :gutter false: no line numbers (a REPL's input)
         let gutter = !self.nodes[&id].props.iter().any(|(k, v)| k == "gutter" && matches!(v, Data::Bool(false)));
         e.gutter_w = if gutter { (digits * e.col_w + 2.0 * e.col_w).ceil() } else { 0.0 };
-        // :report-cells true: tell Norn how many columns and rows fit, when
+        // :report-cells true: tell Skein how many columns and rows fit, when
         // that changes
         if r.w > 0.0 && r.h > 0.0 && self.nodes[&id].props.iter().any(|(k, v)| k == "report-cells" && v.truthy()) {
             let cols = ((r.w - e.gutter_w - 4.0) / e.col_w).floor().max(1.0) as usize;
@@ -261,7 +261,7 @@ impl Engine {
         }
     }
 
-    /// The wheel over an editor scrolls it (no layout, no Norn): true if
+    /// The wheel over an editor scrolls it (no layout, no Skein): true if
     /// it moved.
     /// Where editor id would scroll to for a wheel of (dx, dy), if it moves.
     pub(crate) fn editor_scroll_target(&self, id: NodeId, dx: f32, dy: f32) -> Option<(f32, f32)> {

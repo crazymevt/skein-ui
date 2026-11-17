@@ -1,7 +1,7 @@
 ;;;; Icons: SVG paths rasterized with antialiasing (headless).
 
 (ns icon-test
-  (:require [norn.test :refer [is deftest]] [norn.ui :as ui]))
+  (:require [skein.test :refer [is deftest]] [skein.ui :as ui]))
 
 (ui/theme! ui/base-theme)
 
@@ -20,5 +20,5 @@
     (sleep 150)
     (is (= {:x 10 :y 10 :w 20 :h 20} (ui/node-rect w (ui/node-of w (first names)))))
     (is (= 32 (:w (ui/node-rect w (ui/node-of w :big)))))
-    (ui/screenshot w "/tmp/norn-ui-icons.png" 2)
+    (ui/screenshot w "/tmp/skein-ui-icons.png" 2)
     (ui/close-window w)))

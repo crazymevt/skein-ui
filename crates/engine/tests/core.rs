@@ -1,7 +1,7 @@
 //! The engine core without a GPU: batches, layout, hit-testing, states,
 //! damage and counters.
 
-use norn_ui_engine::{Data, Engine, Op, Props, Rect, RoughMeasure};
+use skein_ui_engine::{Data, Engine, Op, Props, Rect, RoughMeasure};
 
 fn k(s: &str) -> Data {
     Data::key(s)

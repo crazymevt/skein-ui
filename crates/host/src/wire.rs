@@ -1,7 +1,7 @@
-//! Length-prefixed norn.bin v1. Only the types used by the UI protocol
-//! cross this pipe. The desktop host has no dependency on the Norn VM.
+//! Length-prefixed skein.bin v1. Only the types used by the UI protocol
+//! cross this pipe. The desktop host has no dependency on the Skein VM.
 
-use norn_ui_engine::Data;
+use skein_ui_engine::Data;
 use num_bigint::{BigInt, Sign};
 use num_rational::BigRational;
 use num_traits::ToPrimitive;
@@ -54,7 +54,7 @@ pub fn read_frame(input: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
 pub fn decode(frame: &[u8]) -> io::Result<Data> {
     let bytes = frame
         .strip_prefix(HEADER)
-        .ok_or_else(|| invalid("expected norn.bin version 1"))?;
+        .ok_or_else(|| invalid("expected skein.bin version 1"))?;
     let mut decoder = Decoder {
         bytes,
         names: Vec::new(),

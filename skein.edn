@@ -1,0 +1,6 @@
+{:name skein-ui
+ :version "0.1.0"
+ :paths ["lib"]
+ ;; skein package bundles the renderer with an app that uses skein-ui (the
+ ;; first of these that's built)
+ :helpers {"skein-ui-host" ["target/release/skein-ui-host" "bin/{os}-{arch}/skein-ui-host"]}}

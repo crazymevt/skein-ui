@@ -1,9 +1,9 @@
-;;;; norn.ui, headless: rendering, diffing, events, live redefinition.
-;;;; Run with `norn-ui test tests/` (crates/norn-ui/tests/norn.rs does).
+;;;; skein.ui, headless: rendering, diffing, events, live redefinition.
+;;;; Run with `skein-ui test tests/` (crates/skein-ui/tests/skein.rs does).
 
 (ns ui-test
   (:refer-core :exclude [settle])
-  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+  (:require [skein.test :refer [is deftest testing]] [skein.ui :as ui]))
 
 (def state (atom {:count 0 :items ["a" "b" "c"]}))
 
@@ -99,7 +99,7 @@
     (ui/simulate! [:key fw :enter #{}])
     (settle)
     (is (= "Ada" (:submitted @form)))
-    (testing "Norn can set the value"
+    (testing "Skein can set the value"
       (swap! form assoc :name "Grace")
       (settle)
       (ui/simulate! [:type fw "!"])
@@ -133,11 +133,11 @@
   ;; half a window, which then fails every render.
   (let [w (ui/window {:size [200 100]} (fn [_] [:text "owner"]) (atom nil))
         p (ui/popup w {:position [10 10]} (fn [_] [:text "tip"]) (atom nil))
-        app (#'norn.ui/the-app)]
+        app (#'skein.ui/the-app)]
     (settle)
     (ui/close-window p)
-    (#'norn.ui/dispatch app {:event :resize :window p :size [50 20]})
-    (#'norn.ui/dispatch app {:event :moved :window p :position [1 2]})
+    (#'skein.ui/dispatch app {:event :resize :window p :size [50 20]})
+    (#'skein.ui/dispatch app {:event :moved :window p :position [1 2]})
     (is (not (contains? @(:windows app) p)))
     (ui/close-window w)))
 

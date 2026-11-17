@@ -1,8 +1,8 @@
-;;;; norn.ui's widgets, headless.
+;;;; skein.ui's widgets, headless.
 
 (ns widgets-test
   (:refer-core :exclude [settle])
-  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+  (:require [skein.test :refer [is deftest testing]] [skein.ui :as ui]))
 
 (ui/theme! ui/base-theme)
 
@@ -72,7 +72,7 @@
 
 (deftest the-editor-edits-its-rope
   (let [doc (ui/editor-model "(defn f [x]\n  (inc x))")
-        ew (ui/window {:size [400 120]} (fn [_] [:column {:flex-grow 1} [:editor {:id :ed :model doc :highlight ui/highlight-norn}]]) (atom nil))]
+        ew (ui/window {:size [400 120]} (fn [_] [:column {:flex-grow 1} [:editor {:id :ed :model doc :highlight ui/highlight-skein}]]) (atom nil))]
     (settle)
     (ui/click! ew :ed) ; the middle of the editor: below the text, so the end of line 2
     (settle)

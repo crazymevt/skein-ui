@@ -1,4 +1,4 @@
-//! The norn-ui painter (plan 2.4): draws a window's node tree with wgpu.
+//! The skein-ui painter (plan 2.4): draws a window's node tree with wgpu.
 //!
 //! - **Paint pipelines:** boxes, glyphs, triangles and RGBA pixel buffers.
 //! - **Damage-only:** each window has a persistent canvas texture; a frame
@@ -15,7 +15,7 @@ mod display;
 
 use atlas::{Atlas, GlyphKey};
 pub use display::{Item, PixelSampling, display_list};
-use norn_ui_engine::{Engine, Rect, Text, WindowId};
+use skein_ui_engine::{Engine, Rect, Text, WindowId};
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
@@ -259,13 +259,13 @@ fn rgba(c: [u8; 4]) -> [f32; 4] {
 
 impl Renderer {
     /// A renderer without a surface (tests, CI, the headless backend). It
-    /// asks for the low-power GPU; with `NORN_UI_SOFTWARE=1`, for the
+    /// asks for the low-power GPU; with `SKEIN_UI_SOFTWARE=1`, for the
     /// software fallback adapter.
     pub fn headless() -> Result<Renderer, String> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::LowPower,
-            force_fallback_adapter: std::env::var("NORN_UI_SOFTWARE").is_ok_and(|v| v == "1"),
+            force_fallback_adapter: std::env::var("SKEIN_UI_SOFTWARE").is_ok_and(|v| v == "1"),
             compatible_surface: None,
             ..Default::default()
         }))
@@ -276,12 +276,12 @@ impl Renderer {
     /// A renderer on `adapter` (a backend passes the one its surface uses).
     pub fn with_adapter(adapter: &wgpu::Adapter) -> Result<Renderer, String> {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("norn-ui"),
+            label: Some("skein-ui"),
             ..Default::default()
         }))
         .map_err(|e| format!("No GPU device: {e}"))?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("norn-ui"),
+            label: Some("skein-ui"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
         });
         let atlas = Atlas::new(&device);
@@ -292,7 +292,7 @@ impl Renderer {
             mapped_at_creation: false,
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("norn-ui"),
+            label: Some("skein-ui"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -319,7 +319,7 @@ impl Renderer {
             ],
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("norn-ui"),
+            label: Some("skein-ui"),
             layout: &layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
@@ -328,7 +328,7 @@ impl Renderer {
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("norn-ui"),
+            label: Some("skein-ui"),
             bind_group_layouts: &[Some(&layout)],
             ..Default::default()
         });

@@ -8,9 +8,9 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-norn-ui-engine = { path = "crates/engine" }
-norn-ui-render = { path = "crates/render" }
-norn-ui-desktop = { path = "crates/desktop" }
+skein-ui-engine = { path = "crates/engine" }
+skein-ui-render = { path = "crates/render" }
+skein-ui-desktop = { path = "crates/desktop" }
 taffy = "0.9"
 parley = { version = "0.13", features = ["complex-scripts"] }
 swash = "0.2"

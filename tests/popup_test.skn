@@ -2,7 +2,7 @@
 
 (ns popup-test
   (:refer-core :exclude [settle])
-  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+  (:require [skein.test :refer [is deftest testing]] [skein.ui :as ui]))
 
 (ui/theme! ui/base-theme)
 (defn settle [] (sleep 100))

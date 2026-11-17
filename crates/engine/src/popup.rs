@@ -5,11 +5,11 @@
 //! so it can reach past the owner's edges). `:fit-content` sizes a window
 //! to its content. Popups are dismissed lightly: a press in an owner (other
 //! than on the popup's `:anchor` node) or Escape sends `{:event :dismiss}`
-//! for each popup it owns, and Norn closes them.
+//! for each popup it owns, and Skein closes them.
 //!
 //! Tooltips: hovering a node with a `:tooltip` prop for a moment sends
 //! `{:event :tooltip :window w :node n :text t :x :y}`; leaving it sends
-//! `{:event :tooltip :window w :node nil}`. Norn shows them as popups.
+//! `{:event :tooltip :window w :node nil}`. Skein shows them as popups.
 
 use crate::data::{Data, Event, NodeId, WindowId};
 use crate::engine::Engine;

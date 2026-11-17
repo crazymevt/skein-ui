@@ -1,7 +1,7 @@
-;;;; A small norn.ui demo: a counter, a text field, and a scrolling list.
-;;;; Run it with: ./target/debug/norn-ui examples/demo.norn
+;;;; A small skein.ui demo: a counter, a text field, and a scrolling list.
+;;;; Run it with: ./target/debug/skein-ui examples/demo.skn
 
-(require '[norn.ui :as ui])
+(require '[skein.ui :as ui])
 
 (ui/theme! {:tokens {:accent "#3070e0"}
             :rules [[[:button :* :*] {:background :accent :color "#ffffff" :padding [6 14] :border-radius 6}]
@@ -15,7 +15,7 @@
 
 (defn view [{:keys [count name items]}]
   [:column {:padding 20 :gap 14 :background "#f2f3f5"}
-   [:text {:font-size 22 :font-weight :bold} "norn.ui demo"]
+   [:text {:font-size 22 :font-weight :bold} "skein.ui demo"]
    [:box {:class :card}
     [:row {:gap 10 :align-items :center}
      [:button {:on-click (fn [_] (swap! state update :count inc))} "Click me"]
@@ -26,5 +26,5 @@
    [:scroll {:height 140 :background "#ffffff" :border [1 "#dddddd"] :border-radius 10 :padding 8}
     (for [i items] [:text {:key i :padding [3 6]} i])]])
 
-(ui/window {:title "norn.ui demo" :size [420 460]} #'view state)
+(ui/window {:title "skein.ui demo" :size [420 460]} #'view state)
 (ui/wait-closed)

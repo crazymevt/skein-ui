@@ -1,21 +1,21 @@
-;;;; The norn.ui widget gallery (M7.5's done-check app).
-;;;; Run it with: ./target/debug/norn-ui examples/gallery.norn
+;;;; The skein.ui widget gallery (M7.5's done-check app).
+;;;; Run it with: ./target/debug/skein-ui examples/gallery.skn
 
-(require '[norn.ui :as ui])
+(require '[skein.ui :as ui])
 
 (ui/theme! ui/base-theme)
 
 (def files
   [{:id :src :label "src" :icon :folder :color "#3070e0"
-    :children [{:id :main :label "main.norn" :icon :file-code} {:id :ui :label "ui.norn" :icon :file-code}
+    :children [{:id :main :label "main.skn" :icon :file-code} {:id :ui :label "ui.skn" :icon :file-code}
                {:id :widgets :label "widgets" :icon :folder
-                :children [{:id :tabs :label "tabs.norn" :icon :file-code} {:id :tree :label "tree.norn" :icon :file-code}]}]}
+                :children [{:id :tabs :label "tabs.skn" :icon :file-code} {:id :tree :label "tree.skn" :icon :file-code}]}]}
    {:id :docs :label "docs" :icon :folder :color "#c0752d" :children [{:id :readme :label "README.md" :icon :file-text}]}
-   {:id :build :label "build.norn" :icon :file-code :color "#3a8a3a"}])
+   {:id :build :label "build.skn" :icon :file-code :color "#3a8a3a"}])
 
 (def state
   (atom {:sidebar 200 :tab :controls :expanded #{:src} :selected :main
-         :dark? (ui/recall "norn-ui gallery" :dark? false) :wrap? true :name "" :clicks 0 :fruit :pear :level 0.5
+         :dark? (ui/recall "skein-ui gallery" :dark? false) :wrap? true :name "" :clicks 0 :fruit :pear :level 0.5
          :grid-sort [:n :asc] :grid-sel nil :grid-y 0 :grid-widths {:n 70 :name 200 :size 100}
          :items (vec (for [i (range 10000)] (str "Row " i))) :scroll-y 0}))
 
@@ -51,7 +51,7 @@
    (ui/toggle {:id :dark :on? dark? :label "Dark mode"
                :on-change (fn [v]
                             (swap! state assoc :dark? v)
-                            (ui/remember! "norn-ui gallery" :dark? v)
+                            (ui/remember! "skein-ui gallery" :dark? v)
                             (ui/theme! (if v ui/dark-theme ui/base-theme)))})
    (ui/checkbox {:id :wrap :checked? wrap? :label "Wrap long lines" :on-change (fn [v] (swap! state assoc :wrap? v))})
    [:text-field {:id :name :value name :placeholder "Your name" :width 240
@@ -65,7 +65,7 @@
               :on-scroll (fn [y] (swap! state assoc :scroll-y y))
               :row (fn [item i] [:row {:padding [4 8] :background (if (even? i) :panel :row-alt)} [:text item]])})])
 
-(def doc (ui/editor-model ";; The editor surface: the text is a rope in Norn; the engine draws
+(def doc (ui/editor-model ";; The editor surface: the text is a rope in Skein; the engine draws
 ;; only the lines in view and repaints only the lines that change.
 (defn fib [n]
   (if (< n 2)
@@ -76,7 +76,7 @@
 "))
 
 (def files-table
-  (vec (for [i (range 10000)] {:n i :name (str "file-" i ".norn") :size (mod (* i 7919) 100000)})))
+  (vec (for [i (range 10000)] {:n i :name (str "file-" i ".skn") :size (mod (* i 7919) 100000)})))
 
 (def sorted-cache (atom {}))
 
@@ -122,7 +122,7 @@
                                                      [:column {:padding 16}
                                                       (ui/markdown (slurp "README.md") {:on-link (fn [h] (println "link:" h))})]])]
                        [:text "Text" (fn [] (text-tab s))]
-                       [:editor "Editor" [:editor {:id :ed :model doc :highlight ui/highlight-norn}]]]))])
+                       [:editor "Editor" [:editor {:id :ed :model doc :highlight ui/highlight-skein}]]]))])
 
 ;; The menu bar, and files opened or dropped land in the editor tab.
 (defn open-in-editor! [path]
@@ -138,7 +138,7 @@
 
 (when (:dark? @state) (ui/theme! ui/dark-theme))
 
-(def w (ui/window {:title "norn.ui gallery" :size [720 480] :remember ["norn-ui gallery" :main]
+(def w (ui/window {:title "skein.ui gallery" :size [720 480] :remember ["skein-ui gallery" :main]
                    :on-drop (fn [e] (open-in-editor! (first (:paths e))))}
                   #'gallery state))
-(when-not (= "1" (norn.core/%getenv "NORN_UI_HEADLESS")) (ui/wait-closed))
+(when-not (= "1" (skein.core/%getenv "SKEIN_UI_HEADLESS")) (ui/wait-closed))

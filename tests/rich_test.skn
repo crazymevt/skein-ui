@@ -2,7 +2,7 @@
 
 (ns rich-test
   (:refer-core :exclude [settle])
-  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+  (:require [skein.test :refer [is deftest testing]] [skein.ui :as ui]))
 
 (ui/theme! ui/base-theme)
 (defn settle [] (sleep 150))
@@ -21,7 +21,7 @@
                      st)]
     (settle)
     (is (some? (ui/node-of w :r)))
-    (ui/screenshot w "/tmp/norn-ui-rich-spans.png" 2)
+    (ui/screenshot w "/tmp/skein-ui-rich-spans.png" 2)
     (testing "clicking a link"
       ;; on the text (the node is as wide as its column)
       (let [{:keys [x y h]} (ui/node-rect w (ui/node-of w :l))] (ui/simulate! [:click w (+ x 20) (+ y (quot h 2))]))
@@ -41,9 +41,9 @@
         (is (= "Plain, bold" (subs copied 0 (min 11 (count copied)))))))
     (ui/close-window w)))
 
-(def sample "# Norn Studio
+(def sample "# Skein Studio
 
-An editor for **Norn**, written in *Norn*, with `inline code` and a [link](https://example.com).
+An editor for **Skein**, written in *Skein*, with `inline code` and a [link](https://example.com).
 
 ## Lists
 
@@ -57,7 +57,7 @@ An editor for **Norn**, written in *Norn*, with `inline code` and a [link](https
 
 > A block quote that goes on long enough to wrap onto a second line in a narrow window.
 
-```norn
+```skein
 (defn hello [] :world)
 ```
 
@@ -76,7 +76,7 @@ The end.")
                      (fn [_] [:scroll {:flex-grow 1} [:column {:padding 14} (ui/markdown sample {:on-link (fn [h] (swap! links conj h))})]])
                      (atom nil))]
     (settle)
-    (ui/screenshot w "/tmp/norn-ui-markdown.png" 1)
+    (ui/screenshot w "/tmp/skein-ui-markdown.png" 1)
     (is (true? true))
     (ui/close-window w)))
 

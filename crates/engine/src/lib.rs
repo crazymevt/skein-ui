@@ -1,8 +1,8 @@
-//! The norn-ui engine (design §9.1, docs/ui-protocol.md in the Norn
+//! The skein-ui engine (design §9.1, docs/ui-protocol.md in the Skein
 //! repository): the retained node tree, styles and themes, layout,
 //! hit-testing, engine-side states, damage tracking and counters. It knows
-//! nothing of the Norn heap or of any platform; backends (headless, macOS)
-//! drive it, and the extension (crates/norn-ui) connects it to Norn.
+//! nothing of the Skein heap or of any platform; backends (headless, macOS)
+//! drive it, and the extension (crates/skein-ui) connects it to Skein.
 
 pub mod anim;
 pub mod data;

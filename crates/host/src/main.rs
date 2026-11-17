@@ -1,4 +1,4 @@
-//! The norn-ui renderer. The package launches it lazily and uses its
+//! The skein-ui renderer. The package launches it lazily and uses its
 //! standard pipes for patch batches and UI events. The main thread owns
 //! winit on desktop, or runs the deterministic headless backend.
 
@@ -6,9 +6,9 @@ mod backend;
 mod patch;
 mod wire;
 
-use norn_ui_engine::raster::{DecodeRequest, RasterImage};
-use norn_ui_engine::{Data, Engine, Event, Op, Text};
-use norn_ui_render::Renderer;
+use skein_ui_engine::raster::{DecodeRequest, RasterImage};
+use skein_ui_engine::{Data, Engine, Event, Op, Text};
+use skein_ui_render::Renderer;
 use std::collections::VecDeque;
 use std::io::{self, BufReader};
 use std::sync::{Condvar, LazyLock, Mutex, OnceLock, mpsc};
@@ -31,7 +31,7 @@ static SHARED: Shared = Shared {
     queue: Mutex::new(VecDeque::new()),
     wake: Condvar::new(),
 };
-static WAKER: OnceLock<norn_ui_desktop::Waker> = OnceLock::new();
+static WAKER: OnceLock<skein_ui_desktop::Waker> = OnceLock::new();
 static STUB: LazyLock<Mutex<backend::Stub>> = LazyLock::new(Mutex::default);
 
 fn execute(cmd: Cmd, engine: &mut Engine, text: &mut Text, painter: &mut Option<(Renderer, f32)>) {
@@ -69,7 +69,7 @@ fn decode_off_thread(requests: Vec<DecodeRequest>) {
         let threads = thread::available_parallelism().map_or(2, |n| n.get().clamp(1, 4));
         for i in 0..threads {
             let receive = receive.clone();
-            let _ = thread::Builder::new().name(format!("norn-ui-decode-{i}")).spawn(move || {
+            let _ = thread::Builder::new().name(format!("skein-ui-decode-{i}")).spawn(move || {
                 loop {
                     let Ok(request) = receive.lock().unwrap().recv() else { return };
                     let result = request.decode();
@@ -154,13 +154,13 @@ fn ready() {
 }
 
 fn fail(error: impl std::fmt::Display) -> ! {
-    eprintln!("norn-ui-host: {error}");
+    eprintln!("skein-ui-host: {error}");
     std::process::exit(1);
 }
 
 fn main() {
     if let Err(error) = thread::Builder::new()
-        .name("norn-ui-input".into())
+        .name("skein-ui-input".into())
         .spawn(read_requests)
     {
         fail(error);
@@ -170,7 +170,7 @@ fn main() {
         backend::headless();
     }
 
-    if let Err(error) = norn_ui_desktop::run(
+    if let Err(error) = skein_ui_desktop::run(
         |waker| {
             let _ = WAKER.set(waker);
             ready();

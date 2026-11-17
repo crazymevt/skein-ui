@@ -3,7 +3,7 @@
 
 (ns shell-test
   (:refer-core :exclude [settle])
-  (:require [norn.test :refer [is are deftest testing]] [norn.ui :as ui]))
+  (:require [skein.test :refer [is are deftest testing]] [skein.ui :as ui]))
 
 (ui/theme! ui/base-theme)
 (defn settle [] (sleep 150))
@@ -32,13 +32,13 @@
 (defn view [{:keys [side]}]
   [:column {:flex-grow 1}
    (ui/top-bar [:text "loom-lang"] (ui/chip {:id :branch :icon :git-branch :label "main"}) [:spacer]
-               (ui/chip {:id :repl :dot "#3a8a3a" :label "norn: running"}))
+               (ui/chip {:id :repl :dot "#3a8a3a" :label "skein: running"}))
    [:row {:flex-grow 1}
     (ui/activity-bar {:id :bar :selected side
                       :items [[:explorer :file "Explorer"] [:search :search "Search"] [:git :git-branch "Source Control"]]
                       :on-select (fn [k] (swap! st update :side (fn [s] (when-not (= s k) k))))})
     [:column {:flex-grow 1} [:text {:id :side} (str "sidebar: " side)]]]
-   (ui/status-bar {:left [[:text "Ln 1, Col 1"]] :right [(ui/chip {:label "Norn"})]})])
+   (ui/status-bar {:left [[:text "Ln 1, Col 1"]] :right [(ui/chip {:label "Skein"})]})])
 
 (deftest the-shell
   (let [w (ui/window {:size [640 400]} #'view st)]
@@ -58,7 +58,7 @@
       (settle)
       (ui/simulate! [:key w :arrow-down #{}])
       (settle)
-      (ui/screenshot (first (ui/popups-of w)) "/tmp/norn-ui-palette.png" 2)
+      (ui/screenshot (first (ui/popups-of w)) "/tmp/skein-ui-palette.png" 2)
       (ui/simulate! [:key w :enter #{}])
       (settle)
       ;; "Evaluate File" ranks first (shorter), so Down picks the other
@@ -70,5 +70,5 @@
       (ui/simulate! [:key w :escape #{}])
       (settle)
       (is (empty? (ui/popups-of w))))
-    (ui/screenshot w "/tmp/norn-ui-shell.png" 1)
+    (ui/screenshot w "/tmp/skein-ui-shell.png" 1)
     (ui/close-window w)))

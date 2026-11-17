@@ -1,9 +1,9 @@
-;;;; norn.ui's platform requests, against the headless backend's stand-ins:
+;;;; skein.ui's platform requests, against the headless backend's stand-ins:
 ;;;; menus and commands, file dialogs, the clipboard and dropped files.
 
 (ns platform-test
   (:refer-core :exclude [settle])
-  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+  (:require [skein.test :refer [is deftest testing]] [skein.ui :as ui]))
 
 (def state (atom {:dropped nil :window-dropped nil}))
 
@@ -32,8 +32,8 @@
       (is (= [:save] @chosen)))))
 
 (deftest dialogs
-  (ui/simulate! [:dialog-answer ["/tmp/a.norn"]])
-  (is (= "/tmp/a.norn" (ui/choose-file {:filters [["Norn" ["norn"]]]})))
+  (ui/simulate! [:dialog-answer ["/tmp/a.skn"]])
+  (is (= "/tmp/a.skn" (ui/choose-file {:filters [["Skein" ["skein"]]]})))
   (ui/simulate! [:dialog-answer ["/tmp/a" "/tmp/b"]])
   (is (= ["/tmp/a" "/tmp/b"] (ui/choose-file {:multiple true})))
   (ui/simulate! [:dialog-answer ["/tmp/out.txt"]])

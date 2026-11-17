@@ -1,7 +1,7 @@
 //! Text with the bundled fonts: families, measuring, wrapping, glyph runs,
 //! and layout using real text sizes.
 
-use norn_ui_engine::{Data, Engine, Op, Props, Text, TextStyle};
+use skein_ui_engine::{Data, Engine, Op, Props, Text, TextStyle};
 
 fn style(family: &str, size: f32) -> TextStyle {
     TextStyle { family: family.into(), size, ..TextStyle::default() }

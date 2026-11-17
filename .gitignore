@@ -1,4 +1,4 @@
 /target/
 /bin/
-*.nimg
+*.skimg
 .DS_Store

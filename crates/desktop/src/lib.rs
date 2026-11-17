@@ -3,7 +3,7 @@
 //! and Windows mostly configuration.
 //!
 //! The backend owns the event loop on the process's first thread and knows
-//! nothing of Norn: `run` takes a `pull` callback that applies queued work
+//! nothing of Skein: `run` takes a `pull` callback that applies queued work
 //! (patch batches, scripted input) to the engine, and a `deliver` callback
 //! that sends the engine's events on. The host wakes the loop with the
 //! waker it is given.
@@ -13,8 +13,8 @@
 //! window's canvas; the canvas is then copied to the screen. Occluded or
 //! minimised windows draw nothing. The low-power GPU is preferred.
 
-use norn_ui_engine::{Data, Engine, Text};
-use norn_ui_render::Renderer;
+use skein_ui_engine::{Data, Engine, Text};
+use skein_ui_render::Renderer;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -65,7 +65,7 @@ struct App<P, D> {
     /// arrived yet: the request it answers.
     context_req: Option<Data>,
     /// Where the IME candidate window was last placed.
-    ime_area: Option<(u64, norn_ui_engine::Rect)>,
+    ime_area: Option<(u64, skein_ui_engine::Rect)>,
     /// Wheel and trackpad scrolling since the last step, by window:
     /// (x, y, dx, dy), the deltas summed. A trackpad sends far more events
     /// than there are frames; applied one by one, each laid out and drew
@@ -129,16 +129,16 @@ fn menu_items(items: &[Data]) -> Vec<Box<dyn muda::IsMenuItem>> {
     out
 }
 
-/// NORN_UI_FRAMES=1: report steps, event handling and waits for a surface
+/// SKEIN_UI_FRAMES=1: report steps, event handling and waits for a surface
 /// slower than a frame, and what took the time.
 fn frames_trace() -> bool {
     static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *D.get_or_init(|| std::env::var("NORN_UI_FRAMES").is_ok_and(|v| v == "1"))
+    *D.get_or_init(|| std::env::var("SKEIN_UI_FRAMES").is_ok_and(|v| v == "1"))
 }
 
 fn debug() -> bool {
     static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *D.get_or_init(|| std::env::var("NORN_UI_DEBUG").is_ok_and(|v| v == "1"))
+    *D.get_or_init(|| std::env::var("SKEIN_UI_DEBUG").is_ok_and(|v| v == "1"))
 }
 
 fn named(k: &NamedKey) -> String {
@@ -207,7 +207,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
                 .iter()
                 .find(|(k, _)| k == "title")
                 .and_then(|(_, v)| v.as_str())
-                .unwrap_or("Norn")
+                .unwrap_or("Skein")
                 .to_owned();
             let place = self.popup_place(w);
             if let Some(os) = self.windows.get_mut(&w) {
@@ -224,7 +224,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
                 continue;
             }
             if let Err(e) = self.open(el, w, title) {
-                eprintln!("norn-ui: {e}");
+                eprintln!("skein-ui: {e}");
                 self.error = Some(e);
             }
         }
@@ -271,18 +271,18 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
         let items = menu_items(tree);
         let refs: Vec<&dyn muda::IsMenuItem> = items.iter().map(|b| b.as_ref()).collect();
         let (Ok(menu), Some(os)) = (muda::Menu::with_items(&refs), self.windows.get(&w)) else {
-            self.engine.push_event(norn_ui_engine::Event::new("menu-dismissed", vec![("req", req)]));
+            self.engine.push_event(skein_ui_engine::Event::new("menu-dismissed", vec![("req", req)]));
             return;
         };
         let chosen = show_context_menu(&menu, &os.window, x, y);
         if !chosen {
-            self.engine.push_event(norn_ui_engine::Event::new("menu-dismissed", vec![("req", req)]));
+            self.engine.push_event(skein_ui_engine::Event::new("menu-dismissed", vec![("req", req)]));
             return;
         }
         // The item's menu event may already be queued, or come next.
         let first = { let mut c = self.commands.lock().unwrap(); (!c.is_empty()).then(|| c.remove(0)) };
         match first {
-            Some(cmd) => self.engine.push_event(norn_ui_engine::Event::new("command", vec![("req", req), ("command", Data::key(&cmd))])),
+            Some(cmd) => self.engine.push_event(skein_ui_engine::Event::new("command", vec![("req", req), ("command", Data::key(&cmd))])),
             None => self.context_req = Some(req),
         }
     }
@@ -345,7 +345,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
     }
 
     /// Menu commands chosen since the last step: text-field editing ones
-    /// act on the focused field; all go to Norn as :command.
+    /// act on the focused field; all go to Skein as :command.
     fn commands(&mut self) {
         let chosen: Vec<String> = std::mem::take(&mut *self.commands.lock().unwrap());
         for cmd in chosen {
@@ -357,7 +357,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
                 let _ = cb.set_text(t);
             }
             if let Some(req) = self.context_req.take() {
-                self.engine.push_event(norn_ui_engine::Event::new("command", vec![("req", req), ("command", Data::key(&cmd))]));
+                self.engine.push_event(skein_ui_engine::Event::new("command", vec![("req", req), ("command", Data::key(&cmd))]));
                 continue;
             }
             if self.engine.focused_field().is_some() {
@@ -390,7 +390,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
         }
     }
 
-    /// Menus, dialogs and the clipboard, as Norn asked.
+    /// Menus, dialogs and the clipboard, as Skein asked.
     fn platform(&mut self) {
         for (op, args) in std::mem::take(&mut self.engine.platform) {
             match op.as_str() {
@@ -435,7 +435,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
                         _ => d.pick_file().map(|p| vec![p]),
                     };
                     let paths = paths.map_or(Data::Nil, |ps| Data::List(ps.iter().map(|p| Data::Str(p.to_string_lossy().into_owned())).collect()));
-                    self.engine.push_event(norn_ui_engine::Event::new("dialog", vec![("req", req), ("paths", paths)]));
+                    self.engine.push_event(skein_ui_engine::Event::new("dialog", vec![("req", req), ("paths", paths)]));
                 }
                 "clipboard-set" => {
                     if let (Some(t), Some(cb)) = (args.first().and_then(Data::as_str), self.clipboard.as_mut()) {
@@ -444,7 +444,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
                 }
                 "clipboard-get" => {
                     let text = self.clipboard.as_mut().and_then(|cb| cb.get_text().ok()).map_or(Data::Nil, Data::Str);
-                    self.engine.push_event(norn_ui_engine::Event::new("clipboard", vec![("req", args.first().cloned().unwrap_or(Data::Nil)), ("text", text)]));
+                    self.engine.push_event(skein_ui_engine::Event::new("clipboard", vec![("req", args.first().cloned().unwrap_or(Data::Nil)), ("text", text)]));
                 }
                 _ => {}
             }
@@ -474,7 +474,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
             let t2 = Instant::now();
             let scale = self.windows[&w].scale;
             if debug() {
-                eprintln!("norn-ui: window {w}: repaint {damage:?} at scale {scale}");
+                eprintln!("skein-ui: window {w}: repaint {damage:?} at scale {scale}");
             }
             if let Some(r) = self.renderer.as_mut() {
                 r.render(&self.engine, w, &mut self.text, &damage, scale);
@@ -485,7 +485,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
         (self.deliver)(&mut self.engine);
         if frames_trace() && t0.elapsed() > Duration::from_millis(12) {
             let ws: Vec<String> = times.iter().map(|(w, l, d)| format!("window {w}: layout {:.1} ms, draw {:.1} ms", l.as_secs_f64() * 1e3, d.as_secs_f64() * 1e3)).collect();
-            eprintln!("norn-ui: slow step {:.1} ms (ops {:.1} ms; {})", t0.elapsed().as_secs_f64() * 1e3, pulled.as_secs_f64() * 1e3, ws.join("; "));
+            eprintln!("skein-ui: slow step {:.1} ms (ops {:.1} ms; {})", t0.elapsed().as_secs_f64() * 1e3, pulled.as_secs_f64() * 1e3, ws.join("; "));
         }
     }
 
@@ -495,7 +495,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
         let got = os.surface.get_current_texture();
         if frames_trace() && t0.elapsed() > Duration::from_millis(20) {
             eprintln!(
-                "norn-ui: window {w}: waited {:.1} ms for a surface ({}, visible {:?})",
+                "skein-ui: window {w}: waited {:.1} ms for a surface ({}, visible {:?})",
                 t0.elapsed().as_secs_f64() * 1e3,
                 match &got {
                     wgpu::CurrentSurfaceTexture::Success(_) => "ok",
@@ -508,7 +508,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
             );
         }
         if debug() {
-            eprintln!("norn-ui: window {w}: present ({:?}, {}×{} {:?})", std::mem::discriminant(&got), os.config.width, os.config.height, os.config.format);
+            eprintln!("skein-ui: window {w}: present ({:?}, {}×{} {:?})", std::mem::discriminant(&got), os.config.width, os.config.height, os.config.format);
         }
         let frame = match got {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -597,13 +597,13 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> ApplicationHandler
         self.step(el);
     }
 
-    /// The event loop is ending. Norn closes windows itself, so if some are
+    /// The event loop is ending. Skein closes windows itself, so if some are
     /// still open, the system asked the app to quit: say so, as otherwise
     /// it looks like the program just stopped.
     fn exiting(&mut self, _: &ActiveEventLoop) {
         if !self.engine.windows.is_empty() {
             eprintln!(
-                "norn-ui: quitting because the system asked the app to quit ({} window(s) open)",
+                "skein-ui: quitting because the system asked the app to quit ({} window(s) open)",
                 self.engine.windows.len()
             );
         }
@@ -679,7 +679,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> ApplicationHandler
         let t = Instant::now();
         self.window_event_now(el, id, event);
         if t.elapsed() > Duration::from_millis(20) {
-            eprintln!("norn-ui: handling {name} took {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            eprintln!("skein-ui: handling {name} took {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
         }
     }
 }
@@ -713,7 +713,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
             }
             WindowEvent::Occluded(hidden) => {
                 if debug() {
-                    eprintln!("norn-ui: window {w}: occluded {hidden}");
+                    eprintln!("skein-ui: window {w}: occluded {hidden}");
                 }
                 self.engine.set_visible(w, !hidden);
                 if !hidden && self.windows.get(&w).is_some_and(|o| o.unshown) {

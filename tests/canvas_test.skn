@@ -1,5 +1,5 @@
 (ns canvas-test
-  (:require [norn.test :refer [is deftest]] [norn.ui :as ui]))
+  (:require [skein.test :refer [is deftest]] [skein.ui :as ui]))
 
 (deftest wheel-target-and-default-scroll
   (let [wheel (atom [])

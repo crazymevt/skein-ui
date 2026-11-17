@@ -2,7 +2,7 @@
 
 (ns ime-anim-test
   (:refer-core :exclude [settle])
-  (:require [norn.test :refer [is deftest]] [norn.ui :as ui]))
+  (:require [skein.test :refer [is deftest]] [skein.ui :as ui]))
 
 (ui/theme! ui/base-theme)
 (defn settle [] (sleep 100))
@@ -18,7 +18,7 @@
     (ui/click! w :f)
     (ui/simulate! [:preedit w "にほ"])
     (settle)
-    (ui/screenshot w "/tmp/norn-ui-ime-field.png" 2)
+    (ui/screenshot w "/tmp/skein-ui-ime-field.png" 2)
     (is (= "ab" (:v @st)) "a composition isn't input")
     (ui/simulate! [:preedit w ""])
     (ui/simulate! [:type w "日本"])
@@ -34,7 +34,7 @@
     (ui/simulate! [:key w :home #{}])
     (ui/simulate! [:preedit w "かな"])
     (settle)
-    (ui/screenshot w "/tmp/norn-ui-ime-editor.png" 2)
+    (ui/screenshot w "/tmp/skein-ui-ime-editor.png" 2)
     (is (= "(def x 1)" (ui/editor-text doc)))
     (ui/simulate! [:preedit w ""])
     (ui/simulate! [:type w "仮名"])
@@ -58,5 +58,5 @@
       (is (= 0 (:layouts s)) "colour doesn't lay out"))
     (sleep 300)
     (is (= 0 (:frames (ui/stats))) "and none once it's done")
-    (ui/screenshot w "/tmp/norn-ui-transition-end.png" 1)
+    (ui/screenshot w "/tmp/skein-ui-transition-end.png" 1)
     (ui/close-window w)))

@@ -1,5 +1,5 @@
 //! Text fields, edited in the engine (docs/ui-protocol.md §3): typing,
-//! selection, the caret and its blink never wait on Norn. Norn gets
+//! selection, the caret and its blink never wait on Skein. Skein gets
 //! `:input` with the new value (coalesced) and `:submit` on Enter, and can
 //! set `:value` at any time (a controlled field).
 //!

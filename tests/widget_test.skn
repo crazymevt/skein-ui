@@ -2,7 +2,7 @@
 
 (ns widget-test
   (:refer-core :exclude [settle])
-  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+  (:require [skein.test :refer [is deftest testing]] [skein.ui :as ui]))
 
 (ui/theme! ui/base-theme)
 (defn settle [] (sleep 100))
@@ -35,7 +35,7 @@
 (deftest widgets-paint-and-handle-events
   (let [w (ui/window {:size [220 60]} #'view st)]
     (settle)
-    (ui/screenshot w "/tmp/norn-ui-widget-before.png" 2)
+    (ui/screenshot w "/tmp/skein-ui-widget-before.png" 2)
     (let [{:keys [x y]} (ui/node-rect w (ui/node-of w :holder))]
       (ui/simulate! [:click w (+ x 150) (+ y 20)]))
     (settle)
@@ -58,7 +58,7 @@
       (let [s (ui/stats)]
         (is (= 1 (:frames s)))
         (is (= 0 (:layouts s)))))
-    (ui/screenshot w "/tmp/norn-ui-widget-after.png" 2)
+    (ui/screenshot w "/tmp/skein-ui-widget-after.png" 2)
     (ui/close-window w)))
 
 (deftest switching-themes-repaints-everything

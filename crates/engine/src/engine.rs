@@ -43,7 +43,7 @@ impl Node {
             _ => Vec::new(),
         }
     }
-    /// Does Norn want event `e` from this node?
+    /// Does Skein want event `e` from this node?
     pub fn wants(&self, e: &str) -> bool {
         self.prop("on").is_some_and(|on| on.has_key(e))
     }
@@ -196,11 +196,11 @@ pub struct Engine {
     pub(crate) anim_at: Option<std::time::Instant>,
     /// The selection in a rich-text node.
     pub(crate) rich_sel: Option<crate::rich::RichSel>,
-    /// Scroll positions Norn set, for the next frame.
+    /// Scroll positions Skein set, for the next frame.
     pending_scroll: HashMap<NodeId, (Option<f32>, Option<f32>)>,
     /// Nodes given :reveal true: scrolled into view after the next layout.
     pending_reveal: HashSet<NodeId>,
-    /// Scroll positions recently reported to Norn, per node: Norn setting
+    /// Scroll positions recently reported to Skein, per node: Skein setting
     /// one of these back is an echo, not a request (it would undo a fast
     /// wheel).
     reported_scroll: HashMap<NodeId, std::collections::VecDeque<(f32, f32)>>,
@@ -307,7 +307,7 @@ impl Engine {
         }
     }
 
-    /// Events produced since the last call, for Norn.
+    /// Events produced since the last call, for Skein.
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
     }
@@ -343,7 +343,7 @@ impl Engine {
         self.events.push(Event::new("command", fields));
     }
 
-    /// Queue an event for Norn (backends use this for their own answers).
+    /// Queue an event for Skein (backends use this for their own answers).
     pub fn push_event(&mut self, e: Event) {
         self.events.push(e);
     }
@@ -481,7 +481,7 @@ impl Engine {
     }
 
     fn apply_op(&mut self, op: Op) {
-        // A scroll container's :scroll-x/:scroll-y set by Norn: applied at
+        // A scroll container's :scroll-x/:scroll-y set by Skein: applied at
         // the next frame, once the layout is current.
         if let Op::Create { id, props, .. } | Op::Set { id, props } = &op {
             let get = |k: &str| props.iter().find(|(x, _)| x == k).and_then(|(_, v)| v.as_num()).map(|n| n as f32);
@@ -535,7 +535,7 @@ impl Engine {
                 }
             }
             Op::Set { id, props } => {
-                // Norn setting a field's value replaces what was typed.
+                // Skein setting a field's value replaces what was typed.
                 if let (Some(f), Some(Data::Str(v))) = (self.fields.get_mut(&id), props.iter().find(|(k, _)| k == "value").map(|(_, v)| v))
                     && f.value != *v
                 {
@@ -996,7 +996,7 @@ impl Engine {
         win.clips = clips;
     }
 
-    /// Does node id clip its children (and so may be scrolled by Norn)?
+    /// Does node id clip its children (and so may be scrolled by Skein)?
     fn scrolls(&self, id: NodeId) -> bool {
         let n = &self.nodes[&id];
         n.kind == "scroll" || n.resolved.iter().any(|(k, v)| k == "overflow" && matches!(v.as_key(), Some("scroll" | "hidden")))
@@ -1112,9 +1112,9 @@ impl Engine {
         };
         let Some(r) = self.windows.get(&w).and_then(|win| win.rects.get(&id)).copied() else { return false };
         let modifiers = Data::Set(modifiers.iter().map(|m| Data::key(m)).collect());
-        // A wheel event still waiting for Norn, for the same node and
+        // A wheel event still waiting for Skein, for the same node and
         // modifiers, takes this one's movement: a fast trackpad scroll
-        // reaches Norn as a few events, not one per OS event.
+        // reaches Skein as a few events, not one per OS event.
         if let Some(last) = self.events.last_mut()
             && last.kind == "wheel"
             && last.get("window") == Some(&Data::Num(w as f64))
@@ -1182,7 +1182,7 @@ impl Engine {
     }
 
     /// Scroll container id of window w to (x, y), clamped to its range: it
-    /// repaints, and Norn hears if it asked (:scroll). False if it didn't
+    /// repaints, and Skein hears if it asked (:scroll). False if it didn't
     /// move.
     fn set_scroll(&mut self, w: WindowId, id: NodeId, x: f32, y: f32) -> bool {
         let (mx, my) = self.scroll_range(w, id);
@@ -1272,7 +1272,7 @@ impl Engine {
         }
     }
 
-    /// Scroll positions Norn set for window w's scroll containers.
+    /// Scroll positions Skein set for window w's scroll containers.
     fn apply_pending_scroll(&mut self, w: WindowId) {
         let ids: Vec<NodeId> = self.pending_scroll.keys().copied().filter(|n| self.window_of(*n) == Some(w)).collect();
         let mut moved = Vec::new();
@@ -1455,7 +1455,7 @@ impl Engine {
     }
 
     /// Pointer motion: only restyles (hover), or drag-selects in a text
-    /// field; nothing crosses to Norn.
+    /// field; nothing crosses to Skein.
     pub fn pointer_moved(&mut self, w: WindowId, x: f32, y: f32, m: &mut dyn Measure) {
         if let Some(d) = self.thumb_drag {
             self.drag_thumb(d, x, y);
@@ -1648,7 +1648,7 @@ impl Engine {
         self.events.push(Event::new("key", fields));
     }
 
-    /// The OS moved window w to (x, y) on screen (logical): tell Norn
+    /// The OS moved window w to (x, y) on screen (logical): tell Skein
     /// (coalesced), so apps can remember where their windows were.
     pub fn moved(&mut self, w: WindowId, x: f32, y: f32) {
         let me = Data::Num(w as f64);
@@ -1656,7 +1656,7 @@ impl Engine {
         self.events.push(Event::new("moved", vec![("window", me), ("position", Data::List(vec![Data::Num(x as f64), Data::Num(y as f64)]))]));
     }
 
-    /// The window changed size: lay it out again and tell Norn.
+    /// The window changed size: lay it out again and tell Skein.
     pub fn resized(&mut self, w: WindowId, width: f32, height: f32, scale: f32) {
         let Some(win) = self.windows.get_mut(&w) else { return };
         win.size = (width, height);

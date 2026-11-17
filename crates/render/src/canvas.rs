@@ -17,8 +17,8 @@ use crate::display::{Item, PixelSampling};
 use lyon::math::point;
 use lyon::path::Path;
 use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, StrokeOptions, StrokeTessellator, StrokeVertex, VertexBuffers};
-use norn_ui_engine::text::{Rgba, TextStyle, color};
-use norn_ui_engine::{Data, Rect, Text};
+use skein_ui_engine::text::{Rgba, TextStyle, color};
+use skein_ui_engine::{Data, Rect, Text};
 
 struct Ctx<'a> {
     text: &'a mut Text,
@@ -141,7 +141,7 @@ impl Ctx<'_> {
                 "text" => {
                     let (x, y) = pt(xs.get(1));
                     let Some(s) = xs.get(2).and_then(Data::as_str) else { continue };
-                    let props = xs.get(3).map(|d| norn_ui_engine::style::props_of(d).unwrap_or_default()).unwrap_or_default();
+                    let props = xs.get(3).map(|d| skein_ui_engine::style::props_of(d).unwrap_or_default()).unwrap_or_default();
                     let ts = TextStyle::from_props(&props, self.lookup);
                     let layout = self.text.layout(s, &ts, None);
                     self.out.push(Item::Text { x: x + dx, y: y + dy, runs: Text::glyph_runs(&layout), clip });

@@ -2,8 +2,8 @@
 //! Set UPDATE_GOLDEN=1 to rewrite tests/golden/*.png after a deliberate
 //! change; review the new images before committing them.
 
-use norn_ui_engine::{Data, Engine, Op, Props, Rect, Text};
-use norn_ui_render::{Item, PixelSampling, Renderer, display_list, read_png, write_png};
+use skein_ui_engine::{Data, Engine, Op, Props, Rect, Text};
+use skein_ui_render::{Item, PixelSampling, Renderer, display_list, read_png, write_png};
 
 fn p(kvs: &[(&str, Data)]) -> Props {
     kvs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
@@ -27,7 +27,7 @@ fn scene() -> Engine {
         Op::Style { id: 1, style: p(&[("flex-direction", k("column")), ("background", s("#f0f0f0"))]) },
         Op::Create { id: 2, kind: "box".into(), props: vec![] },
         Op::Style { id: 2, style: p(&[("height", n(40.0)), ("padding", n(10.0)), ("background", s("#202830"))]) },
-        Op::Create { id: 3, kind: "text".into(), props: p(&[("text", s("Norn UI"))]) },
+        Op::Create { id: 3, kind: "text".into(), props: p(&[("text", s("Skein UI"))]) },
         Op::Style { id: 3, style: p(&[("color", s("#ffffff")), ("font-size", n(16.0)), ("font-weight", k("bold"))]) },
         Op::Create { id: 4, kind: "button".into(), props: vec![] },
         Op::Style {

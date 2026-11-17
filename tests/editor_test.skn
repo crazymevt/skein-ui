@@ -3,7 +3,7 @@
 
 (ns editor-test
   (:refer-core :exclude [settle])
-  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui] [norn.rope :as rope]))
+  (:require [skein.test :refer [is deftest testing]] [skein.ui :as ui] [skein.rope :as rope]))
 
 (defn settle [] (sleep 100))
 
@@ -94,7 +94,7 @@
       (is (< before (second (first (first (ui/editor-carets doc))))))
       (testing "typing at the end of a long line scrolls it into view"
         (keys! w :end)
-        (ui/simulate! [:screenshot w "/tmp/norn-ui-editor-hscroll.png" 1])
+        (ui/simulate! [:screenshot w "/tmp/skein-ui-editor-hscroll.png" 1])
         (settle)
         (is (= 200 (second (first (first (ui/editor-carets doc))))))))
     (ui/close-window w)))
@@ -131,5 +131,5 @@
       (settle)
       (is (true? @pasted))
       (is (= "red text\nplain" (ui/editor-text m)) "the paste didn't reach the text"))
-    (ui/screenshot w "/tmp/norn-ui-editor-show.png" 1)
+    (ui/screenshot w "/tmp/skein-ui-editor-show.png" 1)
     (ui/close-window w)))

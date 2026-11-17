@@ -1,12 +1,12 @@
 //! Run the existing renderer with real windows or deterministic scripted input.
 
 use crate::{Cmd, SHARED, STUB, deliver, execute};
-use norn_ui_engine::{Data, Engine, Text};
-use norn_ui_render::Renderer;
+use skein_ui_engine::{Data, Engine, Text};
+use skein_ui_render::Renderer;
 use std::sync::LazyLock;
 
 pub(crate) static HEADLESS: LazyLock<bool> =
-    LazyLock::new(|| std::env::var_os("NORN_UI_HEADLESS").is_some_and(|value| value == "1"));
+    LazyLock::new(|| std::env::var_os("SKEIN_UI_HEADLESS").is_some_and(|value| value == "1"));
 
 fn num(xs: &[Data], i: usize) -> f32 {
     xs.get(i).and_then(Data::as_num).unwrap_or(0.0) as f32
@@ -38,12 +38,12 @@ pub(crate) fn input(
     xs: &[Data],
 ) {
     if xs.first().and_then(Data::as_key) == Some("screenshot") && !*HEADLESS {
-        engine.push_event(norn_ui_engine::Event::new(
+        engine.push_event(skein_ui_engine::Event::new(
             "screenshot",
             vec![
                 (
                     "error",
-                    Data::str("screenshots need the headless backend (NORN_UI_HEADLESS=1)"),
+                    Data::str("screenshots need the headless backend (SKEIN_UI_HEADLESS=1)"),
                 ),
                 ("path", xs.get(2).cloned().unwrap_or(Data::Nil)),
             ],
@@ -70,7 +70,7 @@ pub(crate) fn input(
                 w,
                 text,
                 if damage.is_empty() {
-                    &[norn_ui_engine::Rect {
+                    &[skein_ui_engine::Rect {
                         x: 0.0,
                         y: 0.0,
                         w: 1.0,
@@ -83,7 +83,7 @@ pub(crate) fn input(
             );
             r.save_png(w, std::path::Path::new(&path))
         })();
-        engine.push_event(norn_ui_engine::Event::new(
+        engine.push_event(skein_ui_engine::Event::new(
             "screenshot",
             vec![
                 ("window", Data::Num(w as f64)),
@@ -154,7 +154,7 @@ pub(crate) fn input(
             let r = e
                 .editor_caret_rect(num(xs, 2) as u64, text)
                 .unwrap_or_default();
-            e.push_event(norn_ui_engine::Event::new(
+            e.push_event(skein_ui_engine::Event::new(
                 "rect",
                 vec![
                     ("req", xs.get(3).cloned().unwrap_or(Data::Nil)),
@@ -167,7 +167,7 @@ pub(crate) fn input(
         }
         Some("rect") => {
             let r = e.rect(num(xs, 2) as u64).unwrap_or_default();
-            e.push_event(norn_ui_engine::Event::new(
+            e.push_event(skein_ui_engine::Event::new(
                 "rect",
                 vec![
                     ("req", xs.get(3).cloned().unwrap_or(Data::Nil)),
@@ -243,17 +243,17 @@ fn stub_platform(e: &mut Engine) {
             "menu" => stub.menu = Some(req()),
             "dialog" => {
                 let paths = stub.dialogs.pop_front().unwrap_or(Data::Nil);
-                e.push_event(norn_ui_engine::Event::new(
+                e.push_event(skein_ui_engine::Event::new(
                     "dialog",
                     vec![("req", req()), ("paths", paths)],
                 ));
             }
             "context-menu" => match stub.menus.pop_front().unwrap_or(Data::Nil) {
-                Data::Nil => e.push_event(norn_ui_engine::Event::new(
+                Data::Nil => e.push_event(skein_ui_engine::Event::new(
                     "menu-dismissed",
                     vec![("req", req())],
                 )),
-                cmd => e.push_event(norn_ui_engine::Event::new(
+                cmd => e.push_event(skein_ui_engine::Event::new(
                     "command",
                     vec![("req", req()), ("command", cmd)],
                 )),
@@ -263,7 +263,7 @@ fn stub_platform(e: &mut Engine) {
             }
             "clipboard-get" => {
                 let text = stub.clipboard.clone().map_or(Data::Nil, Data::Str);
-                e.push_event(norn_ui_engine::Event::new(
+                e.push_event(skein_ui_engine::Event::new(
                     "clipboard",
                     vec![("req", req()), ("text", text)],
                 ));
@@ -311,13 +311,13 @@ pub(crate) fn headless() -> ! {
         for w in windows {
             // Lay out, and paint the damage once there is a painter.
             let damage = h.engine.frame(w, &mut h.text);
-            // NORN_UI_DAMAGE=1: what each frame repaints (for budgets).
-            if !damage.is_empty() && std::env::var("NORN_UI_DAMAGE").is_ok_and(|v| v == "1") {
+            // SKEIN_UI_DAMAGE=1: what each frame repaints (for budgets).
+            if !damage.is_empty() && std::env::var("SKEIN_UI_DAMAGE").is_ok_and(|v| v == "1") {
                 let rects: Vec<String> = damage
                     .iter()
                     .map(|r| format!("{}x{}@{},{}", r.w, r.h, r.x, r.y))
                     .collect();
-                eprintln!("norn-ui: window {w} repaints {}", rects.join(" "));
+                eprintln!("skein-ui: window {w} repaints {}", rects.join(" "));
             }
             if let Some((r, scale)) = h.painter.as_mut() {
                 r.render(&h.engine, w, &mut h.text, &damage, *scale);

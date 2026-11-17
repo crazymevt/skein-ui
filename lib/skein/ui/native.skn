@@ -1,25 +1,25 @@
-;;;; The norn.ui bridge for stock Norn. Patch batches and UI events travel
-;;;; over the renderer's pipes as length-prefixed norn.bin values.
+;;;; The skein.ui bridge for stock Skein. Patch batches and UI events travel
+;;;; over the renderer's pipes as length-prefixed skein.bin values.
 
-(ns norn.ui.native
-  (:require [norn.bin :as bin] [norn.io :as io] [norn.process :as process]
-            [norn.sys :as sys]))
+(ns skein.ui.native
+  (:require [skein.bin :as bin] [skein.io :as io] [skein.process :as process]
+            [skein.sys :as sys]))
 
 (def ^:private package-root
-  (when-let [[_ source] (norn.core/%find-lib "norn.ui.native")]
+  (when-let [[_ source] (skein.core/%find-lib "skein.ui.native")]
     (let [root (nth (iterate io/parent (io/absolute source)) 4)]
       (or (io/canonical root) root))))
 
 (def ^:private frame-limit (* 128 1024 1024))
 
 (defn- host-path []
-  (or (sys/getenv "NORN_UI_HOST")
+  (or (sys/getenv "SKEIN_UI_HOST")
       (some #(when (io/file? %) %)
             (let [{:keys [os arch]} (sys/info)]
-              [(io/path package-root "target" "release" "norn-ui-host")
-               (io/path package-root "bin" (str (name os) "-" (name arch)) "norn-ui-host")]))
-      (error "norn-ui: renderer missing. Run cargo build --release --locked -p norn-ui-host in"
-             package-root "or set NORN_UI_HOST.")))
+              [(io/path package-root "target" "release" "skein-ui-host")
+               (io/path package-root "bin" (str (name os) "-" (name arch)) "skein-ui-host")]))
+      (error "skein-ui: renderer missing. Run cargo build --release --locked -p skein-ui-host in"
+             package-root "or set SKEIN_UI_HOST.")))
 
 (defn- read-exact [stream size]
   (loop [remaining size parts (transient [])]
@@ -27,21 +27,21 @@
       (apply bytes-concat (persistent! parts))
       (if-let [part (io/read stream (min remaining 65536))]
         (recur (- remaining (count part)) (conj! parts part))
-        (when (< remaining size) (error "norn-ui: truncated renderer message"))))))
+        (when (< remaining size) (error "skein-ui: truncated renderer message"))))))
 
 (defn- receive [stream]
   (when-let [header (read-exact stream 4)]
     (let [n (reduce + (map-indexed (fn [i b] (bit-shift-left b (* i 8))) header))]
       (when-not (<= 5 n frame-limit)
-        (error "norn-ui: invalid renderer message length" n))
+        (error "skein-ui: invalid renderer message length" n))
       (if-let [body (read-exact stream n)]
         (bin/decode body)
-        (error "norn-ui: truncated renderer message")))))
+        (error "skein-ui: truncated renderer message")))))
 
 (defn- send! [{:keys [outbox wake]} kind data]
   (let [body (bin/encode [kind data])
         n (count body)]
-    (when (> n frame-limit) (error "norn-ui: patch exceeds the renderer message limit"))
+    (when (> n frame-limit) (error "skein-ui: patch exceeds the renderer message limit"))
     (let [length (bytes (mapv #(bit-and (bit-shift-right n %) 255) [0 8 16 24]))]
       (swap! outbox conj [length body])
       (offer! wake true)
@@ -59,7 +59,7 @@
   ;; image can only be waiting on a stale pipe.
   (when (and (resource-live? (:out p)) (compare-and-set! stopped? false true))
     (close-process! p)
-    (when message (norn.core/%write-stderr (str "norn-ui: " message "\n")))
+    (when message (skein.core/%write-stderr (str "skein-ui: " message "\n")))
     (exit (if message 1 0))))
 
 (defn- read-events! [p stopped? events]
@@ -92,7 +92,7 @@
   (let [p (process/start (host-path) :err :inherit)]
     (try
       (when-not (= [:ready 1] (receive (:out p)))
-        (error "norn-ui: renderer failed to start or has an incompatible protocol"))
+        (error "skein-ui: renderer failed to start or has an incompatible protocol"))
       (catch Error e
         (close-process! p)
         (throw e)))

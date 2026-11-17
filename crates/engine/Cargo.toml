@@ -1,6 +1,6 @@
 [package]
-name = "norn-ui-engine"
-description = "The norn-ui engine: retained node tree, layout, styles, hit-testing, damage"
+name = "skein-ui-engine"
+description = "The skein-ui engine: retained node tree, layout, styles, hit-testing, damage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

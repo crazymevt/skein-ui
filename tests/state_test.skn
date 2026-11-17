@@ -2,9 +2,9 @@
 ;;;; were (headless).
 
 (ns state-test
-  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui] [norn.io :as io] [norn.sys :as sys] [norn.edn :as edn]))
+  (:require [skein.test :refer [is deftest testing]] [skein.ui :as ui] [skein.io :as io] [skein.sys :as sys] [skein.edn :as edn]))
 
-(def dir (io/path (sys/temp-dir) (str "norn-ui-state-" (sys/pid))))
+(def dir (io/path (sys/temp-dir) (str "skein-ui-state-" (sys/pid))))
 (ui/set-state-dir! dir)
 
 (deftest the-store

@@ -1,4 +1,4 @@
-;;;; norn.ui — windows with declarative views over atom state.
+;;;; skein.ui — windows with declarative views over atom state.
 ;;;;
 ;;;;   (def state (atom {:count 0}))
 ;;;;
@@ -28,9 +28,9 @@
 ;;;; Pass the view as a var (#'counter-view) and redefining it at the REPL
 ;;;; updates the open window. Windows survive an image save and restore.
 
-(ns norn.ui
-  (:require [norn.ui.native :as native] [norn.rope :as rope] [norn.string :as str] [norn.markdown :as mdlib]
-            [norn.edn :as edn] [norn.io :as io] [norn.sys :as sys]))
+(ns skein.ui
+  (:require [skein.ui.native :as native] [skein.rope :as rope] [skein.string :as str] [skein.markdown :as mdlib]
+            [skein.edn :as edn] [skein.io :as io] [skein.sys :as sys]))
 
 ;; ---- elements ----------------------------------------------------------------------------------
 
@@ -162,7 +162,7 @@
         split (if (= kind :icon) (update split :props icon-props) split)
         src (get-in split [:props :src])
         split (if (and (= kind :image) (string? src)) (assoc-in split [:props :src] (io/absolute src)) split)
-        ;; an editor's model and highlighter stay in Norn; its events are
+        ;; an editor's model and highlighter stay in Skein; its events are
         ;; wired to them
         ed (when (= kind :editor) (select-keys (:props split) [:model :highlight]))
         split (if ed
@@ -356,13 +356,13 @@
       (loop []
         (when-let [e (take! events)]
           (handler-case (dispatch a e)
-            (Error [c] (println "norn.ui: an event handler failed:" (condition-text c))))
+            (Error [c] (println "skein.ui: an event handler failed:" (condition-text c))))
           (recur))))
     (spawn-detached
       (loop []
         (when (take! renders)
           (handler-case (render-all! a)
-            (Error [c] (println "norn.ui: rendering failed:" (condition-text c))))
+            (Error [c] (println "skein.ui: rendering failed:" (condition-text c))))
           (recur))))))
 
 (defn- connect!
@@ -441,7 +441,7 @@
       ;; The window may have closed meanwhile: then send nothing, and
       ;; don't bring its entry back.
       (when (and (seq @ops) (contains? @(:windows a) wid))
-        (when (= "1" (sys/getenv "NORN_UI_OPS")) (println "OPS" wid (pr-str @ops)))
+        (when (= "1" (sys/getenv "SKEIN_UI_OPS")) (println "OPS" wid (pr-str @ops)))
         (native/apply! (engine-of a) @ops))
       (swap! (:windows a) (fn [ws] (if (contains? ws wid) (assoc-in ws [wid :tree] tree) ws)))
       ;; (a dragged tab's drop targets were measured on the old tree: the
@@ -456,7 +456,7 @@
   (doseq [wid (keys @(:windows a))]
     (when (contains? @(:windows a) wid)
       (handler-case (render-window! a wid)
-        (Error [c] (println "norn.ui: rendering window" wid "failed:" (condition-text c)))))))
+        (Error [c] (println "skein.ui: rendering window" wid "failed:" (condition-text c)))))))
 
 (defn- update-open
   "ws (the windows by id) with window wid's entry as (f entry args…), if
@@ -494,7 +494,7 @@
           (when-let [ch (get @(:pending a) (or (:req e) (:path e)))]
             (swap! (:pending a) dissoc (or (:req e) (:path e)))
             (put! ch e))
-          (= kind :error) (println "norn.ui: the engine rejected a batch:" (:message e))
+          (= kind :error) (println "skein.ui: the engine rejected a batch:" (:message e))
           :else nil)))
 
 ;; ---- the API ----------------------------------------------------------------------------------
@@ -588,14 +588,14 @@
      (if (identical? (current-fiber) @(:dispatcher a))
        ;; Asked from an event handler: the answer comes through the event
        ;; loop this fiber is running, so keep it going until it does.
-       (let [deadline (when ms (+ (quot (norn.core/%now-nanos) 1000000) ms))]
+       (let [deadline (when ms (+ (quot (skein.core/%now-nanos) 1000000) ms))]
          (loop []
            (or (poll! ch)
-               (let [left (when deadline (- deadline (quot (norn.core/%now-nanos) 1000000)))]
+               (let [left (when deadline (- deadline (quot (skein.core/%now-nanos) 1000000)))]
                  (when (or (nil? left) (pos? left))
                    (when-let [e (if left (first (alts! [(events-of a) (timeout left)])) (take! (events-of a)))]
                      (handler-case (dispatch a e)
-                       (Error [c] (println "norn.ui: an event handler failed:" (condition-text c)))))
+                       (Error [c] (println "skein.ui: an event handler failed:" (condition-text c)))))
                    (recur))))))
        (if ms (first (alts! [ch (timeout ms)])) (take! ch))))))
 
@@ -1068,7 +1068,7 @@
                              ;; Measure again after a render changes the window
                              ;; (groups appear as drop targets once the drag
                              ;; begins), and now and then.
-                             (let [now (quot (norn.core/%now-nanos) 1000000)
+                             (let [now (quot (skein.core/%now-nanos) 1000000)
                                    d (if (or (nil? (:rects d)) (> (- now (:at d)) 150))
                                        (swap! dock-drag assoc :rects (dock-rects (:window e) (:layout d) id (:tab d)) :at now)
                                        d)
@@ -1145,7 +1145,7 @@
 ;; ---- the code editor ---------------------------------------------------------------------------
 ;;
 ;;   (def doc (ui/editor-model "(defn hello [] :world)"))
-;;   [:editor {:model doc :highlight ui/highlight-norn :height 300}]
+;;   [:editor {:model doc :highlight ui/highlight-skein :height 300}]
 ;;
 ;; The text is a rope in the model (an atom); the engine shows the lines in
 ;; view and asks for more as it scrolls. Edits send only what changed: an
@@ -1171,14 +1171,14 @@
 (defn- bracket-style [depth]
   (nth [:bracket-1 :bracket-2 :bracket-3 :bracket-4] (mod depth 4)))
 
-(defn highlight-norn
-  "Highlighting for Norn code. With one argument, a line's spans [start
+(defn highlight-skein
+  "Highlighting for Skein code. With one argument, a line's spans [start
   end style]. With a state (what the line starts in, nil at the top), also
   the state the next line starts in: {:spans … :state …}. Styles are theme
   tokens: :comment :string :keyword :number :special, and brackets
   :bracket-1 to :bracket-4 by depth (:bracket-error for an unmatched
   closer)."
-  ([line] (:spans (highlight-norn line nil)))
+  ([line] (:spans (highlight-skein line nil)))
   ([line state]
    (let [cs (vec line)
          n (count cs)
@@ -1401,7 +1401,7 @@
 
 ;; ---- undo ----
 
-(defn- now-ms [] (quot (norn.core/%now-nanos) 1000000))
+(defn- now-ms [] (quot (skein.core/%now-nanos) 1000000))
 
 (defn- record-undo!
   "Remember the text and carets before an edit, unless it continues the
@@ -2037,7 +2037,7 @@
 
 (defn choose-file
   "Ask for a file to open; its path, or nil if cancelled. opts: :title,
-  :directory, :filters [[\"Norn\" [\"norn\"]] …], :multiple (then a vector
+  :directory, :filters [[\"Skein\" [\"skein\"]] …], :multiple (then a vector
   of paths), :folder (choose a directory)."
   ([] (choose-file {}))
   ([opts]
@@ -2215,7 +2215,7 @@
         (sleep 400)
         (swap! stores update app assoc :pending false)
         (handler-case (save! app)
-          (Error [c] (println "norn.ui: couldn't save state for" app ":" (condition-text c)))))))
+          (Error [c] (println "skein.ui: couldn't save state for" app ":" (condition-text c)))))))
   nil)
 
 ;; ---- the workbench shell: activity bar, chips, status bar, command palette ---------------------
@@ -2355,7 +2355,7 @@
 ;; ---- Markdown ------------------------------------------------------------------------------
 
 (defn- md-inline
-  "norn.markdown inlines as rich-text inline elements."
+  "skein.markdown inlines as rich-text inline elements."
   [x]
   (if (string? x)
     x
@@ -2413,7 +2413,7 @@
       :else nil)))
 
 (defn markdown
-  "An element showing Markdown: text, or what norn.markdown/parse gives.
+  "An element showing Markdown: text, or what skein.markdown/parse gives.
   Options: :on-link (called with a link's href when it's clicked);
   :block-id, a function of a top-level block's index giving it an :id
   (to find, measure or scroll to it)."

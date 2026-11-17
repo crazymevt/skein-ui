@@ -1,11 +1,11 @@
-//! The data that crosses between `norn.ui` and the engine, in Rust form.
-//! The extension (crates/norn-ui) converts Norn values to and from these on
-//! a carrier, so the engine itself never touches the Norn heap and can run
+//! The data that crosses between `skein.ui` and the engine, in Rust form.
+//! The extension (crates/skein-ui) converts Skein values to and from these on
+//! a carrier, so the engine itself never touches the Skein heap and can run
 //! on any thread (the main thread, for the macOS event loop).
 
 use std::sync::Arc;
 
-/// A Norn value, as far as the protocol needs one.
+/// A Skein value, as far as the protocol needs one.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Data {
     Nil,
@@ -93,7 +93,7 @@ pub enum Op {
     Platform { op: String, args: Vec<Data> },
 }
 
-/// An event for Norn: `{:event kind …fields}`.
+/// An event for Skein: `{:event kind …fields}`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {
     pub kind: &'static str,

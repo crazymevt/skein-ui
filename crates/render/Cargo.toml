@@ -1,12 +1,12 @@
 [package]
-name = "norn-ui-render"
-description = "The norn-ui painter: wgpu pipelines for boxes and text, damage-only repaint, headless PNG output"
+name = "skein-ui-render"
+description = "The skein-ui painter: wgpu pipelines for boxes and text, damage-only repaint, headless PNG output"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-norn-ui-engine.workspace = true
+skein-ui-engine.workspace = true
 wgpu = "30"
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }

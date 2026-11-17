@@ -1,27 +1,27 @@
-# norn-ui
+# skein-ui
 
-This checkout provides the `norn-ui` Norn package and the
-`norn.ui` API from the original toolkit. Applications run on the stock
-`norn` executable. The toolkit provides the native renderer for every app
+This checkout provides the `skein-ui` Skein package and the
+`skein.ui` API from the original toolkit. Applications run on the stock
+`skein` executable. The toolkit provides the native renderer for every app
 that uses this checkout.
 
 ## Use it in an app
 
-Point the existing dependency name at this checkout in the app's `norn.edn`.
+Point the existing dependency name at this checkout in the app's `skein.edn`.
 
 ```clojure
-:deps {norn-ui {:path "../norn-ui"}}
+:deps {skein-ui {:path "../skein-ui"}}
 ```
 
-Keep using `(require '[norn.ui :as ui])` and the same window, widget and
-event APIs. Run the app script with the current Norn release.
+Keep using `(require '[skein.ui :as ui])` and the same window, widget and
+event APIs. Run the app script with the current Skein release.
 
 ```sh
-../norn-lang/target/release/norn app.norn
+../skein-lang/target/release/skein app.skn
 ```
 
-For Mandelbrot, change the dependency path in `mandelbrot/norn.edn` and use
-`../norn-lang/target/release/norn mandelbrot.norn` from the app directory.
+For Mandelbrot, change the dependency path in `mandelbrot/skein.edn` and use
+`../skein-lang/target/release/skein mandelbrot.skn` from the app directory.
 Its viewer already calls `ui/wait-closed` to keep the app alive until its
 windows close.
 
@@ -31,7 +31,7 @@ windows close.
 [:image {:src "photo.jpg" :width 320 :height 240 :fit :cover}]
 ```
 
-`:src` accepts a local path or the encoded contents of an image as Norn
+`:src` accepts a local path or the encoded contents of an image as Skein
 bytes. PNG, JPEG, BMP, TIFF, ICO, and Netpbm (PBM, PGM, PPM, PAM) are
 supported. Images use their intrinsic size when no dimensions are set.
 With a specified box, `:contain` (the default) fits the whole image,
@@ -67,7 +67,7 @@ decoded pixels to those exact dimensions, with the same output limits.
 ```
 
 `:pixels` draws a buffer into `[x y width height]` in canvas coordinates.
-The source size is in pixels. Supply a Norn byte string with four bytes per
+The source size is in pixels. Supply a Skein byte string with four bytes per
 pixel in RGBA order, tightly packed in rows from top to bottom. Colors use
 straight alpha. The command uses nearest-neighbor scaling by default.
 Pass `{:sampling :linear}` as the final argument for smooth bilinear scaling.
@@ -80,7 +80,7 @@ down. Going up from the element under the pointer, the first of an enabled
 handler and a scroll container or editor that can still move that way takes
 the wheel. A scroll view inside an element with `:on-wheel` keeps scrolling,
 and the handler hears the wheel once the view reaches its end. Wheel events
-still waiting for Norn combine, so a fast trackpad scroll arrives as a few
+still waiting for Skein combine, so a fast trackpad scroll arrives as a few
 events with the summed deltas.
 
 Pass `:on-resize (fn [{:keys [window size scale]}] …)` in `ui/window` options.
@@ -116,43 +116,43 @@ The bundled icons include `:database`, `:table`, `:globe`, `:send`, `:lock`,
 
 ## Renderer installation
 
-The Apple Silicon distribution includes `bin/macos-aarch64/norn-ui-host`.
+The Apple Silicon distribution includes `bin/macos-aarch64/skein-ui-host`.
 From a source checkout, build the renderer once in this directory.
 
 ```sh
-cargo build --release --locked -p norn-ui-host
+cargo build --release --locked -p skein-ui-host
 ```
 
-The package looks for a renderer set by `NORN_UI_HOST` first, then the
+The package looks for a renderer set by `SKEIN_UI_HOST` first, then the
 local release build, then the bundled renderer for the current OS and
-architecture. Set `NORN_UI_HOST` to an absolute path when using a custom
+architecture. Set `SKEIN_UI_HOST` to an absolute path when using a custom
 Cargo target directory or restoring an image whose original toolkit
 directory has moved. Apps share the installation and launch their own
 renderer process when they first use the UI.
 
-`norn package` bundles the renderer with an app that uses this package:
-`norn.edn` declares it under `:helpers`, and the packaged app points
-`NORN_UI_HOST` at its own copy.
+`skein package` bundles the renderer with an app that uses this package:
+`skein.edn` declares it under `:helpers`, and the packaged app points
+`SKEIN_UI_HOST` at its own copy.
 
 ## Architecture
 
-`lib/norn/ui.norn` owns views, state, patch generation and event handlers.
-Its `norn.ui.native` bridge uses stock Norn's `norn.process`, `norn.io`
-and `norn.bin` to send patch batches and receive semantic events over
+`lib/skein/ui.skn` owns views, state, patch generation and event handlers.
+Its `skein.ui.native` bridge uses stock Skein's `skein.process`, `skein.io`
+and `skein.bin` to send patch batches and receive semantic events over
 standard pipes. There are no listening sockets. The renderer owns the
 winit event loop on its own main thread and uses the original layout,
 widgets and wgpu painting code. It exits when the app closes its pipe.
-A saved Norn image starts a fresh renderer and reconstructs its windows
+A saved Skein image starts a fresh renderer and reconstructs its windows
 when restored.
 
 ## Tests
 
-From this directory, run the original UI suite against stock Norn.
+From this directory, run the original UI suite against stock Skein.
 
 ```sh
-NORN_UI_HEADLESS=1 ../norn-lang/target/release/norn test --serial tests
+SKEIN_UI_HEADLESS=1 ../skein-lang/target/release/skein test --serial tests
 ```
 
 Headless mode supports layout, simulated input and event assertions.
-PNG screenshots require a wgpu adapter. With `NORN_UI_HEADLESS` unset,
+PNG screenshots require a wgpu adapter. With `SKEIN_UI_HEADLESS` unset,
 the same package opens desktop windows.

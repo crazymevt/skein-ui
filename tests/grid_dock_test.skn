@@ -2,7 +2,7 @@
 
 (ns grid-dock-test
   (:refer-core :exclude [settle])
-  (:require [norn.test :refer [is deftest testing]] [norn.ui :as ui]))
+  (:require [skein.test :refer [is deftest testing]] [skein.ui :as ui]))
 
 (ui/theme! ui/base-theme)
 (defn settle [] (sleep 100))
@@ -57,7 +57,7 @@
         (ui/simulate! [:up w (+ x 30) y]))
       (settle)
       (is (= 170 (get-in @gstate [:widths :name]))))
-    (ui/screenshot w "/tmp/norn-ui-grid.png" 1)
+    (ui/screenshot w "/tmp/skein-ui-grid.png" 1)
     (ui/close-window w)))
 
 (def fstate (atom {:scroll-y 0 :scroll-x 0}))
@@ -142,7 +142,7 @@
         (ui/simulate! [:up w (- tx 10) ty]))
       (settle)
       (is (= [[:left [:search :files]] [:right [:editor :repl]]] (:groups @dstate))))
-    (ui/screenshot w "/tmp/norn-ui-dock.png" 1)
+    (ui/screenshot w "/tmp/skein-ui-dock.png" 1)
     (ui/close-window w)))
 
 ;; Groups placed apart (as an editor's left, right and bottom docks), with an

@@ -2,8 +2,8 @@
 //! order (parents before children, later siblings on top), limited to the
 //! nodes that touch the damage.
 
-use norn_ui_engine::text::{GlyphRun, Rgba, TextStyle, color};
-use norn_ui_engine::{Data, Engine, NodeId, Rect, Text, WindowId};
+use skein_ui_engine::text::{GlyphRun, Rgba, TextStyle, color};
+use skein_ui_engine::{Data, Engine, NodeId, Rect, Text, WindowId};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,7 +67,7 @@ pub fn display_list(engine: &Engine, w: WindowId, text: &mut Text, damage: &[Rec
 
 fn walk(
     engine: &Engine,
-    win: &norn_ui_engine::engine::Window,
+    win: &skein_ui_engine::engine::Window,
     id: NodeId,
     text: &mut Text,
     damage: &[Rect],
@@ -120,7 +120,7 @@ fn walk(
         } else if !node.text().is_empty() {
             let content = node.text();
             let ts = TextStyle::from_props(style, lookup);
-            let wrap = if norn_ui_engine::style::no_wrap(style) { None } else { Some(r.w + 0.5) };
+            let wrap = if skein_ui_engine::style::no_wrap(style) { None } else { Some(r.w + 0.5) };
             let layout = text.layout(content, &ts, wrap);
             out.push(Item::Text { x: r.x, y: r.y, runs: Text::glyph_runs(&layout), clip });
         }
@@ -155,14 +155,14 @@ fn image_rect(r: Rect, [width, height]: [u32; 2], fit: Option<&str>) -> Rect {
 fn field(
     engine: &Engine,
     id: NodeId,
-    f: &norn_ui_engine::field::Field,
-    style: &norn_ui_engine::Props,
+    f: &skein_ui_engine::field::Field,
+    style: &skein_ui_engine::Props,
     clip: Rect,
     text: &mut Text,
     lookup: &dyn Fn(&Data) -> Data,
     out: &mut Vec<Item>,
 ) {
-    let (ts, _, cb) = norn_ui_engine::field::content_box(engine, id);
+    let (ts, _, cb) = skein_ui_engine::field::content_box(engine, id);
     let clip = clip.intersect(&cb);
     let focused = engine.focused == Some(id);
     let line_h = (ts.size * ts.line_height).ceil();
@@ -216,13 +216,13 @@ fn rich(
     engine: &Engine,
     id: NodeId,
     r: Rect,
-    style: &norn_ui_engine::Props,
+    style: &skein_ui_engine::Props,
     clip: Rect,
     text: &mut Text,
     lookup: &dyn Fn(&Data) -> Data,
     out: &mut Vec<Item>,
 ) {
-    let spans = norn_ui_engine::text::spans_of(engine.nodes[&id].prop("spans"));
+    let spans = skein_ui_engine::text::spans_of(engine.nodes[&id].prop("spans"));
     if spans.is_empty() {
         return;
     }
@@ -263,7 +263,7 @@ fn rich(
 }
 
 /// A color by name: a theme token, a color value, or None.
-fn named_color(name: &str, lookup: &dyn Fn(&Data) -> Data) -> Option<norn_ui_engine::text::Rgba> {
+fn named_color(name: &str, lookup: &dyn Fn(&Data) -> Data) -> Option<skein_ui_engine::text::Rgba> {
     color(&lookup(&Data::key(name))).or_else(|| color(&Data::str(name)))
 }
 
@@ -274,9 +274,9 @@ fn named_color(name: &str, lookup: &dyn Fn(&Data) -> Data) -> Option<norn_ui_eng
 fn editor(
     engine: &Engine,
     id: NodeId,
-    e: &norn_ui_engine::editor::Editor,
+    e: &skein_ui_engine::editor::Editor,
     r: Rect,
-    style: &norn_ui_engine::Props,
+    style: &skein_ui_engine::Props,
     clip: Rect,
     text: &mut Text,
     damage: &[Rect],
@@ -346,7 +346,7 @@ fn editor(
                 out.push(Item::Box { rect: Rect { x: text_x + xa, y, w: (xb - xa).max(0.0), h: e.line_h }, color: bg, radius: 0.0, border: None, clip });
             }
         }
-        let mut spans: Vec<(usize, usize, norn_ui_engine::text::Rgba)> =
+        let mut spans: Vec<(usize, usize, skein_ui_engine::text::Rgba)> =
             styles.iter().filter_map(|(a, b, st)| st.fg.map(|c| (*a, *b, c))).collect();
         // An input method composing at the primary caret: its text goes in
         // the line, underlined, pushing the rest along.
@@ -457,8 +457,8 @@ fn editor(
 
 /// A span's style in an editor line.
 struct SpanStyle {
-    fg: Option<norn_ui_engine::text::Rgba>,
-    bg: Option<norn_ui_engine::text::Rgba>,
+    fg: Option<skein_ui_engine::text::Rgba>,
+    bg: Option<skein_ui_engine::text::Rgba>,
     underline: bool,
     strike: bool,
 }

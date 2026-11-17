@@ -1,6 +1,6 @@
-//! Text fields: editing in the engine, events for Norn, the caret blink.
+//! Text fields: editing in the engine, events for Skein, the caret blink.
 
-use norn_ui_engine::{Data, Engine, Op, Props, Rect, RoughMeasure};
+use skein_ui_engine::{Data, Engine, Op, Props, Rect, RoughMeasure};
 use std::time::{Duration, Instant};
 
 fn p(kvs: &[(&str, Data)]) -> Props {
@@ -71,13 +71,13 @@ fn typing_editing_and_events() {
     let ev = e.take_events();
     assert_eq!(ev[0].kind, "submit");
     assert_eq!(ev[0].get("value"), Some(&Data::str("done")));
-    // Keys the field doesn't use still reach Norn (to the window here).
+    // Keys the field doesn't use still reach Skein (to the window here).
     e.key(1, Data::key("escape"), &[], false, m);
     assert_eq!(e.take_events()[0].kind, "key");
 }
 
 #[test]
-fn norn_sets_the_value() {
+fn skein_sets_the_value() {
     let mut e = setup();
     click_at(&mut e, 200.0, &[]);
     assert_eq!(e.fields[&2].caret, 5);
@@ -86,7 +86,7 @@ fn norn_sets_the_value() {
     assert_eq!(e.fields[&2].caret, 2);
     assert!(e.apply(vec![Op::Set { id: 2, props: p(&[("value", Data::str("longer"))]) }]));
     assert_eq!(e.fields[&2].caret, 6);
-    // Without focus, typing goes to Norn as a :text event.
+    // Without focus, typing goes to Skein as a :text event.
     let mut e = setup();
     e.text_input(1, "x", &mut RoughMeasure);
     assert_eq!(value(&e), "hello");
