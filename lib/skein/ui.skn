@@ -1152,6 +1152,10 @@
 ;; edit within a line re-sends that line (and the lines after it whose
 ;; highlighting it changed, as when a string opens).
 ;;
+;; :hover true makes it say where the pointer rests in the text (see
+;; editor-hover!); :report-cells true how many columns and rows it holds
+;; (see editor-hooks!).
+;;
 ;; A highlighter is (f line state): spans [start end style] for the line,
 ;; or {:spans … :state s}, s being what the next line starts from (bracket
 ;; depth, being inside a string). The editor keeps each line's start state,
@@ -1904,6 +1908,7 @@
                        (edit! m t (when (and (= 1 (count t)) (not= "\n" t)) :type)))))
      :click (fn [e] (editor-click m e))
      :drag-select (fn [e] (set-carets! m [[[(:line e) (:col e)] (:anchor e)]]))
+     :editor-hover (fn [e] (when-let [f (:hover-hook @m)] (f (when (:line e) (select-keys e [:line :col :x :y])))))
      :command (fn [e] (if-let [h (:command-hook @m)]
                         (if (h (:command e)) nil (editor-command m (:command e)))
                         (editor-command m (:command e))))
@@ -1932,6 +1937,15 @@
   (swap! m assoc :key-hook key-hook :text-hook text-hook :command-hook command-hook :on-cells cells-hook)
   (when-let [[c r] (and cells-hook (::cells @m))]
     (cells-hook c r))
+  nil)
+
+(defn editor-hover!
+  "Hear where the pointer rests in model m's text: (f {:line :col :x :y})
+  once it has stayed over a character for a moment (x and y in the
+  window), and (f nil) when it moves on or leaves, or at a press, a key or
+  scrolling. The element needs :hover true. nil removes it."
+  [m f]
+  (swap! m assoc :hover-hook f)
   nil)
 
 (defn editor-show!

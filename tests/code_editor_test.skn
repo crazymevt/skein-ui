@@ -184,3 +184,45 @@
     (is (= [{:line 0 :from 1 :to 2 :kind :squiggle :style :find-current}] (:skein.ui/sent-decs @a))
         "shown again, it gets its decorations")
     (ui/close-window w)))
+
+(deftest hovering-says-where-the-pointer-rests
+  (let [doc (ui/editor-model "(shout word)\n\nend")
+        heard (atom [])
+        w (ui/window {:size [480 200]} (fn [_] [:editor {:id :ed :model doc :hover true :flex-grow 1}]) (atom nil))]
+    (ui/editor-hover! doc (fn [e] (swap! heard conj (when e [(:line e) (:col e)]))))
+    (settle)
+    (ui/click! w :ed)
+    (settle)
+    (let [at (fn [line col] (ui/editor-set-carets! doc [[[line col] nil]]) (settle) (ui/editor-caret-rect doc))
+          {x1 :x y1 :y h :h} (at 0 1)
+          {x2 :x} (at 0 2)
+          {xe :x} (at 0 12)
+          cw (- x2 x1)
+          row (+ y1 (/ h 2))]
+      (reset! heard [])
+      (testing "over a character, after a moment"
+        (ui/simulate! [:move w (+ x1 (/ cw 2)) row])
+        (settle)
+        (is (= [] @heard) "not at once")
+        (sleep 600)
+        (is (= [[0 1]] @heard) "the character under the pointer"))
+      (testing "moving to another character ends it, and starts again there"
+        (ui/simulate! [:move w (+ x2 (* 3.5 cw)) row])
+        (settle)
+        (is (= [[0 1] nil] @heard))
+        (sleep 600)
+        (is (= [[0 1] nil [0 5]] @heard)))
+      (testing "past the end of a line, or on a line with no text, there's nothing to hear"
+        (ui/simulate! [:move w (+ xe (* 4 cw)) row])
+        (sleep 700)
+        (is (= [[0 1] nil [0 5] nil] @heard))
+        (ui/simulate! [:move w (+ x1 cw) (+ row h)])
+        (sleep 700)
+        (is (= [[0 1] nil [0 5] nil] @heard)))
+      (testing "a key ends it"
+        (ui/simulate! [:move w (+ x1 (/ cw 2)) (+ row h h)])
+        (sleep 700)
+        (is (= [2 1] (peek @heard)))
+        (keys! w :arrow-left)
+        (is (nil? (peek @heard)))))
+    (ui/close-window w)))

@@ -10,9 +10,15 @@
 //! Tooltips: hovering a node with a `:tooltip` prop for a moment sends
 //! `{:event :tooltip :window w :node n :text t :x :y}`; leaving it sends
 //! `{:event :tooltip :window w :node nil}`. Skein shows them as popups.
+//!
+//! Hovering in an editor: an editor with a `:hover` prop says where the
+//! pointer rests, once it has stayed over one character of its text for
+//! the same moment: `{:event :editor-hover :window w :node n :line l
+//! :col c :x :y}`; moving on, leaving, a press or a key sends
+//! `{:event :editor-hover :window w :node n :line nil}`.
 
 use crate::data::{Data, Event, NodeId, WindowId};
-use crate::engine::Engine;
+use crate::engine::{Engine, Measure};
 use std::time::{Duration, Instant};
 
 pub const TOOLTIP_DELAY: Duration = Duration::from_millis(500);
@@ -25,6 +31,8 @@ pub struct Tooltip {
     pub y: f32,
     pub due: Instant,
     pub shown: bool,
+    /// For an editor's hover: the (line, column) the pointer is over.
+    pub at: Option<(usize, usize)>,
 }
 
 impl Engine {
@@ -98,11 +106,49 @@ impl Engine {
         }
     }
 
-    /// The pointer moved to (x, y) over `over`: start, keep or end a tooltip.
-    pub(crate) fn update_tooltip(&mut self, w: WindowId, x: f32, y: f32, over: Option<NodeId>) {
-        let target = over.and_then(|n| self.tooltip_at(n)).map(|(n, _)| n);
+    /// The editor at or above id that asks for `:hover`, and the (line,
+    /// column) of its text at window point (x, y): None in its gutter,
+    /// past a line's end or below its last line.
+    fn editor_hover_at(&self, mut id: NodeId, x: f32, y: f32, m: &mut dyn Measure) -> Option<(NodeId, (usize, usize))> {
+        loop {
+            let n = self.nodes.get(&id)?;
+            if self.is_editor(id) {
+                if !n.prop("hover").is_some_and(Data::truthy) {
+                    return None;
+                }
+                let (e, r) = (self.editors.get(&id)?, self.rect(id)?);
+                let row = (y - r.y + e.scroll_y) / e.line_h;
+                if row < 0.0 || row >= e.line_count as f32 {
+                    return None;
+                }
+                let line = row.floor() as usize;
+                let len = e.lines.get(&line)?.text.chars().count();
+                let dx = x - r.x - e.gutter_w - 4.0 + e.scroll_x;
+                if dx < 0.0 || dx > self.editor_col_x(id, line, len, m) {
+                    return None;
+                }
+                let (line, col) = self.editor_position(id, x, y, m);
+                // (the character under the pointer, not the gap nearest it)
+                let col = if col > 0 && self.editor_col_x(id, line, col, m) > dx { col - 1 } else { col };
+                return Some((id, (line, col.min(len.saturating_sub(1)))));
+            }
+            id = n.parent?;
+        }
+    }
+
+    /// The pointer moved to (x, y) over `over`: start, keep or end a
+    /// tooltip, or an editor's hover.
+    pub(crate) fn update_tooltip(&mut self, w: WindowId, x: f32, y: f32, over: Option<NodeId>, m: &mut dyn Measure) {
+        let tip = over.and_then(|n| self.tooltip_at(n)).map(|(n, _)| n);
+        let (target, at) = match tip {
+            Some(n) => (Some(n), None),
+            None => match over.and_then(|n| self.editor_hover_at(n, x, y, m)) {
+                Some((n, pos)) => (Some(n), Some(pos)),
+                None => (None, None),
+            },
+        };
         match &self.tooltip {
-            Some(t) if Some(t.node) == target && t.window == w => {
+            Some(t) if Some(t.node) == target && t.window == w && t.at == at => {
                 if !t.shown {
                     // Keep following the pointer until it shows.
                     let t = self.tooltip.as_mut().unwrap();
@@ -113,7 +159,7 @@ impl Engine {
             _ => {
                 self.hide_tooltip();
                 if let Some(node) = target {
-                    self.tooltip = Some(Tooltip { window: w, node, x, y, due: Instant::now() + TOOLTIP_DELAY, shown: false });
+                    self.tooltip = Some(Tooltip { window: w, node, x, y, due: Instant::now() + TOOLTIP_DELAY, shown: false, at });
                 }
             }
         }
@@ -124,7 +170,14 @@ impl Engine {
         if let Some(t) = self.tooltip.take()
             && t.shown
         {
-            self.events.push(Event::new("tooltip", vec![("window", Data::Num(t.window as f64)), ("node", Data::Nil)]));
+            if t.at.is_some() {
+                self.events.push(Event::new(
+                    "editor-hover",
+                    vec![("window", Data::Num(t.window as f64)), ("node", Data::Num(t.node as f64)), ("line", Data::Nil)],
+                ));
+            } else {
+                self.events.push(Event::new("tooltip", vec![("window", Data::Num(t.window as f64)), ("node", Data::Nil)]));
+            }
         }
     }
 
@@ -135,6 +188,21 @@ impl Engine {
     pub(crate) fn tooltip_tick(&mut self, now: Instant) {
         let Some(t) = self.tooltip.clone() else { return };
         if t.shown || now < t.due {
+            return;
+        }
+        if let Some((line, col)) = t.at {
+            self.tooltip.as_mut().unwrap().shown = true;
+            self.events.push(Event::new(
+                "editor-hover",
+                vec![
+                    ("window", Data::Num(t.window as f64)),
+                    ("node", Data::Num(t.node as f64)),
+                    ("line", Data::Num(line as f64)),
+                    ("col", Data::Num(col as f64)),
+                    ("x", Data::Num(t.x as f64)),
+                    ("y", Data::Num(t.y as f64)),
+                ],
+            ));
             return;
         }
         let Some((_, text)) = self.tooltip_at(t.node) else {

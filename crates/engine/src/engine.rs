@@ -1159,6 +1159,7 @@ impl Engine {
     }
 
     pub fn wheel(&mut self, w: WindowId, x: f32, y: f32, dx: f32, dy: f32, m: &mut dyn Measure) {
+        self.hide_tooltip();
         if !self.dispatch_wheel(w, x, y, dx, dy, &[]) {
             self.scroll_wheel(w, x, y, dx, dy, m);
         }
@@ -1524,7 +1525,7 @@ impl Engine {
         }
         let over = self.hit(w, x, y);
         self.set_state(|e| &mut e.hovered, over.map(|n| (w, n)));
-        self.update_tooltip(w, x, y, over);
+        self.update_tooltip(w, x, y, over, m);
     }
 
     pub fn pointer_down(&mut self, w: WindowId, x: f32, y: f32, mods: &[&str], m: &mut dyn Measure) {
