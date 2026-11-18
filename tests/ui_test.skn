@@ -1,5 +1,5 @@
 ;;;; skein.ui, headless: rendering, diffing, events, live redefinition.
-;;;; Run with `skein-ui test tests/` (crates/skein-ui/tests/skein.rs does).
+;;;; Run with `SKEIN_UI_HEADLESS=1 skein test --serial tests` (see the README).
 
 (ns ui-test
   (:refer-core :exclude [settle])

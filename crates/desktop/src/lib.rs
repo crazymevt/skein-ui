@@ -298,6 +298,18 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
         {
             attrs = attrs.with_position(winit::dpi::LogicalPosition::new(x, y));
         }
+        // :min-size [w h] and :resizable, for a top-level window.
+        if place.is_none() {
+            let prop = |name: &str| self.engine.windows[&w].props.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+            if let Some(Data::List(m)) = prop("min-size")
+                && let (Some(mw), Some(mh)) = (m.first().and_then(Data::as_num), m.get(1).and_then(Data::as_num))
+            {
+                attrs = attrs.with_min_inner_size(LogicalSize::new(mw.max(1.0), mh.max(1.0)));
+            }
+            if let Some(r) = prop("resizable") {
+                attrs = attrs.with_resizable(r.truthy());
+            }
+        }
         if let Some((at, _)) = place {
             // A popup: borderless, above its owner, not taking focus.
             attrs = attrs

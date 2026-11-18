@@ -1,5 +1,6 @@
 ;;;; The skein.ui widget gallery (M7.5's done-check app).
-;;;; Run it with: ./target/debug/skein-ui examples/gallery.skn
+;;;; Run it from this directory with: ../../skein-lang/target/release/skein examples/gallery.skn
+;;;; (any stock skein; build the renderer first, as the README says).
 
 (require '[skein.ui :as ui])
 

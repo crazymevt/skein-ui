@@ -1,0 +1,114 @@
+;;;; skein.ui, headless: what happens when something goes wrong, and the
+;;;; order and extent of re-rendering.
+
+(ns recovery-test
+  (:require [skein.test :refer [is deftest testing]] [skein.ui :as ui]))
+
+(def errors (atom []))
+(ui/on-error! (fn [e] (swap! errors conj e)))
+
+(defn kinds [] (mapv :kind @errors))
+
+(deftest a-rejected-batch-doesnt-end-the-window
+  (let [state (atom {:dir :row :n 0})
+        w (ui/window {:title "recovery" :size [300 200]}
+                     (fn [{:keys [dir n]}]
+                       [:column
+                        [:box {:id :b :flex-direction dir} [:text {:id :t} "n=" n]]
+                        [:button {:id :inc :on-click (fn [_] (swap! state update :n inc))} "+"]])
+                     state)]
+    (ui/settle!)
+    (reset! errors [])
+    (testing "a value the renderer won't take, in a window that was fine"
+      (swap! state assoc :dir :diagonal)
+      (ui/settle!)
+      (is (= :engine (first (kinds))))
+      (is (= w (:window (first @errors)))))
+    (testing "the window works again once the view gives something it takes"
+      (swap! state assoc :dir :row)
+      (ui/settle!)
+      (reset! errors [])
+      (is (pos? (:w (ui/node-rect w (ui/node-of w :t)))))
+      (ui/click! w :inc)
+      (ui/settle!)
+      (is (= 1 (:n @state)))
+      (is (= [] @errors)))
+    (ui/close-window w)
+    (ui/settle!)))
+
+(deftest a-window-that-starts-with-a-rejected-batch-recovers
+  (let [state (atom :diagonal)
+        w (ui/window {:title "recovery" :size [200 100]} (fn [dir] [:box {:flex-direction dir} [:text {:id :t} "x"]]) state)]
+    (ui/settle!)
+    (reset! state :row)
+    (ui/settle!)
+    (reset! errors [])
+    (is (pos? (:w (ui/node-rect w (ui/node-of w :t)))))
+    (swap! state identity)
+    (ui/refresh!)
+    (ui/settle!)
+    (is (= [] @errors))
+    (ui/close-window w)
+    (ui/settle!)))
+
+(deftest a-view-that-fails-at-first-opens-no-window
+  (let [state (atom 0)
+        threw? (try (ui/window {:title "no" :size [100 100]} (fn [_] (error "the view failed")) state) false
+                    (catch Error _ true))]
+    (is threw?)
+    (reset! errors [])
+    (swap! state inc)
+    (ui/refresh!)
+    (ui/settle!)
+    (is (= [] @errors) "nothing is left to render")))
+
+(deftest a-failed-handler-is-reported
+  (let [w (ui/window {:title "handler" :size [100 100]} (fn [_] [:button {:id :boom :on-click (fn [_] (error "boom"))} "b"]) (atom 0))]
+    (ui/settle!)
+    (reset! errors [])
+    (ui/click! w :boom)
+    (ui/settle!)
+    (is (= [:handler] (kinds)))
+    (ui/close-window w)
+    (ui/settle!)))
+
+(deftest reordering-keeps-nodes-and-puts-them-in-order
+  (let [state (atom (vec (range 300)))
+        id (fn [i] (keyword (str "row-" i)))
+        w (ui/window {:title "order" :size [200 400]}
+                     (fn [xs] [:column (for [i xs] [:text {:key i :id (id i) :height 10} (str i)])])
+                     state)
+        ys (fn [xs] (mapv (fn [i] (ui/test-y w (id i))) xs))]
+    (ui/settle!)
+    (let [before (mapv (fn [i] (ui/node-of w (id i))) (range 300))
+          check (fn [order]
+                  (reset! state (vec order))
+                  (ui/settle!)
+                  (let [sample (take 12 order)]
+                    (is (= (ys sample) (mapv (fn [k] (* 10 k)) (range (count sample)))) "in the new order")
+                    (is (= (mapv (fn [i] (nth before i)) sample) (mapv (fn [i] (ui/node-of w (id i))) sample)) "the same nodes")))]
+      (reset! errors [])
+      (check (reverse (range 300)))
+      (check (concat (range 150 300) (range 150)))
+      (check (concat [7 3] (remove #{3 7 100} (range 300))))
+      (is (= [] @errors)))
+    (ui/close-window w)
+    (ui/settle!)))
+
+(deftest a-window-renders-for-its-own-state
+  (let [calls (atom 0)
+        s1 (atom 0)
+        s2 (atom 0)
+        w1 (ui/window {:title "one" :size [100 100]} (fn [n] (swap! calls inc) [:text "one " n]) s1)
+        w2 (ui/window {:title "two" :size [100 100]} (fn [n] [:text "two " n]) s2)]
+    (ui/settle!)
+    (reset! calls 0)
+    (swap! s2 inc)
+    (sleep 200)
+    (is (= 0 @calls) "another window's state doesn't render this one")
+    (swap! s1 inc)
+    (sleep 200)
+    (is (= 1 @calls))
+    (ui/close-window w1)
+    (ui/close-window w2)
+    (ui/settle!)))

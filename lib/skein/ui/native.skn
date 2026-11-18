@@ -38,14 +38,21 @@
         (bin/decode body)
         (error "skein-ui: truncated renderer message")))))
 
-(defn- send! [{:keys [outbox wake]} kind data]
+(defn- send!
+  "Queue a frame. For a patch batch (count? set), the batch's number: the
+  renderer counts the batches it is sent the same way, and names a
+  rejected one by it."
+  [{:keys [outbox wake]} kind data count?]
   (let [body (bin/encode [kind data])
         n (count body)]
     (when (> n frame-limit) (error "skein-ui: patch exceeds the renderer message limit"))
-    (let [length (bytes (mapv #(bit-and (bit-shift-right n %) 255) [0 8 16 24]))]
-      (swap! outbox conj [length body])
+    (let [length (bytes (mapv #(bit-and (bit-shift-right n %) 255) [0 8 16 24]))
+          ;; (numbered and queued in one step, so the numbers are the order sent)
+          state (swap! outbox (fn [o] (-> o
+                                          (update :frames conj [length body])
+                                          (update :batches (if count? inc identity)))))]
       (offer! wake true)
-      nil)))
+      (when count? (:batches state)))))
 
 (defn- close-process! [p]
   ;; (closing its input tells the renderer to quit, and closing its output
@@ -79,8 +86,8 @@
   (try
     (loop []
       (when (take! wake)
-        (let [[frames _] (reset-vals! outbox [])]
-          (doseq [[header body] frames]
+        (let [[old _] (swap-vals! outbox assoc :frames [])]
+          (doseq [[header body] (:frames old)]
             (io/write (:in p) header)
             (io/write (:in p) body)))
         (recur)))
@@ -96,15 +103,19 @@
       (catch Error e
         (close-process! p)
         (throw e)))
-    (let [outbox (atom [])
+    (let [outbox (atom {:frames [] :batches 0})
           wake (chan 1 :dropping)
           stopped? (atom false)]
       (spawn-detached (write-requests! p stopped? outbox wake))
       (spawn-detached (read-events! p stopped? events))
       {:outbox outbox :wake wake})))
 
-(defn apply! [engine batch]
-  (send! engine :apply batch))
+(defn apply!
+  "Send a patch batch. Returns its number, which an :error event for it
+  carries as :batch."
+  [engine batch]
+  (send! engine :apply batch true))
 
 (defn simulate! [engine input]
-  (send! engine :simulate input))
+  (send! engine :simulate input false)
+  nil)

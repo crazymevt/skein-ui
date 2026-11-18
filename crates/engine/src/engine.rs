@@ -372,6 +372,13 @@ impl Engine {
         true
     }
 
+    /// A batch that couldn't be read at all: counted, and reported as
+    /// rejected, like one that failed its check.
+    pub fn reject(&mut self, message: String) {
+        self.batches += 1;
+        self.events.push(Event::new("error", vec![("batch", Data::Num(self.batches as f64)), ("message", Data::Str(message))]));
+    }
+
     /// Check a batch against the tree as it would be after each op.
     fn check(&self, batch: &[Op]) -> Result<(), (usize, String)> {
         let mut exists: HashSet<NodeId> = HashSet::new();

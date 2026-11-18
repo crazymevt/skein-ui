@@ -114,10 +114,29 @@ band behind the caret's line.
 The bundled icons include `:database`, `:table`, `:globe`, `:send`, `:lock`,
 `:copy`, `:download` and `:key`.
 
+## When something goes wrong
+
+A failed event handler, a failed render and a batch the renderer rejects
+are printed on standard error. `(ui/on-error! f)` sends them to `f`
+instead, as `{:kind :handler|:render|:engine|:state|:unsupported :message
+"…"}` with `:window` and `:condition` where they apply.
+
+A view whose first render fails opens no window: `ui/window` raises the
+error. When the renderer rejects a window's batch (a style value it
+doesn't take, say), it applies none of it, and the window is made anew
+from the next render that it accepts.
+
+A window renders when its own state atom changes. `ui/refresh!` and an
+evaluation at the REPL render every window.
+
+`:shadow`, a text field's `:multiline` and `:password`, and `:on-focus`
+and `:on-blur` aren't supported yet. Using one says so once.
+
 ## Renderer installation
 
-The Apple Silicon distribution includes `bin/macos-aarch64/skein-ui-host`.
-From a source checkout, build the renderer once in this directory.
+A source checkout has no renderer (`bin/` isn't in the repository): build
+it once in this directory. A packaged distribution may carry one as
+`bin/<os>-<arch>/skein-ui-host`.
 
 ```sh
 cargo build --release --locked -p skein-ui-host

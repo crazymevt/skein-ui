@@ -1,5 +1,6 @@
 ;;;; A small skein.ui demo: a counter, a text field, and a scrolling list.
-;;;; Run it with: ./target/debug/skein-ui examples/demo.skn
+;;;; Run it from this directory with: ../../skein-lang/target/release/skein examples/demo.skn
+;;;; (any stock skein; build the renderer first, as the README says).
 
 (require '[skein.ui :as ui])
 

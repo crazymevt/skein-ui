@@ -12,7 +12,8 @@
 ;;;; A view is a function from state to an element tree:
 ;;;; - `[kind props? & children]`, where kind is :box, :row, :column, :text,
 ;;;;   :button, :text-field, :scroll, :image, :svg, :canvas, :spacer, … (the
-;;;;   node kinds of docs/ui-protocol.md, plus :row, :column and :spacer);
+;;;;   node kinds of skein-lang's docs/internals/ui-protocol.md, plus :row,
+;;;;   :column and :spacer);
 ;;;; - strings and numbers are text; nil and nested sequences are fine.
 ;;;;
 ;;;; Props:
@@ -31,6 +32,47 @@
 (ns skein.ui
   (:require [skein.ui.native :as native] [skein.rope :as rope] [skein.string :as str] [skein.markdown :as mdlib]
             [skein.edn :as edn] [skein.io :as io] [skein.sys :as sys]))
+
+;; ---- errors -----------------------------------------------------------------------------------
+
+(def ^:private error-handler (atom nil))
+
+(defn on-error!
+  "Hear what goes wrong away from the caller: (f {:kind k :message text …})
+  for a failed event handler (:handler), a failed render (:render, with
+  :window), a batch the renderer rejected (:engine, with :window when it
+  was a window's render), remembered state that couldn't be saved (:state)
+  and a prop that isn't supported yet (:unsupported). :condition is the
+  error, where there is one. Without a handler (or with nil) they are
+  printed on standard error."
+  [f]
+  (reset! error-handler f)
+  nil)
+
+(defn- report! [kind message extra]
+  (let [print! (fn [text] (skein.core/%write-stderr (str "skein.ui: " text "\n")))]
+    (if-let [f @error-handler]
+      (handler-case (f (merge {:kind kind :message message} extra))
+        (Error [c] (print! message) (print! (str "the on-error! handler failed: " (condition-text c)))))
+      (print! message))))
+
+(def ^:private unsupported-seen (atom #{}))
+
+(def ^:private unsupported
+  "Props the protocol names that the renderer doesn't act on yet."
+  {:shadow "the :shadow style isn't drawn yet"
+   :multiline "text fields have one line: :multiline isn't supported yet"
+   :password "text fields show what's typed: :password isn't supported yet"
+   :on-focus ":on-focus never runs: the renderer doesn't report focus yet"
+   :on-blur ":on-blur never runs: the renderer doesn't report focus yet"})
+
+(defn- note-unsupported!
+  "Say once that prop k does nothing, if it's one of those."
+  [k]
+  (when-let [text (get unsupported k)]
+    (when-not (contains? @unsupported-seen k)
+      (swap! unsupported-seen conj k)
+      (report! :unsupported text {:prop k}))))
 
 ;; ---- elements ----------------------------------------------------------------------------------
 
@@ -149,6 +191,7 @@
   (let [[kind extra] (case-kind kind)
         split (reduce-kv (fn [acc k v]
                            (let [ev (handler-key? k)]
+                             (note-unsupported! k)
                              (cond (= k :key) (assoc acc :key v)
                                    (= k :style) (update acc :style merge v)
                                    (and ev (fn? v)) (assoc-in acc [:handlers ev] v)
@@ -271,15 +314,20 @@
     (doseq [o old-kids]
       (when-not (contains? used (:id o)) (swap! ops conj [:remove (:id o)])))
     (let [kids (mapv (fn [[c o]] (if o (diff o c next-id ops) (create c next-id ops))) matched)]
-      ;; put them in order, moving only what is out of place
-      (loop [i 0 cur (vec (filter (fn [x] (contains? used x)) (map :id old-kids)))]
-        (when (< i (count kids))
-          (let [cid (:id (nth kids i))]
-            (if (= cid (get cur i))
-              (recur (inc i) cur)
-              (do (swap! ops conj [:insert id i cid])
-                  (recur (inc i) (let [without (vec (remove (fn [x] (= x cid)) cur))]
-                                   (vec (concat (subvec* without 0 (min i (count without))) [cid] (subvec* without (min i (count without)) (count without)))))))))))
+      ;; Put them in order, moving only what is out of place. With the
+      ;; first i in place, the renderer has them and then the kept old
+      ;; children not yet placed, in their old order: so the child at i
+      ;; is the first of those (olds from j, skipping the ones placed).
+      (let [olds (vec (filter (fn [x] (contains? used x)) (map :id old-kids)))
+            n-olds (count olds)]
+        (loop [i 0 j 0 placed #{}]
+          (when (< i (count kids))
+            (let [cid (:id (nth kids i))
+                  j (loop [j j] (if (and (< j n-olds) (contains? placed (nth olds j))) (recur (inc j)) j))]
+              (if (and (< j n-olds) (= cid (nth olds j)))
+                (recur (inc i) (inc j) placed)
+                (do (swap! ops conj [:insert id i cid])
+                    (recur (inc i) j (conj placed cid))))))))
       kids)))
 
 (defn- diff
@@ -343,7 +391,24 @@
 
 (def ^:private app (atom nil))
 
-(declare dispatch render-all! request-render! close-window find-node show-tooltip! node-rect remember-window!)
+(declare dispatch render-all! render-windows! request-render! close-window find-node show-tooltip! node-rect remember-window!)
+
+(def ^:private dirty
+  "The windows waiting for the render loop: their ids, or ::all."
+  (atom #{}))
+
+(def ^:private render-batches
+  "Batch number → {:wid :epoch :root :fresh?} for the render batches sent
+  lately: which window a batch the renderer rejects was for, and what the
+  renderer was showing there before it (:root, a node id)."
+  (atom {}))
+
+(defn- note-batch! [n rec]
+  (swap! render-batches
+         (fn [m] (let [m (assoc m n rec)]
+                   (if (> (count m) 512) (into {} (filter (fn [[k _]] (> k (- n 256)))) m) m)))))
+
+(def ^:private current-theme "The theme last given to theme!, for a restored image." (atom nil))
 
 (defn- start-loops!
   "The event loop and the render loop of a's current connection. Each holds
@@ -356,13 +421,14 @@
       (loop []
         (when-let [e (take! events)]
           (handler-case (dispatch a e)
-            (Error [c] (println "skein.ui: an event handler failed:" (condition-text c))))
+            (Error [c] (report! :handler (str "an event handler failed: " (condition-text c)) {:condition c})))
           (recur))))
     (spawn-detached
       (loop []
         (when (take! renders)
-          (handler-case (render-all! a)
-            (Error [c] (println "skein.ui: rendering failed:" (condition-text c))))
+          (handler-case (let [[wids _] (reset-vals! dirty #{})]
+                          (if (contains? wids ::all) (render-all! a) (render-windows! a wids)))
+            (Error [c] (report! :render (str "rendering failed: " (condition-text c)) {:condition c})))
           (recur))))))
 
 (defn- connect!
@@ -370,6 +436,8 @@
   [a]
   (let [events (chan 1024)]
     (reset! (:conn a) {:events events :engine (native/connect events) :renders (chan 1 :dropping)})
+    ;; (a new renderer counts its batches from one again)
+    (reset! render-batches {})
     (native/apply! (engine-of a) [[:hello 1]])
     a))
 
@@ -391,7 +459,12 @@
                 a))
           (finally (put! app-token true))))))
 
-(defn- request-render! [a] (offer! (:renders @(:conn a)) true))
+(defn- request-render!
+  "Ask the render loop to render window wid, or every window."
+  ([a] (request-render! a ::all))
+  ([a wid]
+   (swap! dirty conj wid)
+   (offer! (:renders @(:conn a)) true)))
 
 (def ^:private render-token
   "Held while a window renders, and while ops that name nodes of the last
@@ -413,7 +486,7 @@
              (finally (reset! render-holder nil)
                       (put! render-token true))))))
 
-(declare render-window-now!)
+(declare render-window-now! update-open)
 
 (defn- render-window!
   "Re-render window wid: diff its view's new tree against the last one."
@@ -426,10 +499,13 @@
           f (if (var? view) (var-get view) view)
           new (normalize (f @(:state w)))
           old (:tree w)
+          ;; what the renderer shows, when it isn't our tree: a rejected
+          ;; batch left the tree before it there (see engine-error!)
+          shown (if old (:id old) (:engine-root w))
           ops (atom [])
           tree (if (and old (= (:kind old) (:kind new)) (= (:key old) (:key new)))
                  (diff old new (:next-id a) ops)
-                 (do (when old (swap! ops conj [:remove (:id old)]))
+                 (do (when shown (swap! ops conj [:remove shown]))
                      (create new (:next-id a) ops)))]
       (when (not= (:id tree) (:id old))
         (swap! ops conj [:window wid (assoc (:props w) :root (:id tree))]))
@@ -442,21 +518,54 @@
       ;; don't bring its entry back.
       (when (and (seq @ops) (contains? @(:windows a) wid))
         (when (= "1" (sys/getenv "SKEIN_UI_OPS")) (println "OPS" wid (pr-str @ops)))
-        (native/apply! (engine-of a) @ops))
-      (swap! (:windows a) (fn [ws] (if (contains? ws wid) (assoc-in ws [wid :tree] tree) ws)))
+        (note-batch! (native/apply! (engine-of a) @ops)
+                     {:wid wid :epoch (get w :epoch 0) :root shown :fresh? (nil? old)}))
+      (swap! (:windows a) update-open wid (fn [w] (dissoc (assoc w :tree tree) :engine-root)))
       ;; (a dragged tab's drop targets were measured on the old tree: the
       ;; groups that show while dragging appear in a render after it began)
       (when (and (seq @ops) @dock-drag) (swap! dock-drag assoc :rects nil))
       (register-editors! tree wid)
       (forget-gone-editors! old tree))))
 
-(defn- render-all! [a]
+(defn- render-windows! [a wids]
   ;; (A window may close while others render.)
   ;; One window failing doesn't stop the others.
-  (doseq [wid (keys @(:windows a))]
+  (doseq [wid wids]
     (when (contains? @(:windows a) wid)
       (handler-case (render-window! a wid)
-        (Error [c] (println "skein.ui: rendering window" wid "failed:" (condition-text c)))))))
+        (Error [c] (report! :render (str "rendering window " wid " failed: " (condition-text c)) {:window wid :condition c}))))))
+
+(defn- render-all! [a] (render-windows! a (keys @(:windows a))))
+
+(defn- engine-error!
+  "The renderer rejected a batch, and applied none of it. If it was a
+  window's render, our tree for that window is no longer what the renderer
+  has: forget it, so the next render makes the window's content anew (and
+  removes what the renderer still shows). That render happens at once,
+  unless the rejected batch was itself one made anew: then the view gives
+  something the renderer won't take, and it waits for the next change."
+  [a e]
+  (let [rec (get @render-batches (:batch e))
+        wid (:wid rec)
+        w (when rec (get @(:windows a) wid))
+        text (str "the engine rejected a batch: " (:message e) (when (:op e) (str " (" (:op e) ")")))]
+    (cond
+      (nil? rec) (report! :engine text {:event e})
+      ;; (a window that closed, or a batch sent before an earlier one's
+      ;; rejection was heard: the window has been set right since)
+      (or (nil? w) (not= (:epoch rec) (get w :epoch 0))) nil
+      :else
+      (let [;; (the renderer says it hasn't the node we thought it showed)
+            root (when-not (and (:fresh? rec) (= (:message e) (str "no node " (:root rec)))) (:root rec))]
+        (report! :engine text {:window wid :event e})
+        (with-render-lock
+          (fn []
+            (when-let [old (:tree w)]
+              (swap! (:handlers a) (fn [hs] (apply dissoc hs (keys (collect-handlers old {})))))
+              (forget-gone-editors! old nil))
+            (swap! (:windows a) update-open wid
+                   (fn [w] (assoc w :tree nil :engine-root root :epoch (inc (get w :epoch 0)))))))
+        (when-not (:fresh? rec) (request-render! a wid))))))
 
 (defn- update-open
   "ws (the windows by id) with window wid's entry as (f entry args…), if
@@ -494,7 +603,7 @@
           (when-let [ch (get @(:pending a) (or (:req e) (:path e)))]
             (swap! (:pending a) dissoc (or (:req e) (:path e)))
             (put! ch e))
-          (= kind :error) (println "skein.ui: the engine rejected a batch:" (:message e))
+          (= kind :error) (engine-error! a e)
           :else nil)))
 
 ;; ---- the API ----------------------------------------------------------------------------------
@@ -520,7 +629,9 @@
   and position the window last had (see remember!) and saves them as
   they change. view is a function or a var (redefining a var's function
   re-renders). The window re-renders whenever state changes. Returns the
-  window id."
+  window id. If the view fails this first time, the error is the caller's
+  and no window opens. A window re-renders when its own state changes
+  (and all do after an evaluation at the REPL, or refresh!)."
   [props view state]
   (let [a (the-app)
         wid (swap! window-ids inc)
@@ -528,8 +639,14 @@
         props (apply dissoc props (keys handlers))
         props (if-let [[app k] (:remember handlers)] (merge props (recall app [:window k] {})) props)]
     (swap! (:windows a) assoc wid (merge handlers {:props props :view view :state state :tree nil}))
-    (add-watch state [::window wid] (fn [_ _ old new] (when-not (identical? old new) (request-render! a))))
-    (render-window! a wid)
+    (add-watch state [::window wid] (fn [_ _ old new] (when-not (identical? old new) (request-render! a wid))))
+    ;; A view that fails the first time: no window, rather than one nobody
+    ;; has the id of.
+    (try (render-window! a wid)
+         (catch Error e
+           (remove-watch state [::window wid])
+           (swap! (:windows a) dissoc wid)
+           (throw e)))
     wid))
 
 (defn close-window "Close window wid (and the popups it owns)." [wid]
@@ -573,14 +690,20 @@
     (remove-watch (:windows a) ::wait-closed)
     nil))
 
-(defn theme! "Use theme (docs/ui-protocol.md §5) for every window." [theme]
-  (native/apply! (engine-of (the-app)) [[:theme theme]]))
+(defn theme!
+  "Use theme (skein-lang's docs/internals/ui-protocol.md §5) for every
+  window. A restored image gets it again."
+  [theme]
+  (let [a (the-app)]
+    (reset! current-theme theme)
+    (native/apply! (engine-of a) [[:theme theme]])
+    nil))
 
-(defn- ask
+(defn- ask*
   "Send a request and park for its answer event (at most ms, or for as long
   as it takes when ms is nil: a person answering a dialog)."
-  ([key op] (ask key op 10000))
-  ([key op ms]
+  [key op ms]
+  (do
    (let [a (the-app)
          ch (chan 1)]
      (swap! (:pending a) assoc key ch)
@@ -595,9 +718,17 @@
                  (when (or (nil? left) (pos? left))
                    (when-let [e (if left (first (alts! [(events-of a) (timeout left)])) (take! (events-of a)))]
                      (handler-case (dispatch a e)
-                       (Error [c] (println "skein.ui: an event handler failed:" (condition-text c)))))
+                       (Error [c] (report! :handler (str "an event handler failed: " (condition-text c)) {:condition c}))))
                    (recur))))))
        (if ms (first (alts! [ch (timeout ms)])) (take! ch))))))
+
+(defn- ask
+  "As ask*, and an answer that never came isn't waited for any more."
+  ([key op] (ask key op 10000))
+  ([key op ms]
+   (let [answer (ask* key op ms)]
+     (swap! (:pending (the-app)) dissoc key)
+     answer)))
 
 (def ^:private req-ids (atom 0))
 
@@ -658,7 +789,9 @@
     (when n
       (swap! (:pending a) assoc r ch)
       (native/simulate! (engine-of a) [:rect wid n r])
-      (let [e (first (alts! [ch (timeout 5000)]))] (when e (:y e))))))
+      (let [e (first (alts! [ch (timeout 5000)]))]
+        (swap! (:pending a) dissoc r)
+        (when e (:y e))))))
 
 (defn- round-trip!
   "Park until the engine and the event loop have handled everything sent
@@ -670,7 +803,9 @@
     (swap! (:pending a) assoc r ch)
     ;; (a node that doesn't exist: the answer is all that matters)
     (native/simulate! (engine-of a) [:rect 0 0 r])
-    (boolean (first (alts! [ch (timeout ms)])))))
+    (let [answered? (boolean (first (alts! [ch (timeout ms)])))]
+      (swap! (:pending a) dissoc r)
+      answered?)))
 
 (defn settle!
   "Headless tests: park until everything sent so far has had its effect.
@@ -1124,7 +1259,7 @@
 (defmethod measure ((w Widget)) [100 100])
 
 (defgeneric paint (w size)
-  "Drawing commands (docs/ui-protocol.md §8) for widget w at size [width
+  "Drawing commands (ui-protocol.md §8) for widget w at size [width
   height], in its own coordinates.")
 (defmethod paint ((w Widget) size) [])
 
@@ -2229,7 +2364,7 @@
         (sleep 400)
         (swap! stores update app assoc :pending false)
         (handler-case (save! app)
-          (Error [c] (println "skein.ui: couldn't save state for" app ":" (condition-text c)))))))
+          (Error [c] (report! :state (str "couldn't save state for " app ": " (condition-text c)) {:condition c}))))))
   nil)
 
 ;; ---- the workbench shell: activity bar, chips, status bar, command palette ---------------------
@@ -2454,6 +2589,7 @@
                                               (map (fn [[k w]] [k (assoc w :tree nil)])))
                                      ws)))
   (start-loops! a)
+  (when-let [t @current-theme] (native/apply! (engine-of a) [[:theme t]]))
   (when-let [m @(:menu a)] (native/apply! (engine-of a) [[:menu m]]))
   (render-all! a)
   true)

@@ -7,7 +7,7 @@ mod patch;
 mod wire;
 
 use skein_ui_engine::raster::{DecodeRequest, RasterImage};
-use skein_ui_engine::{Data, Engine, Event, Op, Text};
+use skein_ui_engine::{Data, Engine, Op, Text};
 use skein_ui_render::Renderer;
 use std::collections::VecDeque;
 use std::io::{self, BufReader};
@@ -40,9 +40,8 @@ fn execute(cmd: Cmd, engine: &mut Engine, text: &mut Text, painter: &mut Option<
             engine.apply(ops);
         }
         Cmd::Input(xs) => backend::input(engine, text, painter, &xs),
-        Cmd::Invalid(message) => {
-            engine.push_event(Event::new("error", vec![("message", Data::Str(message))]))
-        }
+        // (counted as a batch, so the numbers stay in step with the app's)
+        Cmd::Invalid(message) => engine.reject(message),
         Cmd::Decoded(request, result) => engine.decoded(request, result),
     }
 }
@@ -107,6 +106,9 @@ fn deliver(engine: &mut Engine) {
     }
 }
 
+/// A request, or why it can't be read. What can't be read is reported as a
+/// rejected batch: the app sends well-formed frames, so in practice it is a
+/// batch with an op the renderer doesn't take.
 fn parse(data: Data) -> Result<Cmd, String> {
     let Data::List(mut request) = data else {
         return Err("A UI request is a vector".into());
