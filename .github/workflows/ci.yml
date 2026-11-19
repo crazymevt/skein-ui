@@ -75,13 +75,19 @@ jobs:
         working-directory: skein-ui
         run: ../skein-lang/target/release/skein test --serial tests
 
-  # Windows on ARM, built as skein-lang's own Windows job builds Skein: with
-  # clang on the PATH and MMTk patched for Windows (tools/windows/mmtk.sh in
-  # skein-lang). Like that job, it can't fail the run until it has been
-  # green a while.
+  # Windows on ARM and on x86-64, built as skein-lang's own Windows jobs
+  # build Skein: with clang on the PATH and MMTk patched for Windows
+  # (tools/windows/mmtk.sh in skein-lang). Like those jobs, they can't fail
+  # the run until they've been green a while.
   windows:
-    name: Windows arm64
-    runs-on: windows-11-arm
+    name: Windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, runner: windows-11-arm }
+          - { arch: x86-64, runner: windows-latest }
     continue-on-error: true
     timeout-minutes: 90
     defaults:
@@ -117,8 +123,9 @@ jobs:
             skein-lang
 
       - name: clang on the PATH
-        # (Skein's dependencies build C with clang on Windows arm64; where
-        # LLVM is installed, it isn't on the PATH)
+        # (Skein's dependencies build C with clang on Windows arm64, and cc
+        # takes it on x86-64 too where it's there; where LLVM is installed,
+        # it isn't on the PATH)
         run: |
           if [ -x "/c/Program Files/LLVM/bin/clang.exe" ]; then
             echo "C:\Program Files\LLVM\bin" >> "$GITHUB_PATH"
@@ -143,5 +150,7 @@ jobs:
         run: cargo test --release --locked --workspace
 
       - name: skein.ui tests
+        # (even after the renderer's tests fail: they're the other half)
+        if: ${{ !cancelled() }}
         working-directory: skein-ui
         run: ../skein-lang/target/release/skein.exe test --serial tests
