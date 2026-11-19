@@ -1,6 +1,11 @@
 //! The desktop backend (plan 2.6): winit windows with wgpu surfaces, input,
-//! and the idle rules (design §9.1). macOS first; winit and wgpu make Linux
-//! and Windows mostly configuration.
+//! and the idle rules (design §9.1). macOS and Windows; winit and wgpu make
+//! Linux mostly configuration.
+//!
+//! **Menus differ by platform.** macOS has one menu bar for the app; on
+//! Windows each top-level window carries the menu bar (popups don't), its
+//! shortcuts are translated in the message loop, and Quit ends the event
+//! loop as the system's own Quit does on macOS. Windows has no Hide.
 //!
 //! The backend owns the event loop on the process's first thread and knows
 //! nothing of Skein: `run` takes a `pull` callback that applies queued work
@@ -73,6 +78,9 @@ struct App<P, D> {
     wheel: HashMap<u64, (f32, f32, f32, f32)>,
     /// Events came: step once the batch is in (about_to_wait).
     needs_step: bool,
+    /// The menu's Quit was chosen (off macOS, where it is an ordinary
+    /// item): end the event loop at the next step.
+    quit: bool,
     /// Big wheel steps still to scroll, by window: applied over a few
     /// frames rather than at once.
     glide: HashMap<u64, Glide>,
@@ -118,8 +126,13 @@ fn menu_items(items: &[Data]) -> Vec<Box<dyn muda::IsMenuItem>> {
                     .and_then(Data::as_str)
                     .and_then(|k| k.replace("cmd", "CmdOrCtrl").parse::<muda::accelerator::Accelerator>().ok());
                 match cmd.as_str() {
-                    "quit" => out.push(Box::new(muda::PredefinedMenuItem::quit(Some(label)))),
-                    "hide" => out.push(Box::new(muda::PredefinedMenuItem::hide(Some(label)))),
+                    // (the system's own on macOS; elsewhere muda's Quit posts
+                    // WM_QUIT, which winit doesn't end its loop on, so Quit is
+                    // an item the backend acts on, and there's no Hide: on
+                    // Windows muda's hides the window for good)
+                    "quit" if cfg!(target_os = "macos") => out.push(Box::new(muda::PredefinedMenuItem::quit(Some(label)))),
+                    "hide" if cfg!(target_os = "macos") => out.push(Box::new(muda::PredefinedMenuItem::hide(Some(label)))),
+                    "hide" => {}
                     _ => out.push(Box::new(muda::MenuItem::with_id(cmd.as_str(), label, true, accel))),
                 }
             }
@@ -197,6 +210,9 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
         let gone: Vec<u64> = self.windows.keys().filter(|w| !self.engine.windows.contains_key(w)).copied().collect();
         for w in gone {
             if let Some(os) = self.windows.remove(&w) {
+                if let Some(m) = &self.menu {
+                    detach_menu(m, &os.window);
+                }
                 self.by_os.remove(&os.window.id());
             }
         }
@@ -350,6 +366,12 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
         };
         surface.configure(&r.device, &config);
         let scale = window.scale_factor() as f32;
+        if place.is_none()
+            && let Some(m) = &self.menu
+        {
+            attach_menu(m, &window);
+        }
+        let size = window.inner_size();
         self.by_os.insert(window.id(), w);
         self.windows.insert(w, OsWindow { window, surface, config, scale, cursor: (0.0, 0.0), title, unshown: false, position: place.map(|(_, p)| p) });
         self.engine.resized(w, size.width as f32 / scale, size.height as f32 / scale, scale);
@@ -361,6 +383,11 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
     fn commands(&mut self) {
         let chosen: Vec<String> = std::mem::take(&mut *self.commands.lock().unwrap());
         for cmd in chosen {
+            // Off macOS, Quit is ours: end the loop, as the system's does.
+            if cmd == "quit" && !cfg!(target_os = "macos") && self.context_req.is_none() {
+                self.quit = true;
+                continue;
+            }
             // The menu's Copy takes selected rich text too.
             if cmd == "copy"
                 && self.engine.focused_field().is_none()
@@ -412,6 +439,16 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
                     if let Ok(m) = muda::Menu::with_items(&refs) {
                         #[cfg(target_os = "macos")]
                         m.init_for_nsapp();
+                        // (on Windows the menu bar is each top-level window's)
+                        let tops: Vec<u64> = self.windows.keys().copied().filter(|w| self.engine.owner_of(*w).is_none()).collect();
+                        for w in tops {
+                            let window = &self.windows[&w].window;
+                            if let Some(old) = &self.menu {
+                                detach_menu(old, window);
+                            }
+                            attach_menu(&m, window);
+                        }
+                        set_accelerators(&m);
                         self.menu = Some(m);
                     }
                 }
@@ -470,6 +507,10 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
         let pulled = t0.elapsed();
         let mut times = Vec::new();
         self.commands();
+        if self.quit {
+            el.exit();
+            return;
+        }
         self.platform();
         self.fit_windows();
         self.place_ime();
@@ -588,9 +629,12 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
             }
         }
         self.engine.key(w, key, &mods, ev.repeat, &mut self.text);
-        // Typed text (not shortcuts) also arrives as text.
+        // Typed text (not shortcuts) also arrives as text. On Windows AltGr
+        // reports Ctrl+Alt, and what it types (@, €, { on many layouts) is
+        // text.
+        let altgr = cfg!(target_os = "windows") && self.modifiers.control_key() && self.modifiers.alt_key();
         if let Some(t) = &ev.text
-            && !self.modifiers.control_key()
+            && (!self.modifiers.control_key() || altgr)
             && !self.modifiers.super_key()
             && !t.chars().all(char::is_control)
         {
@@ -839,7 +883,15 @@ where
     P: FnMut(&mut Engine, &mut Text),
     D: FnMut(&mut Engine),
 {
-    let event_loop = EventLoop::<()>::with_user_event().build().map_err(|e| format!("No event loop: {e}"))?;
+    let mut builder = EventLoop::<()>::with_user_event();
+    // The menu's shortcuts: Windows only sees them if the message loop
+    // translates them.
+    #[cfg(target_os = "windows")]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        builder.with_msg_hook(|msg| win32::translate_accelerator(msg));
+    }
+    let event_loop = builder.build().map_err(|e| format!("No event loop: {e}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
     let menu_proxy = event_loop.create_proxy();
@@ -873,6 +925,7 @@ where
         ime_area: None,
         wheel: HashMap::new(),
         needs_step: false,
+        quit: false,
         glide: HashMap::new(),
     };
     event_loop.run_app(&mut app).map_err(|e| format!("The event loop failed: {e}"))?;
@@ -898,7 +951,94 @@ fn show_context_menu(menu: &muda::Menu, window: &Window, x: f32, y: f32) -> bool
     unsafe { menu.show_context_menu_for_nsview(h.ns_view.as_ptr() as *const _, Some(at)) }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn show_context_menu(menu: &muda::Menu, window: &Window, x: f32, y: f32) -> bool {
+    use muda::ContextMenu;
+    let Some(hwnd) = win32::hwnd(window) else { return false };
+    // (muda takes a logical point in the client area, as winit gives it)
+    let at = muda::dpi::Position::Logical(muda::dpi::LogicalPosition::new(x as f64, y as f64));
+    // SAFETY: the window is live and belongs to this (the event loop's) thread.
+    unsafe { menu.show_context_menu_for_hwnd(hwnd, Some(at)) }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn show_context_menu(_: &muda::Menu, _: &Window, _: f32, _: f32) -> bool {
     false
+}
+
+/// Give a top-level window the menu bar (Windows; macOS has the app's).
+/// The bar takes room from the client area, so the window grows to keep
+/// the content's size.
+fn attach_menu(menu: &muda::Menu, window: &Window) {
+    #[cfg(target_os = "windows")]
+    if let Some(hwnd) = win32::hwnd(window) {
+        let size = window.inner_size();
+        // SAFETY: the window is live and belongs to this thread.
+        if unsafe { menu.init_for_hwnd(hwnd) }.is_ok() {
+            let _ = window.request_inner_size(size);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (menu, window);
+}
+
+/// Take the menu bar off a window (before it closes, or for a new menu).
+fn detach_menu(menu: &muda::Menu, window: &Window) {
+    #[cfg(target_os = "windows")]
+    if let Some(hwnd) = win32::hwnd(window) {
+        // SAFETY: as attach_menu.
+        let _ = unsafe { menu.remove_for_hwnd(hwnd) };
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = (menu, window);
+}
+
+/// The shortcuts the message loop translates: the current menu's.
+fn set_accelerators(menu: &muda::Menu) {
+    #[cfg(target_os = "windows")]
+    win32::HACCEL.store(menu.haccel(), std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(target_os = "windows"))]
+    let _ = menu;
+}
+
+#[cfg(target_os = "windows")]
+mod win32 {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use winit::window::Window;
+
+    /// The menu's accelerator table (0: none yet).
+    pub static HACCEL: AtomicIsize = AtomicIsize::new(0);
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn TranslateAcceleratorW(hwnd: isize, haccel: isize, msg: *const c_void) -> i32;
+        fn GetAncestor(hwnd: isize, flags: u32) -> isize;
+    }
+    const GA_ROOT: u32 = 2;
+
+    pub fn hwnd(window: &Window) -> Option<isize> {
+        match window.window_handle().ok()?.as_raw() {
+            RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+            _ => None,
+        }
+    }
+
+    /// winit's message hook: true if msg was a menu shortcut (sent to the
+    /// window as the menu's WM_COMMAND, so winit mustn't dispatch it too).
+    pub fn translate_accelerator(msg: *const c_void) -> bool {
+        let haccel = HACCEL.load(Ordering::Relaxed);
+        if haccel == 0 || msg.is_null() {
+            return false;
+        }
+        // SAFETY: winit passes a valid MSG, whose first field is its HWND.
+        unsafe {
+            let hwnd = *(msg as *const isize);
+            if hwnd == 0 {
+                return false;
+            }
+            TranslateAcceleratorW(GetAncestor(hwnd, GA_ROOT), haccel, msg) != 0
+        }
+    }
 }

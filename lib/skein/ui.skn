@@ -2162,9 +2162,10 @@
   "Set the app's menu bar. items are [label command shortcut?] for an item
   (command a keyword; shortcut like \"cmd+s\", cmd meaning ctrl off macOS),
   [label [items…]] for a submenu, or :separator. On macOS the first submenu
-  is the application menu. Choosing an item runs its on-command! handler;
-  :quit and :hide are the system's own, and :copy :cut :paste :select-all
-  also act on the focused text field.
+  is the application menu; on Windows each window shows the menu bar.
+  Choosing an item runs its on-command! handler; :quit and :hide are the
+  system's own (Windows has no :hide, and leaves it out), and :copy :cut
+  :paste :select-all also act on the focused text field.
 
     (ui/menu! [[\"App\" [[\"Quit\" :quit \"cmd+q\"]]]
                [\"File\" [[\"Open…\" :open \"cmd+o\"] :separator [\"Save\" :save \"cmd+s\"]]]])"
@@ -2329,8 +2330,9 @@
   "The file app's remembered state lives in."
   [app]
   (io/path (or @state-root
-               (if (= :macos (sys/os))
-                 (io/path (sys/home-dir) "Library" "Application Support")
+               (case (sys/os)
+                 :macos (io/path (sys/home-dir) "Library" "Application Support")
+                 :windows (or (sys/getenv "APPDATA") (io/path (sys/home-dir) "AppData" "Roaming"))
                  (or (sys/getenv "XDG_CONFIG_HOME") (io/path (sys/home-dir) ".config"))))
            app "state.edn"))
 

@@ -142,6 +142,11 @@ it once in this directory. A packaged distribution may carry one as
 cargo build --release --locked -p skein-ui-host
 ```
 
+On Windows the renderer is `skein-ui-host.exe`, and the same command
+builds it. Each window shows the menu bar from `ui/menu!` (macOS has one
+for the app), Quit closes the app, and Hide is left out. Remembered state
+lives under `%APPDATA%`.
+
 The package looks for a renderer set by `SKEIN_UI_HOST` first, then the
 local release build, then the bundled renderer for the current OS and
 architecture. Set `SKEIN_UI_HOST` to an absolute path when using a custom
