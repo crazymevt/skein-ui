@@ -15,9 +15,10 @@
 (defn- host-path []
   (or (sys/getenv "SKEIN_UI_HOST")
       (some #(when (io/file? %) %)
-            (let [{:keys [os arch]} (sys/info)]
-              [(io/path package-root "target" "release" "skein-ui-host")
-               (io/path package-root "bin" (str (name os) "-" (name arch)) "skein-ui-host")]))
+            (let [{:keys [os arch]} (sys/info)
+                  exe (if (= :windows os) "skein-ui-host.exe" "skein-ui-host")]
+              [(io/path package-root "target" "release" exe)
+               (io/path package-root "bin" (str (name os) "-" (name arch)) exe)]))
       (error "skein-ui: renderer missing. Run cargo build --release --locked -p skein-ui-host in"
              package-root "or set SKEIN_UI_HOST.")))
 
