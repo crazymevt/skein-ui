@@ -146,6 +146,9 @@ fn read_requests() {
             // The app exited and closed its pipe. This also works during
             // a dialog, when the main event loop may be in a modal call.
             Ok(None) => std::process::exit(0),
+            // The app exited partway through writing a frame (it can, as
+            // it quits): it is gone all the same.
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => std::process::exit(0),
             Err(error) => fail(error),
         }
     }
