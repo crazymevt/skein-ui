@@ -17,6 +17,11 @@ static INTER_ITALIC: &[u8] = include_bytes!("../../../fonts/Inter-Italic.ttf");
 static MONO: &[u8] = include_bytes!("../../../fonts/JetBrainsMono.ttf");
 static MONO_ITALIC: &[u8] = include_bytes!("../../../fonts/JetBrainsMono-Italic.ttf");
 
+/// Fonts for symbols the bundled fonts lack (▾ ▸ ✕ ☐ and the like), last in
+/// every family list. macOS's system font falls back to its symbol fonts by
+/// itself; Windows' (Segoe UI) doesn't, and they drew as missing glyphs.
+const SYMBOL_FALLBACK: &str = if cfg!(target_os = "windows") { ", \"Segoe UI Symbol\", \"Segoe UI Emoji\"" } else { "" };
+
 /// An RGBA color, the brush text is drawn with.
 pub type Rgba = [u8; 4];
 
@@ -194,10 +199,11 @@ impl Text {
     /// A CSS family list for `family`: `ui` and `code` mean the bundled
     /// fonts; anything else is used as given, with the UI font after it.
     fn family_list(&self, family: &str) -> String {
+        let s = SYMBOL_FALLBACK;
         match family {
-            "ui" | "sans-serif" | "system-ui" => format!("\"{}\", system-ui, sans-serif", self.ui_family),
-            "code" | "mono" | "monospace" => format!("\"{}\", monospace", self.mono_family),
-            other => format!("{other}, \"{}\", sans-serif", self.ui_family),
+            "ui" | "sans-serif" | "system-ui" => format!("\"{}\", system-ui, sans-serif{s}", self.ui_family),
+            "code" | "mono" | "monospace" => format!("\"{}\", monospace{s}", self.mono_family),
+            other => format!("{other}, \"{}\", sans-serif{s}", self.ui_family),
         }
     }
 
