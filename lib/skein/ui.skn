@@ -2428,10 +2428,11 @@
 (defn fuzzy-score
   "How well query matches text as a fuzzy subsequence, ignoring case:
   nil when it doesn't, else [score positions] (higher is better;
-  consecutive letters and word starts score more)."
+  consecutive letters and word starts score more). The path separators
+  / and \\ match each other, so src/a finds a Windows path src\\a.skn."
   [query text]
-  (let [q (str/lower-case query)
-        t (str/lower-case text)
+  (let [q (str/replace (str/lower-case query) "\\" "/")
+        t (str/replace (str/lower-case text) "\\" "/")
         qs (vec q) ts (vec t) nq (count qs) nt (count ts)]
     (if (zero? nq)
       [0 []]
