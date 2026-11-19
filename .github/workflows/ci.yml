@@ -88,8 +88,8 @@ jobs:
       run:
         shell: bash
     env:
-      # (the skein-lang branch with Windows support; main once it's merged)
-      SKEIN_LANG_REF: windows-arm64
+      # (the skein-lang it's built with: Windows support is in main)
+      SKEIN_LANG_REF: main
       # (MMTk with its Windows layer, in place of the one on crates.io)
       MMTK: --config=patch.crates-io.mmtk.path='target/mmtk-windows'
     steps:
