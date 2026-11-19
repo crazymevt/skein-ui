@@ -5,6 +5,17 @@
 use skein_ui_engine::{Data, Engine, Op, Props, Rect, Text};
 use skein_ui_render::{Item, PixelSampling, Renderer, display_list, read_png, write_png};
 
+/// Held by a test for as long as it has a renderer: one GPU device at a
+/// time. (On Windows CI's runners, which have no GPU, the paint tests
+/// sometimes ended in an access violation, after one test or after five,
+/// with each test making its own device beside the others'.)
+static GPU: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    // (a test that panicked while holding it leaves it for the next)
+    GPU.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn p(kvs: &[(&str, Data)]) -> Props {
     kvs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
 }
@@ -94,6 +105,7 @@ fn canvas_pixels_scale_clip_blend_and_update() {
     assert_eq!(rgba.as_slice(), source);
     assert_eq!(*sampling, PixelSampling::Nearest);
 
+    let _gpu = one_at_a_time();
     let Ok(mut r) = Renderer::headless() else {
         eprintln!("no GPU adapter: skipping pixel readback");
         return;
@@ -156,6 +168,7 @@ fn image_sampling_blends_without_transparent_color_bleed() {
     let damage = e.frame(1, &mut t);
     assert_eq!(e.nodes[&1].raster.as_ref().unwrap().rgba.as_slice(), [255, 0, 0, 255, 0, 0, 255, 0]);
 
+    let _gpu = one_at_a_time();
     let Ok(mut r) = Renderer::headless() else {
         eprintln!("no GPU adapter: skipping pixel readback");
         return;
@@ -174,6 +187,7 @@ fn image_sampling_blends_without_transparent_color_bleed() {
 
 #[test]
 fn boxes_text_and_damage_only_repaint() {
+    let _gpu = one_at_a_time();
     let Ok(mut r) = Renderer::headless() else {
         eprintln!("no GPU adapter: skipping");
         return;
@@ -223,6 +237,7 @@ fn boxes_text_and_damage_only_repaint() {
 
 #[test]
 fn the_scene_matches_its_golden_image() {
+    let _gpu = one_at_a_time();
     let Ok(mut r) = Renderer::headless() else {
         eprintln!("no GPU adapter: skipping");
         return;
@@ -247,6 +262,7 @@ fn the_scene_matches_its_golden_image() {
 
 #[test]
 fn scrolled_content_is_clipped_to_its_container() {
+    let _gpu = one_at_a_time();
     let Ok(mut r) = Renderer::headless() else {
         eprintln!("no GPU adapter: skipping");
         return;
