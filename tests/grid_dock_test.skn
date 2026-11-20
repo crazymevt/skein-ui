@@ -7,6 +7,15 @@
 (ui/theme! ui/base-theme)
 (defn settle [] (sleep 100))
 
+(defn settle-until
+  "Wait until (ok?) is true, up to 5 s: after a burst of input, which a slow
+  machine handles in more than settle's 100 ms."
+  [ok?]
+  (loop [left 250]
+    (when (and (pos? left) (not (ok?)))
+      (sleep 20)
+      (recur (dec left)))))
+
 (defn centre [w id]
   (let [{:keys [x y w h]} (ui/node-rect w (ui/node-of w id))] [(+ x (quot w 2)) (+ y (quot h 2))]))
 
@@ -35,12 +44,12 @@
       (settle)
       (is (= 2 (:selected @gstate)))
       (dotimes [_ 20] (ui/simulate! [:key w :arrow-down #{}]))
-      (settle)
+      (settle-until #(and (= 22 (:selected @gstate)) (some? (ui/node-of w :grid-row-22))))
       (is (= 22 (:selected @gstate)))
       (is (pos? (:scroll-y @gstate)))
       (is (some? (ui/node-of w :grid-row-22)))
       (ui/simulate! [:key w :end #{}])
-      (settle)
+      (settle-until #(and (= 4999 (:selected @gstate)) (some? (ui/node-of w :grid-row-4999))))
       (is (= 4999 (:selected @gstate)))
       (is (some? (ui/node-of w :grid-row-4999)) "End scrolls to the last row")
       (ui/simulate! [:key w :home #{}])
