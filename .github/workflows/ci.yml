@@ -67,6 +67,18 @@ jobs:
         working-directory: skein-ui
         run: cargo build --release --locked -p skein-ui-host
 
+      - name: The renderer's shared libraries (Linux)
+        if: runner.os == 'Linux'
+        working-directory: skein-ui
+        # What a desktop needs installed for the renderer to start. libxdo
+        # isn't on most desktops, and without it the renderer can't start.
+        run: |
+          readelf -d target/release/skein-ui-host | grep NEEDED
+          if readelf -d target/release/skein-ui-host | grep -q libxdo; then
+            echo "::error::The renderer needs libxdo again (muda's libxdo feature?)"
+            exit 1
+          fi
+
       - name: Renderer tests
         working-directory: skein-ui
         run: cargo test --release --locked --workspace

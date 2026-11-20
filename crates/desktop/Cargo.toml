@@ -11,5 +11,8 @@ skein-ui-render.workspace = true
 winit = "0.30"
 wgpu = "30"
 arboard = "3"
-muda = "0.17"
+# (without libxdo: muda needs it only for its predefined Cut, Copy, Paste
+# and Select All items on Linux, which skein-ui doesn't use, and with it
+# the Linux renderer won't start on a desktop without libxdo.so.3)
+muda = { version = "0.17", default-features = false, features = ["gtk"] }
 rfd = "0.15"

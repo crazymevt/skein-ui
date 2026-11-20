@@ -162,6 +162,11 @@ it once in this directory. A packaged distribution may carry one as
 cargo build --release --locked -p skein-ui-host
 ```
 
+On Linux, building needs GTK 3's headers (`sudo apt install
+libgtk-3-dev` on Debian and Ubuntu), and running needs GTK 3, which
+desktops normally have. The menus are GTK's, and the windows and graphics
+libraries are loaded as needed.
+
 On Windows the renderer is `skein-ui-host.exe`, and the same command
 builds it. Each window shows the menu bar from `ui/menu!` (macOS has one
 for the app), Quit closes the app, and Hide is left out. Remembered state

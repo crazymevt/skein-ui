@@ -1645,25 +1645,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libxdo"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00333b8756a3d28e78def82067a377de7fa61b24909000aeaa2b446a948d14db"
-dependencies = [
- "libxdo-sys",
-]
-
-[[package]]
-name = "libxdo-sys"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db23b9e7e2b7831bbd8aac0bbeeeb7b68cbebc162b227e7052e8e55829a09212"
-dependencies = [
- "libc",
- "x11",
-]
-
-[[package]]
 name = "linebender_resource_handle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1835,7 +1816,6 @@ dependencies = [
  "dpi",
  "gtk",
  "keyboard-types",
- "libxdo",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
@@ -1912,54 +1892,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
-]
-
-[[package]]
-name = "skein-ui-desktop"
-version = "0.2.0"
-dependencies = [
- "arboard",
- "muda",
- "skein-ui-engine",
- "skein-ui-render",
- "rfd",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "skein-ui-engine"
-version = "0.2.0"
-dependencies = [
- "image",
- "parley",
- "taffy",
-]
-
-[[package]]
-name = "skein-ui-host"
-version = "0.2.0"
-dependencies = [
- "skein-ui-desktop",
- "skein-ui-engine",
- "skein-ui-render",
- "num-bigint",
- "num-rational",
- "num-traits",
-]
-
-[[package]]
-name = "skein-ui-render"
-version = "0.2.0"
-dependencies = [
- "bytemuck",
- "lyon",
- "skein-ui-engine",
- "parley",
- "png 0.18.1",
- "pollster 1.0.1",
- "swash",
- "wgpu",
 ]
 
 [[package]]
@@ -3063,6 +2995,54 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "skein-ui-desktop"
+version = "0.2.0"
+dependencies = [
+ "arboard",
+ "muda",
+ "rfd",
+ "skein-ui-engine",
+ "skein-ui-render",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "skein-ui-engine"
+version = "0.2.0"
+dependencies = [
+ "image",
+ "parley",
+ "taffy",
+]
+
+[[package]]
+name = "skein-ui-host"
+version = "0.2.0"
+dependencies = [
+ "num-bigint",
+ "num-rational",
+ "num-traits",
+ "skein-ui-desktop",
+ "skein-ui-engine",
+ "skein-ui-render",
+]
+
+[[package]]
+name = "skein-ui-render"
+version = "0.2.0"
+dependencies = [
+ "bytemuck",
+ "lyon",
+ "parley",
+ "png 0.18.1",
+ "pollster 1.0.1",
+ "skein-ui-engine",
+ "swash",
+ "wgpu",
+]
 
 [[package]]
 name = "skrifa"
@@ -4342,16 +4322,6 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
-
-[[package]]
-name = "x11"
-version = "2.21.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "502da5464ccd04011667b11c435cb992822c2c0dbde1770c988480d312a0db2e"
-dependencies = [
- "libc",
- "pkg-config",
-]
 
 [[package]]
 name = "x11-dl"
