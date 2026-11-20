@@ -1012,6 +1012,14 @@
         (when-let [b (:badge n)]
           [:text {:color (or (:badge-color n) (:color n) :muted) :font-size 11 :padding [0 4 0 0]} b])]))])
 
+(defn- rows-in
+  "How many whole rows of height row-h fit in px pixels. Sizes, row
+  heights and scroll positions can be fractions of a pixel (Windows gives
+  window sizes so at 125% display scaling), so this divides as numbers
+  and drops the fraction, where quot would take whole numbers only."
+  [px row-h]
+  (int (/ (double px) row-h)))
+
 (defn vlist
   "A virtualized list: only the rows near the visible part exist. Options:
   :items, :row-height, :height, :scroll-y (where it is scrolled to, as the
@@ -1019,8 +1027,8 @@
   function of an item and its index giving its element), :id."
   [{:keys [items row-height height scroll-y on-scroll row id] :or {scroll-y 0}}]
   (let [n (count items)
-        top (max 0 (dec (quot (int scroll-y) row-height)))
-        end (min n (+ top (quot height row-height) 3))]
+        top (max 0 (dec (rows-in scroll-y row-height)))
+        end (min n (+ top (rows-in height row-height) 3))]
     [:scroll {:id id :height height :scroll-y scroll-y :on-scroll (fn [e] (when on-scroll (on-scroll (:y e))))}
      [:box {:height (* n row-height) :flex-shrink 0}
       (for [i (range top end)]
@@ -1059,8 +1067,8 @@
                         (if (and c (= (:drawn c) drawn)) [(:i c) (:y c)] drawn)))
         header-h 26
         body-h (if fill? (or viewport 1000) (- height header-h 2))
-        top (max 0 (dec (quot (int scroll-y) row-height)))
-        end (min n (+ top (quot body-h row-height) 3))
+        top (max 0 (dec (rows-in scroll-y row-height)))
+        end (min n (+ top (rows-in body-h row-height) 3))
         width (reduce + 0 (map :width columns))
         cell (or cell (fn [row col] (str (get row (:key col) ""))))
         select! (fn [i]
@@ -1073,7 +1081,7 @@
                       (swap! grid-cursors assoc id {:drawn drawn :i i :y sy2})
                       (when on-select (on-select i))
                       (when (and on-scroll (not= sy sy2)) (on-scroll sy2)))))
-        page (max 1 (quot body-h row-height))]
+        page (max 1 (rows-in body-h row-height))]
     [:column {:id id :class :grid (if fill? :flex-grow :height) (if fill? 1 height) :min-height 0 :min-width 0
               :overflow :hidden :focusable true
               :on-key (fn [e]
@@ -2481,7 +2489,7 @@
    (let [[ww _] (or (get-in @(:windows (the-app)) [wid :props :size]) [800 600])
          st (atom {:q "" :hi 0})
          run! (fn [c] (close-palette!) (when c ((:run c))))
-         pid (popup wid {:position [(max 0 (quot (- ww width) 2)) 48] :on-dismiss (fn [_] (close-palette!))}
+         pid (popup wid {:position [(max 0 (int (/ (- ww width) 2))) 48] :on-dismiss (fn [_] (close-palette!))}
                     (fn [{:keys [q hi]}]
                       (let [ms (palette-matches commands q)
                             hi (min hi (max 0 (dec (count ms))))]
