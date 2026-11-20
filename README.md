@@ -58,6 +58,26 @@ decoded pixels to those exact dimensions, with the same output limits.
 (ui/decode-image "photo.jpg" {:size [320 240]})
 ```
 
+## Window icons
+
+```clojure
+(ui/window {:title "Linnet" :icon "assets/linnet.ico" :size [1240 800]} view state)
+```
+
+`:icon` is a PNG or ICO path (made absolute, as an image's `:src` is) or the
+encoded bytes of one. It shows in the window's title bar and, on Windows,
+on its taskbar button. An ICO gives its largest image, and Windows scales it
+down. macOS windows have no icons: there the app's icon comes from its
+bundle, so `:icon` does nothing. A file that can't be read is reported on
+standard error and the window opens without it. Popups never show one.
+
+The renderer's windows belong to `skein-ui-host.exe`, so Windows groups them
+under that program and pins that program. Giving them the app's own
+identity needs an AppUserModelID set in the renderer
+(`SetCurrentProcessExplicitAppUserModelID`), the same ID on the app's
+Start-menu shortcut, and an ID per app, such as its package `:id`. That
+belongs with Windows packaging and isn't done yet.
+
 ## Canvas pixels and input
 
 ```clojure
