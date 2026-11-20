@@ -1,0 +1,56 @@
+;;;; Sizes, row heights and scroll positions in fractions of a pixel, as
+;;;; Windows gives them at 125% or 150% display scaling (972.8 logical
+;;;; pixels for 1216 real ones). The widgets that count rows or centre
+;;;; themselves must take them.
+
+(ns fractional-test
+  (:require [skein.test :refer [is deftest testing]] [skein.ui :as ui]))
+
+(ui/theme! ui/base-theme)
+
+(defn- rows-drawn
+  "The ids among candidates the window's tree has."
+  [wid candidates]
+  (vec (filter (fn [id] (ui/node-of wid id)) candidates)))
+
+(deftest a-virtual-list
+  (let [w (ui/window {:size [400 300]}
+                     (fn [_]
+                       (ui/vlist {:id :list :items (vec (range 1000)) :row-height 20.5 :height 100.8 :scroll-y 41.6
+                                  :row (fn [x _] [:text {:id (keyword (str "row" x))} (str x)])}))
+                     (atom nil))]
+    (try
+      (ui/settle!)
+      (let [drawn (rows-drawn w (map (fn [i] (keyword (str "row" i))) (range 20)))]
+        (is (= :row1 (first drawn)) "from a row above the top")
+        (is (some #{:row6} drawn) "to the bottom of the view")
+        (is (not (some #{:row0 :row19} drawn)) "and no more"))
+      (finally (ui/close-window w)))))
+
+(deftest a-grid
+  (doseq [[what opts] [["a height" {:height 340.5}]
+                       ["filling its parent, with a viewport" {:viewport 972.8}]]]
+    (testing what
+      (let [rows (vec (for [i (range 500)] {:n i}))
+            w (ui/window {:size [400 600]}
+                         (fn [_]
+                           [:column {:flex-grow 1}
+                            (ui/grid (merge {:id :g :rows rows :row-height 22.5 :scroll-y 47.3
+                                             :columns [{:key :n :title "#" :width 80}]}
+                                            opts))])
+                         (atom nil))]
+        (try
+          (ui/settle!)
+          (is (some? (ui/node-of w :grid-row-2)))
+          (is (nil? (ui/node-of w :grid-row-0)))
+          (finally (ui/close-window w)))))))
+
+(deftest the-command-palette
+  (let [w (ui/window {:size [1216.0 972.79998]} (fn [_] [:text "app"]) (atom nil))]
+    (try
+      (ui/settle!)
+      (ui/command-palette! w [{:title "Do it" :run (fn [])}])
+      (ui/settle!)
+      (is (seq (ui/popups-of w)) "it opens over a window of a fractional width")
+      (ui/close-palette!)
+      (finally (ui/close-window w)))))
