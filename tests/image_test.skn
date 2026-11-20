@@ -45,3 +45,13 @@
       (is (try (ui/decode-image src {:size size})
                false
                (catch Error _ true))))))
+
+(deftest window-icons
+  ;; (headless windows take :icon and draw as before; the desktop backend
+  ;; shows it in the title bar and taskbar)
+  (doseq [icon ["crates/render/tests/golden/scene@2x.png" "no/such/icon.png" (ppm 4 4)]]
+    (let [win (ui/window {:size [80 60] :icon icon} (fn [_] [:text {:id :hello} "hi"]) (atom nil))]
+      (try
+        (ui/settle!)
+        (is (some? (ui/node-of win :hello)) (if (string? icon) icon "bytes"))
+        (finally (ui/close-window win))))))

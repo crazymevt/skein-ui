@@ -28,7 +28,9 @@ use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
-use winit::window::{Window, WindowAttributes, WindowId as OsId};
+use winit::window::{Icon, Window, WindowAttributes, WindowId as OsId};
+#[cfg(windows)]
+use winit::platform::windows::{WindowAttributesExtWindows, WindowExtWindows};
 
 /// Wakes the event loop from any thread.
 pub type Waker = Box<dyn Fn() + Send + Sync>;
@@ -45,6 +47,28 @@ struct OsWindow {
     unshown: bool,
     /// A popup's position in its owner (logical), as last placed.
     position: Option<(f32, f32)>,
+    /// The `:icon` the window was given last (applied or not).
+    icon: Option<Data>,
+}
+
+/// A window's `:icon` prop: a PNG or ICO path (or encoded bytes). An ICO
+/// gives its largest image. macOS has no window icons, so there it does
+/// nothing (the app's icon comes from its bundle).
+fn window_icon(src: &Data) -> Option<Icon> {
+    let loaded = skein_ui_engine::raster::RasterImage::load(src)
+        .and_then(|img| Icon::from_rgba(img.rgba.to_vec(), img.size[0], img.size[1]).map_err(|e| e.to_string()));
+    match loaded {
+        Ok(icon) => Some(icon),
+        Err(e) => {
+            eprintln!("skein-ui: can't use the window icon: {e}");
+            None
+        }
+    }
+}
+
+/// The `:icon` prop among a window's props.
+fn icon_prop(props: &[(String, Data)]) -> Option<Data> {
+    props.iter().find(|(k, _)| k == "icon").map(|(_, v)| v.clone()).filter(|v| !matches!(v, Data::Nil))
 }
 
 struct App<P, D> {
@@ -226,10 +250,18 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
                 .unwrap_or("Skein")
                 .to_owned();
             let place = self.popup_place(w);
+            let icon = icon_prop(&self.engine.windows[&w].props);
             if let Some(os) = self.windows.get_mut(&w) {
                 if os.title != title {
                     os.window.set_title(&title);
                     os.title = title;
+                }
+                if os.icon != icon {
+                    let img = icon.as_ref().and_then(window_icon);
+                    #[cfg(windows)]
+                    os.window.set_taskbar_icon(img.clone());
+                    os.window.set_window_icon(img);
+                    os.icon = icon;
                 }
                 if let Some((at, p)) = place
                     && os.position != Some(p)
@@ -326,6 +358,16 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
                 attrs = attrs.with_resizable(r.truthy());
             }
         }
+        // :icon, for the title bar (and on Windows, the taskbar). Popups
+        // have no title bar.
+        let icon = if place.is_none() { icon_prop(&self.engine.windows[&w].props) } else { None };
+        if let Some(img) = icon.as_ref().and_then(window_icon) {
+            #[cfg(windows)]
+            {
+                attrs = attrs.with_taskbar_icon(Some(img.clone()));
+            }
+            attrs = attrs.with_window_icon(Some(img));
+        }
         if let Some((at, _)) = place {
             // A popup: borderless, above its owner, not taking focus.
             attrs = attrs
@@ -373,7 +415,7 @@ impl<P: FnMut(&mut Engine, &mut Text), D: FnMut(&mut Engine)> App<P, D> {
         }
         let size = window.inner_size();
         self.by_os.insert(window.id(), w);
-        self.windows.insert(w, OsWindow { window, surface, config, scale, cursor: (0.0, 0.0), title, unshown: false, position: place.map(|(_, p)| p) });
+        self.windows.insert(w, OsWindow { window, surface, config, scale, cursor: (0.0, 0.0), title, unshown: false, position: place.map(|(_, p)| p), icon });
         self.engine.resized(w, size.width as f32 / scale, size.height as f32 / scale, scale);
         Ok(())
     }

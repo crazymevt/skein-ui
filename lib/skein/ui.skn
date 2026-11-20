@@ -621,7 +621,10 @@
 
 (defn window
   "Open a window showing (view @state): props are :title, :size [w h],
-  :position [x y] (on screen), :min-size, :resizable, plus :on-close,
+  :position [x y] (on screen), :min-size, :resizable, :icon (a PNG or ICO
+  path, or encoded image bytes, for the title bar and Windows's taskbar;
+  an ICO gives its largest image, and macOS, whose windows have no icons,
+  ignores it), plus :on-close,
   :on-key, :on-resize and :on-drop handlers. :on-resize receives an event
   with :window, :size [w h] in logical pixels, and :scale, after
   window-size has been updated. :on-drop gets files dropped where no
@@ -637,6 +640,7 @@
         wid (swap! window-ids inc)
         handlers (select-keys props [:on-close :on-key :on-resize :on-drop :on-dismiss :remember])
         props (apply dissoc props (keys handlers))
+        props (if (string? (:icon props)) (update props :icon io/absolute) props)
         props (if-let [[app k] (:remember handlers)] (merge props (recall app [:window k] {})) props)]
     (swap! (:windows a) assoc wid (merge handlers {:props props :view view :state state :tree nil}))
     (add-watch state [::window wid] (fn [_ _ old new] (when-not (identical? old new) (request-render! a wid))))
