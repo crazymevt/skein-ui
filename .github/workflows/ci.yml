@@ -40,10 +40,10 @@ jobs:
         with:
           path: skein-ui
 
-      - uses: actions/checkout@v5
+      # (Skein as released; change both for a new one)
+      - uses: crazymevt/skein-lang@v0.1.0
         with:
-          repository: crazymevt/skein-lang
-          path: skein-lang
+          version: 0.1.0
 
       - name: Linux packages
         if: runner.os == 'Linux'
@@ -55,13 +55,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            skein-ui
-            skein-lang
-
-      - name: Build skein
-        working-directory: skein-lang
-        run: cargo build --release --locked -p skein
+          workspaces: skein-ui
 
       - name: Build the renderer
         working-directory: skein-ui
@@ -85,12 +79,11 @@ jobs:
 
       - name: skein.ui tests
         working-directory: skein-ui
-        run: ../skein-lang/target/release/skein test --serial tests
+        run: skein test --serial tests
 
-  # Windows on ARM and on x86-64, built as skein-lang's own Windows jobs
-  # build Skein: with clang on the PATH and MMTk patched for Windows
-  # (tools/windows/mmtk.sh in skein-lang). Like those jobs, they can't fail
-  # the run until they've been green a while.
+  # Windows on ARM and on x86-64, with clang on the PATH as skein-lang's own
+  # Windows jobs have it. Like those jobs, they can't fail the run until
+  # they've been green a while.
   windows:
     name: Windows ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
@@ -105,53 +98,35 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      # (the skein-lang it's built with: Windows support is in main)
-      SKEIN_LANG_REF: main
-      # (MMTk with its Windows layer, in place of the one on crates.io)
-      MMTK: --config=patch.crates-io.mmtk.path='target/mmtk-windows'
     steps:
       - name: Files as they are in the repository
-        # (Git on Windows would give every text file \r\n line ends, the
-        # MMTk patch and its script among them)
+        # (Git on Windows would give every text file \r\n line ends)
         run: git config --global core.autocrlf false
 
       - uses: actions/checkout@v5
         with:
           path: skein-ui
 
-      - uses: actions/checkout@v5
+      # (Skein as released; change both for a new one)
+      - uses: crazymevt/skein-lang@v0.1.0
         with:
-          repository: crazymevt/skein-lang
-          ref: ${{ env.SKEIN_LANG_REF }}
-          path: skein-lang
+          version: 0.1.0
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            skein-ui
-            skein-lang
+          workspaces: skein-ui
 
       - name: clang on the PATH
-        # (Skein's dependencies build C with clang on Windows arm64, and cc
-        # takes it on x86-64 too where it's there; where LLVM is installed,
-        # it isn't on the PATH)
+        # (the renderer's dependencies build C with clang on Windows arm64,
+        # and cc takes it on x86-64 too where it's there; where LLVM is
+        # installed, it isn't on the PATH)
         run: |
           if [ -x "/c/Program Files/LLVM/bin/clang.exe" ]; then
             echo "C:\Program Files\LLVM\bin" >> "$GITHUB_PATH"
           fi
           clang --version || echo "::warning::No clang on the PATH"
-
-      - name: MMTk with its Windows layer
-        working-directory: skein-lang
-        run: tools/windows/mmtk.sh
-
-      - name: Build skein
-        # (not --locked: Cargo.lock names the MMTk on crates.io)
-        working-directory: skein-lang
-        run: cargo "$MMTK" build --release -p skein
 
       - name: Build the renderer
         working-directory: skein-ui
@@ -165,4 +140,4 @@ jobs:
         # (even after the renderer's tests fail: they're the other half)
         if: ${{ !cancelled() }}
         working-directory: skein-ui
-        run: ../skein-lang/target/release/skein.exe test --serial tests
+        run: skein test --serial tests
